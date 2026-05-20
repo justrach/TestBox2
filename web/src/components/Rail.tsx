@@ -12,6 +12,7 @@ import {
   Activity,
   KeyRound,
   Settings,
+  Store,
   Github,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -24,6 +25,7 @@ const NAV_ITEMS = [
   { to: '/network', icon: Network, key: 'network' },
   { to: '/observability', icon: Activity, key: 'observability' },
   { to: '/keys', icon: KeyRound, key: 'apiKeys' },
+  { to: '/store', icon: Store, key: 'store' },
   { to: '/settings', icon: Settings, key: 'settings' },
 ] as const;
 
@@ -71,7 +73,7 @@ export function Rail() {
             GitHub
           </span>
         </a>
-        <div className="text-[10px] tracking-widest text-muted-foreground/60">v0.1</div>
+        <div className="text-xs tracking-wider text-muted-foreground/70 text-num">v0.1</div>
       </div>
     </aside>
   );

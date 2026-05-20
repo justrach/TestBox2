@@ -114,6 +114,9 @@ export default function OverviewPage() {
                 <Badge tone="info">{sb.state ?? 'running'}</Badge>
                 <span className="font-mono text-xs text-foreground/80">{short(sb.sandboxID)}</span>
                 <span className="text-muted-foreground">{sb.templateID ?? sb.alias ?? '—'}</span>
+                {sb.clientID && (
+                  <span className="chip-net">{sb.clientID}</span>
+                )}
                 <span className="ml-auto text-xs text-muted-foreground">
                   {formatRelative(sb.startedAt)}
                 </span>
@@ -149,9 +152,9 @@ export default function OverviewPage() {
                 </span>
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-medium">{tpl.templateID}</div>
-                  <div className="truncate font-mono text-[11px] text-muted-foreground">{tpl.templateID}</div>
+                  <div className="truncate font-mono text-xs text-muted-foreground">{tpl.templateID}</div>
                 </div>
-                <Badge tone={tpl.status === 'ready' ? 'ok' : tpl.status === 'failed' ? 'err' : 'warn'}>
+                <Badge tone={tpl.status.toLowerCase() === 'ready' ? 'ok' : tpl.status.toLowerCase() === 'failed' ? 'err' : 'warn'}>
                   {tpl.version ?? tpl.status}
                 </Badge>
               </Link>
@@ -211,7 +214,7 @@ function Kpi({
         </div>
       )}
       {progress == null && (
-        <div className="mt-4 flex items-center gap-1 text-[11px] text-muted-foreground">
+        <div className="mt-4 flex items-center gap-1 text-xs text-muted-foreground">
           <TrendingUp size={12} />
           <span>{tCommon('trendingStable')}</span>
         </div>
