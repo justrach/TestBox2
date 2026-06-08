@@ -793,5 +793,24 @@ if [[ "${ONE_CLICK_RUN_QUICKCHECK:-1}" == "1" ]]; then
     "${INSTALL_PREFIX}/scripts/one-click/quickcheck.sh"
 fi
 
+# Optional: build the language-runtime snapshots (templates) shipped under
+# snapshots/ at the repo root. Only runs for source/dev installs that have the
+# folder next to the checkout; the packaged one-click bundle does not ship it.
+if [[ "${CUBE_BUILD_SNAPSHOTS:-0}" == "1" && "${DEPLOY_ROLE}" != "compute" ]]; then
+  snap_dir="${ONE_CLICK_SNAPSHOTS_DIR:-}"
+  if [[ -z "${snap_dir}" ]]; then
+    for cand in "${SCRIPT_DIR}/../../snapshots" "${SCRIPT_DIR}/../snapshots" "${SCRIPT_DIR}/snapshots"; do
+      [[ -x "${cand}/build-snapshots.sh" ]] && snap_dir="${cand}" && break
+    done
+  fi
+  if [[ -n "${snap_dir}" && -x "${snap_dir}/build-snapshots.sh" ]]; then
+    log "CUBE_BUILD_SNAPSHOTS=1 -> building language runtime snapshots from ${snap_dir}"
+    CUBEMASTERCLI="${INSTALL_PREFIX}/CubeMaster/bin/cubemastercli" \
+      bash "${snap_dir}/build-snapshots.sh" || log "snapshot build reported errors (continuing)"
+  else
+    log "CUBE_BUILD_SNAPSHOTS=1 set but snapshots/build-snapshots.sh was not found; skipping"
+  fi
+fi
+
 log "install complete (role=${DEPLOY_ROLE})"
 print_path_hint
