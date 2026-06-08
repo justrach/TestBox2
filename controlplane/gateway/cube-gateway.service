@@ -1,0 +1,19 @@
+[Unit]
+Description=Cube Gateway (multi-tenant auth + metering plane)
+After=network-online.target cube-sandbox-control.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/local/services/cube-gateway
+Environment=GATEWAY_ADDR=:8088
+Environment=CUBE_UPSTREAM=http://127.0.0.1:3000
+Environment=GATEWAY_TENANTS=/usr/local/services/cube-gateway/tenants.json
+Environment=GATEWAY_USAGE_LOG=/var/lib/cube-gateway/usage.jsonl
+EnvironmentFile=-/usr/local/services/cube-gateway/gateway.env
+ExecStart=/usr/local/bin/cube-gateway
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

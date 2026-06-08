@@ -1,0 +1,18 @@
+{
+  "tenants": [
+    {
+      "key": "e2b_tenant_alpha_REPLACE_ME",
+      "id": "alpha",
+      "max_sandboxes": 5,
+      "max_cpu_count": 4,
+      "max_memory_mb": 4096
+    },
+    {
+      "key": "e2b_tenant_beta_REPLACE_ME",
+      "id": "beta",
+      "max_sandboxes": 20,
+      "max_cpu_count": 8,
+      "max_memory_mb": 8192
+    }
+  ]
+}
