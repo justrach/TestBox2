@@ -287,11 +287,46 @@ install_docker_compose() {
   fi
 }
 
+# Docker refuses to start ANY container when the kernel has AppArmor enabled
+# but the apparmor_parser userspace tool is missing: it cannot load the
+# docker-default profile and every `docker run` fails with a cryptic
+# "AppArmor enabled on system but the docker-default profile could not be
+# loaded". Some minimal server images (e.g. Hetzner's Debian) ship the kernel
+# feature without the tooling. Install it when we detect that situation.
+apparmor_enabled_in_kernel() {
+  local f=/sys/module/apparmor/parameters/enabled
+  [[ -r "${f}" ]] && [[ "$(cat "${f}" 2>/dev/null)" == "Y" ]]
+}
+
+install_apparmor() {
+  if command -v apparmor_parser >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! apparmor_enabled_in_kernel; then
+    # Kernel AppArmor is off, so Docker will not require apparmor_parser.
+    return 0
+  fi
+  local pm
+  pm="$(detect_pkg_manager)"
+  log "AppArmor is enabled in the kernel but apparmor_parser is missing; installing apparmor tooling via ${pm}..."
+  case "${pm}" in
+    apt)
+      apt-get update -qq && apt-get install -y -qq apparmor apparmor-utils
+      ;;
+    yum)
+      yum install -y apparmor-parser apparmor-utils 2>/dev/null || yum install -y apparmor-utils
+      ;;
+  esac
+  command -v apparmor_parser >/dev/null 2>&1 \
+    || die "failed to install apparmor_parser; Docker cannot start containers while the kernel has AppArmor enabled. Install it manually or boot the host with apparmor=0."
+}
+
 install_dependencies() {
   log "checking and installing dependencies..."
   install_ripgrep
   install_docker
   install_docker_compose
+  install_apparmor
 }
 
 detect_node_ip() {

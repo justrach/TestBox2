@@ -24,7 +24,12 @@ services:
       retries: 20
     volumes:
       - __MYSQL_VOLUME__:/var/lib/mysql
-      - __SQL_DIR__:/docker-entrypoint-initdb.d:ro
+      # NOTE: the seed-only sql/ dir is intentionally NOT mounted into
+      # /docker-entrypoint-initdb.d. 002_seed_single_node.sql depends on tables
+      # that CubeMaster creates via goose migrations at startup, which happens
+      # long after MySQL's first-boot init scripts run. Mounting it here makes a
+      # fresh MySQL fail with "ERROR 1146 ... t_cube_host_type doesn't exist".
+      # The seed is applied post-migration by up-with-deps.sh via `docker exec`.
 
   redis:
     image: __REDIS_IMAGE__

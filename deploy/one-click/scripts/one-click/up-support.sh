@@ -61,8 +61,7 @@ render_support_compose() {
       -e "s/__MYSQL_DB__/$(escape_sed "${MYSQL_DB}")/g" \
       -e "s/__MYSQL_USER__/$(escape_sed "${MYSQL_USER}")/g" \
       -e "s/__MYSQL_PASSWORD__/$(escape_sed "${MYSQL_PASSWORD}")/g" \
-      -e "s/__MYSQL_ROOT_PASSWORD__/$(escape_sed "${MYSQL_ROOT_PASSWORD}")/g" \
-      -e "s#__SQL_DIR__#$(escape_sed "${SQL_DIR}")#g"
+      -e "s/__MYSQL_ROOT_PASSWORD__/$(escape_sed "${MYSQL_ROOT_PASSWORD}")/g"
   ) 9>"${SUPPORT_COMPOSE_LOCK}"
 }
 
