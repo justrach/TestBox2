@@ -82,6 +82,7 @@ install_required_dependencies() {
   if needs_docker_for_install; then
     install_docker
     install_docker_compose
+    install_apparmor
   fi
 }
 
