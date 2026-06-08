@@ -292,6 +292,49 @@ See: https://cubesandbox.com/guide/pvm-deploy.html"
   esac
 }
 
+# Optional convenience for single-node / bare-metal hosts whose root filesystem
+# is not XFS and that have no spare partition to format (a very common case on
+# rented dedicated servers with an ext4 RAID root). When CUBE_XFS_LOOPBACK_SIZE
+# is set (e.g. "200G"), back /data/cubelet with a loopback XFS image instead of
+# failing the preflight. Default behaviour is unchanged when the variable is
+# unset. The image path can be overridden with CUBE_XFS_LOOPBACK_IMAGE.
+setup_xfs_loopback() {
+  local mount_dir="$1" size="$2"
+  local img="${CUBE_XFS_LOOPBACK_IMAGE:-/data/cubelet.img}"
+
+  # Idempotent: already mounted as XFS -> nothing to do.
+  if mountpoint -q "${mount_dir}" 2>/dev/null \
+     && [[ "$(df -T "${mount_dir}" 2>/dev/null | awk 'NR==2 {print $2}')" == "xfs" ]]; then
+    log "XFS loopback already mounted at ${mount_dir}"
+    return 0
+  fi
+
+  require_cmd fallocate
+  if ! command -v mkfs.xfs >/dev/null 2>&1; then
+    local pm
+    pm="$(detect_pkg_manager)"
+    log "installing xfsprogs via ${pm} for the loopback XFS image..."
+    case "${pm}" in
+      apt) apt-get update -qq && apt-get install -y -qq xfsprogs ;;
+      yum) yum install -y xfsprogs ;;
+    esac
+  fi
+  command -v mkfs.xfs >/dev/null 2>&1 || die "mkfs.xfs not available; cannot create the XFS loopback image"
+
+  mkdir -p "$(dirname "${img}")" "${mount_dir}"
+  if [[ ! -f "${img}" ]]; then
+    log "creating ${size} XFS loopback image at ${img} (CUBE_XFS_LOOPBACK_SIZE=${size})"
+    fallocate -l "${size}" "${img}" || die "failed to allocate ${size} at ${img}"
+    mkfs.xfs -q "${img}" || die "mkfs.xfs failed on ${img}"
+  fi
+
+  mount -o loop "${img}" "${mount_dir}" || die "failed to mount ${img} at ${mount_dir}"
+  if ! grep -qs "[[:space:]]${mount_dir}[[:space:]]" /etc/fstab; then
+    printf '%s  %s  xfs  loop,nofail  0 0\n' "${img}" "${mount_dir}" >> /etc/fstab
+  fi
+  log "mounted XFS loopback ${img} at ${mount_dir} (persisted to /etc/fstab)"
+}
+
 check_cubelet_fs_preflight() {
   local cubelet_dir="/data/cubelet"
 
@@ -312,6 +355,12 @@ check_cubelet_fs_preflight() {
     return 0
   fi
 
+  # Opt-in: back /data/cubelet with a loopback XFS image when requested.
+  if [[ -n "${CUBE_XFS_LOOPBACK_SIZE:-}" ]]; then
+    setup_xfs_loopback "${cubelet_dir}" "${CUBE_XFS_LOOPBACK_SIZE}"
+    return 0
+  fi
+
   if [[ -d "${cubelet_dir}" ]] && mountpoint -q "${cubelet_dir}" 2>/dev/null; then
     die "/data/cubelet is a mount point but its filesystem type is '${fs_type}' (requires xfs).
   Please format the underlying partition as XFS and remount it at /data/cubelet:
@@ -326,6 +375,8 @@ check_cubelet_fs_preflight() {
          mkfs.xfs /dev/<your-partition>
          mount /dev/<your-partition> /data/cubelet
     2. Ensure the parent path (${check_path}) itself is on XFS.
+    3. Single-node convenience: set CUBE_XFS_LOOPBACK_SIZE=200G to back
+       /data/cubelet with a loopback XFS image (no repartitioning needed).
   Troubleshooting: https://github.com/TencentCloud/CubeSandbox/issues/311"
   fi
 }
