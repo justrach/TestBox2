@@ -35,7 +35,10 @@ GATEWAY_ADMIN_TOKEN=secret ./cube-gateway \
 ```
 
 Config via flags or env: `GATEWAY_ADDR`, `CUBE_UPSTREAM`, `GATEWAY_TENANTS`,
-`GATEWAY_USAGE_LOG`, `GATEWAY_ADMIN_TOKEN`.
+`GATEWAY_USAGE_LOG`, `GATEWAY_ADMIN_TOKEN`. Fleet capacity (for the
+`/admin/capacity` scale signal): `GATEWAY_FLEET_NODES`, `GATEWAY_FLEET_VCPU`,
+`GATEWAY_FLEET_MEM_MB` (total schedulable across worker nodes — bump as you add
+workers), `GATEWAY_TARGET_UTIL` (default 0.80).
 
 ## Use (tenant side)
 
@@ -53,9 +56,22 @@ with Sandbox.create(template="py313") as sb:
 
 ```bash
 curl -H "X-Admin-Token: secret" http://localhost:8088/admin/usage
-curl -H "X-Admin-Token: secret" http://localhost:8088/admin/tenants
+`/admin/usage` returns per-tenant `sandbox_seconds`, `vcpu_seconds`,
+`gb_seconds` (closed + still-open intervals) and current open counts — the raw
+inputs for metered billing.
+
+```bash
+curl -H "X-Admin-Token: secret" http://localhost:8088/admin/capacity
 ```
 
+`/admin/capacity` is the **"when do I add a worker node?"** readout: live
+`committed` load (vCPU / mem / sandbox count, summed from open sandboxes) vs
+operator-declared `fleet` capacity, `headroom` + `utilization`, the recent 429
+`rejections` rate (5m / 15m), and a `scale` recommendation (`add_node` +
+`reason`). It recommends adding a node when utilization ≥ `target_util` **or**
+creates were rejected in the last 5m. Stateless and portable — the same signal a
+future Cloudflare-Worker/edge autoscaler would consume. Pair it with
+`controlplane/multinode/add-compute-node.sh` to actually grow the fleet.
 `/admin/usage` returns per-tenant `sandbox_seconds`, `vcpu_seconds`,
 `gb_seconds` (closed + still-open intervals) and current open counts — the raw
 inputs for metered billing.
