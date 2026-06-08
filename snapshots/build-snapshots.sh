@@ -53,6 +53,9 @@ build_one() {
     echo "==> [$tid] BUILD FAILED"; fail=$((fail+1)); FAILED="${FAILED} ${tid}(build)"; return
   fi
   echo "==> [$tid] cubemastercli tpl create-from-image"
+  # Delete any pre-existing template with this id first: create-from-image is a
+  # no-op when the id already exists, which would silently keep a stale image.
+  "${CUBEMASTERCLI}" tpl delete --template-id "${tid}" >/dev/null 2>&1 || true
   "${CUBEMASTERCLI}" tpl create-from-image \
     --image "${img}" --template-id "${tid}" \
     --writable-layer-size "${WLS}" \
