@@ -26,6 +26,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -167,6 +168,20 @@ func (l *Ledger) openCount(tenant string) int {
 	return n
 }
 
+// committed sums the currently-open sandboxes into fleet-wide committed load:
+// vCPU (clamped to >=1 each), memory MB, and sandbox count. This is what's
+// actually scheduled onto the worker fleet right now.
+func (l *Ledger) committed() (vcpu, memMB, sandboxes int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, iv := range l.open {
+		vcpu += max1(iv.CPU)
+		memMB += iv.MemMB
+		sandboxes++
+	}
+	return
+}
+
 func (l *Ledger) recordOpen(iv openInterval, id string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -230,6 +245,47 @@ type Gateway struct {
 	ledger   *Ledger
 	admin    string
 	client   *http.Client
+
+	// fleet capacity (operator-supplied; total schedulable across worker nodes).
+	// Drives the /admin/capacity "when do I add a node?" readout. As you add
+	// workers, bump these. Portable: the same signal a Worker autoscaler reads.
+	fleetNodes  int
+	fleetVCPU   int
+	fleetMemMB  int
+	targetUtil  float64 // headroom threshold, e.g. 0.80
+
+	// recent create rejections (429s) for the scale signal.
+	rmu     sync.Mutex
+	rejects []int64 // unix-second timestamps, pruned to last 15m
+}
+
+// recordReject notes a 429 (quota/capacity rejection) for the scale signal.
+func (g *Gateway) recordReject(now int64) {
+	g.rmu.Lock()
+	defer g.rmu.Unlock()
+	g.rejects = append(g.rejects, now)
+	// prune anything older than 15m
+	cut := now - 15*60
+	i := 0
+	for i < len(g.rejects) && g.rejects[i] < cut {
+		i++
+	}
+	g.rejects = g.rejects[i:]
+}
+
+// rejectStats returns rejection counts in the last 5m / 15m.
+func (g *Gateway) rejectStats(now int64) (last5m, last15m int) {
+	g.rmu.Lock()
+	defer g.rmu.Unlock()
+	for _, ts := range g.rejects {
+		if ts >= now-15*60 {
+			last15m++
+			if ts >= now-5*60 {
+				last5m++
+			}
+		}
+	}
+	return
 }
 
 func (g *Gateway) tenantFor(r *http.Request) (Tenant, bool) {
@@ -303,6 +359,7 @@ func (g *Gateway) handleCreate(w http.ResponseWriter, r *http.Request, t Tenant)
 
 	// Quota: concurrency
 	if t.MaxSandboxes > 0 && g.ledger.openCount(t.ID) >= t.MaxSandboxes {
+		g.recordReject(time.Now().Unix())
 		writeErr(w, http.StatusTooManyRequests,
 			fmt.Sprintf("tenant %s sandbox quota reached (%d)", t.ID, t.MaxSandboxes))
 		return
@@ -380,6 +437,8 @@ func (g *Gateway) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			"usage": snap,
 			"open":  g.openByTenant(),
 		})
+	case "/admin/capacity":
+		g.writeCapacity(w)
 	case "/admin/tenants":
 		out := []map[string]any{}
 		for _, t := range g.byID {
@@ -393,6 +452,62 @@ func (g *Gateway) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeErr(w, http.StatusNotFound, "unknown admin endpoint")
 	}
+}
+
+// writeCapacity is the "when do I add a worker node?" readout: live committed
+// load vs operator-declared fleet capacity, plus the recent 429 rate, plus a
+// recommendation. Stateless and portable — the same signal a future edge/Worker
+// autoscaler would consume.
+func (g *Gateway) writeCapacity(w http.ResponseWriter) {
+	now := time.Now().Unix()
+	vcpu, memMB, sandboxes := g.ledger.committed()
+	r5, r15 := g.rejectStats(now)
+
+	var utilVCPU, utilMem float64
+	if g.fleetVCPU > 0 {
+		utilVCPU = float64(vcpu) / float64(g.fleetVCPU)
+	}
+	if g.fleetMemMB > 0 {
+		utilMem = float64(memMB) / float64(g.fleetMemMB)
+	}
+	util := utilVCPU
+	if utilMem > util {
+		util = utilMem // bottleneck dimension drives the decision
+	}
+
+	// recommend adding a node if we're over the target utilization OR we've
+	// rejected creates recently (demand already exceeding capacity).
+	add := false
+	reason := fmt.Sprintf("util %.0f%% < target %.0f%%, no recent rejections",
+		util*100, g.targetUtil*100)
+	switch {
+	case g.fleetVCPU == 0:
+		reason = "fleet capacity not configured (set GATEWAY_FLEET_VCPU / GATEWAY_FLEET_MEM_MB)"
+	case r5 > 0:
+		add = true
+		reason = fmt.Sprintf("%d create(s) rejected in last 5m — capacity exceeded", r5)
+	case util >= g.targetUtil:
+		add = true
+		reason = fmt.Sprintf("util %.0f%% >= target %.0f%% — running hot", util*100, g.targetUtil*100)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"as_of": time.Now().UTC().Format(time.RFC3339),
+		"fleet": map[string]any{
+			"nodes": g.fleetNodes, "vcpu": g.fleetVCPU, "mem_mb": g.fleetMemMB,
+			"target_util": g.targetUtil,
+		},
+		"committed": map[string]any{
+			"vcpu": vcpu, "mem_mb": memMB, "sandboxes": sandboxes,
+		},
+		"headroom": map[string]any{
+			"vcpu": g.fleetVCPU - vcpu, "mem_mb": g.fleetMemMB - memMB,
+			"utilization": util, "util_vcpu": utilVCPU, "util_mem": utilMem,
+		},
+		"rejections": map[string]any{"last_5m": r5, "last_15m": r15},
+		"scale":      map[string]any{"add_node": add, "reason": reason},
+	})
 }
 
 func (g *Gateway) openByTenant() map[string]int {
@@ -432,6 +547,10 @@ func main() {
 	tenantsPath := flag.String("tenants", env("GATEWAY_TENANTS", "tenants.json"), "tenants config file")
 	usagePath := flag.String("usage", env("GATEWAY_USAGE_LOG", "usage.jsonl"), "usage ledger (JSONL)")
 	admin := flag.String("admin-token", env("GATEWAY_ADMIN_TOKEN", ""), "admin API token")
+	fleetNodes := flag.Int("fleet-nodes", envInt("GATEWAY_FLEET_NODES", 1), "worker nodes in the fleet")
+	fleetVCPU := flag.Int("fleet-vcpu", envInt("GATEWAY_FLEET_VCPU", 0), "total schedulable vCPU across the fleet (0=unset)")
+	fleetMemMB := flag.Int("fleet-mem-mb", envInt("GATEWAY_FLEET_MEM_MB", 0), "total schedulable memory MB across the fleet (0=unset)")
+	targetUtil := flag.Float64("target-util", envFloat("GATEWAY_TARGET_UTIL", 0.80), "utilization at which to recommend adding a node")
 	flag.Parse()
 
 	tb, err := os.ReadFile(*tenantsPath)
@@ -469,6 +588,10 @@ func main() {
 		ledger:   ledger,
 		admin:    *admin,
 		client:   &http.Client{Timeout: 60 * time.Second},
+		fleetNodes: *fleetNodes,
+		fleetVCPU:  *fleetVCPU,
+		fleetMemMB: *fleetMemMB,
+		targetUtil: *targetUtil,
 	}
 
 	log.Printf("cube gateway: listening %s -> %s | tenants=%d | usage=%s",
@@ -480,6 +603,24 @@ func main() {
 func env(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return d
+}
+
+func envInt(k string, d int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return d
+}
+
+func envFloat(k string, d float64) float64 {
+	if v := os.Getenv(k); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
 	}
 	return d
 }

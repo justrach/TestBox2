@@ -1,0 +1,12 @@
+[Unit]
+Description=Cube control-plane firewall (lock internal ports off public NIC)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/cube-firewall.sh
+
+[Install]
+WantedBy=multi-user.target
