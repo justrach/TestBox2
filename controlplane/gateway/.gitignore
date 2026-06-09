@@ -1,0 +1,5 @@
+/cube-gateway
+/cube-gateway-*
+tenants.json
+*.jsonl
+gateway.env
