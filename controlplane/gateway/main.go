@@ -3,20 +3,25 @@
 //
 // It turns a single CubeSandbox node into a multi-tenant substrate:
 //   - authenticates each request by API key -> tenant
+//   - AUTHORIZES every sandbox-addressed path: a tenant may only see/touch its
+//     own sandboxes (ownership is held in the in-process ledger)
 //   - enforces per-tenant concurrency + resource quotas on sandbox creation
-//   - stamps metadata.tenant on every sandbox (for downstream filtering)
+//   - stamps metadata.tenant on every sandbox (for ownership + list filtering)
 //   - meters sandbox lifetime (create -> destroy) into a JSONL ledger that
 //     billing can aggregate (sandbox-seconds, vCPU-seconds, GB-seconds)
 //
-// Everything else is transparently reverse-proxied to the upstream API, so the
-// stock E2B/cubesandbox SDKs work unchanged: point them at the gateway and set
-// their API key to the tenant key.
+// Authentication is NOT authorization: cube-api has no tenant model and serves
+// every route at both "/" and "/cubeapi/v1/" (plus a /v2/sandboxes list), so a
+// blind transparent proxy would let any authenticated tenant read the whole
+// node or mutate shared state. This gateway therefore default-denies: only the
+// tenant-scoped data-plane operations below are proxied; everything else is 403.
 //
 // Stdlib only — builds to a single static binary (CGO_ENABLED=0).
 package main
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -37,9 +42,9 @@ import (
 type Tenant struct {
 	Key          string `json:"key"`
 	ID           string `json:"id"`
-	MaxSandboxes int    `json:"max_sandboxes"`  // 0 = unlimited
-	MaxCPUCount  int    `json:"max_cpu_count"`  // 0 = no clamp
-	MaxMemoryMB  int    `json:"max_memory_mb"`  // 0 = no clamp
+	MaxSandboxes int    `json:"max_sandboxes"` // 0 = unlimited
+	MaxCPUCount  int    `json:"max_cpu_count"` // 0 = no clamp
+	MaxMemoryMB  int    `json:"max_memory_mb"` // 0 = no clamp
 }
 
 type tenantsFile struct {
@@ -49,13 +54,13 @@ type tenantsFile struct {
 // ---- usage ledger ----
 
 type event struct {
-	Type      string  `json:"type"` // "open" | "close"
-	Tenant    string  `json:"tenant"`
-	SandboxID string  `json:"sandbox_id"`
-	Template  string  `json:"template,omitempty"`
-	CPU       int     `json:"cpu,omitempty"`
-	MemMB     int     `json:"mem_mb,omitempty"`
-	TS        int64   `json:"ts"` // unix seconds
+	Type      string `json:"type"` // "open" | "close"
+	Tenant    string `json:"tenant"`
+	SandboxID string `json:"sandbox_id"`
+	Template  string `json:"template,omitempty"`
+	CPU       int    `json:"cpu,omitempty"`
+	MemMB     int    `json:"mem_mb,omitempty"`
+	TS        int64  `json:"ts"` // unix seconds
 }
 
 type openInterval struct {
@@ -168,6 +173,21 @@ func (l *Ledger) openCount(tenant string) int {
 	return n
 }
 
+// ownerOf returns the tenant that owns an open sandbox. It is the authorization
+// primitive: a sandbox the gateway never created (out-of-band / warm-pool
+// replica) isn't in the ledger, so it has no owner and is invisible through the
+// gateway. recordOpen runs before the create response is written, so ownership
+// is consistent the instant the client learns the sandbox id.
+func (l *Ledger) ownerOf(id string) (string, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	iv, ok := l.open[id]
+	if !ok {
+		return "", false
+	}
+	return iv.Tenant, true
+}
+
 // committed sums the currently-open sandboxes into fleet-wide committed load:
 // vCPU (clamped to >=1 each), memory MB, and sandbox count. This is what's
 // actually scheduled onto the worker fleet right now.
@@ -246,13 +266,19 @@ type Gateway struct {
 	admin    string
 	client   *http.Client
 
+	// capacity charged to a sandbox when the request specifies no cpu/memory AND
+	// the tenant has no clamp. Without it an unclamped sandbox books 0 MB and
+	// under-reports committed load. Set to your template's real footprint.
+	defaultCPU   int
+	defaultMemMB int
+
 	// fleet capacity (operator-supplied; total schedulable across worker nodes).
 	// Drives the /admin/capacity "when do I add a node?" readout. As you add
 	// workers, bump these. Portable: the same signal a Worker autoscaler reads.
-	fleetNodes  int
-	fleetVCPU   int
-	fleetMemMB  int
-	targetUtil  float64 // headroom threshold, e.g. 0.80
+	fleetNodes int
+	fleetVCPU  int
+	fleetMemMB int
+	targetUtil float64 // headroom threshold, e.g. 0.80
 
 	// recent create rejections (429s) for the scale signal.
 	rmu     sync.Mutex
@@ -289,10 +315,8 @@ func (g *Gateway) rejectStats(now int64) (last5m, last15m int) {
 }
 
 func (g *Gateway) tenantFor(r *http.Request) (Tenant, bool) {
-	key := r.Header.Get("X-API-KEY")
-	if key == "" {
-		key = r.Header.Get("X-API-Key")
-	}
+	// http.Header.Get is case-insensitive, so X-API-Key covers X-API-KEY too.
+	key := r.Header.Get("X-API-Key")
 	if key == "" {
 		if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
 			key = strings.TrimPrefix(a, "Bearer ")
@@ -306,6 +330,44 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// statusRecorder captures the status code of a proxied response so the caller
+// can decide whether to settle meters (only on a confirmed terminal state).
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wroteHeader {
+		s.status = code
+		s.wroteHeader = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+// parseSandboxPath matches /sandboxes/{id} or /v2/sandboxes/{id} with an
+// optional /subpath. Returns the id, whether a subpath follows, and whether it
+// matched at all. The bare list paths (/sandboxes, /v2/sandboxes) do not match.
+func parseSandboxPath(p string) (id string, subpath, ok bool) {
+	var rest string
+	switch {
+	case strings.HasPrefix(p, "/sandboxes/"):
+		rest = strings.TrimPrefix(p, "/sandboxes/")
+	case strings.HasPrefix(p, "/v2/sandboxes/"):
+		rest = strings.TrimPrefix(p, "/v2/sandboxes/")
+	default:
+		return "", false, false
+	}
+	if rest == "" {
+		return "", false, false
+	}
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[:i], true, true
+	}
+	return rest, false, true
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -325,20 +387,52 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Intercept sandbox create / destroy; everything else is transparent.
-	if r.Method == http.MethodPost && r.URL.Path == "/sandboxes" {
+	// cube-api serves every route at BOTH "/" and "/cubeapi/v1/". Normalize the
+	// prefix for routing/authorization decisions only — the proxy still forwards
+	// the ORIGINAL path, so cube-api receives whichever form the client used.
+	p := r.URL.Path
+	if p == "/cubeapi/v1" || p == "/cubeapi/v1/" {
+		p = "/"
+	} else if strings.HasPrefix(p, "/cubeapi/v1/") {
+		p = strings.TrimPrefix(p, "/cubeapi/v1")
+	}
+
+	switch {
+	case p == "/health":
+		g.proxy.ServeHTTP(w, r) // upstream liveness
+		return
+	case r.Method == http.MethodPost && p == "/sandboxes":
 		g.handleCreate(w, r, t)
 		return
+	case r.Method == http.MethodGet && (p == "/sandboxes" || p == "/v2/sandboxes"):
+		g.handleList(w, r, t)
+		return
+	case r.Method == http.MethodGet && (p == "/templates" || strings.HasPrefix(p, "/templates/")):
+		g.proxy.ServeHTTP(w, r) // read-only template info, needed to launch
+		return
 	}
-	if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/sandboxes/") {
-		id := strings.TrimPrefix(r.URL.Path, "/sandboxes/")
-		if id != "" && !strings.Contains(id, "/") {
-			g.proxy.ServeHTTP(w, r)
-			g.ledger.recordClose(id, time.Now().Unix())
+
+	// Any specific sandbox (and its subpaths: logs, timeout, pause, resume,
+	// connect, snapshots, rollback) — enforce ownership before touching the box.
+	if id, subpath, ok := parseSandboxPath(p); ok {
+		owner, known := g.ledger.ownerOf(id)
+		if !known || owner != t.ID {
+			writeErr(w, http.StatusNotFound, "sandbox not found")
 			return
 		}
+		if r.Method == http.MethodDelete && !subpath {
+			g.handleDelete(w, r, id)
+			return
+		}
+		g.proxy.ServeHTTP(w, r)
+		return
 	}
-	g.proxy.ServeHTTP(w, r)
+
+	// DEFAULT-DENY. cube-api has no tenant model, so everything else is a shared
+	// or control-plane surface a tenant must not reach through this gateway:
+	// template mutation (POST/PATCH/DELETE /templates*), /snapshots, /cluster/*,
+	// /nodes*, /config, /store/*, /agenthub/*, and any unknown path.
+	writeErr(w, http.StatusForbidden, "forbidden: not a tenant-scoped operation")
 }
 
 func (g *Gateway) handleCreate(w http.ResponseWriter, r *http.Request, t Tenant) {
@@ -365,19 +459,31 @@ func (g *Gateway) handleCreate(w http.ResponseWriter, r *http.Request, t Tenant)
 		return
 	}
 
-	// Resource clamps
+	// Resource clamps, then a default floor so an unclamped/unsized sandbox can
+	// never book 0 capacity (which would under-report committed load).
 	cpu := asInt(m["cpuCount"])
 	if t.MaxCPUCount > 0 && (cpu == 0 || cpu > t.MaxCPUCount) {
 		cpu = t.MaxCPUCount
-		m["cpuCount"] = cpu
 	}
+	if cpu <= 0 {
+		cpu = max1(g.defaultCPU)
+	}
+	m["cpuCount"] = cpu
+
 	mem := asInt(m["memoryMB"])
 	if t.MaxMemoryMB > 0 && (mem == 0 || mem > t.MaxMemoryMB) {
 		mem = t.MaxMemoryMB
-		m["memoryMB"] = mem
 	}
+	if mem <= 0 {
+		mem = g.defaultMemMB
+		if mem < 1 {
+			mem = 1
+		}
+	}
+	m["memoryMB"] = mem
 
-	// Tag tenant in metadata
+	// Tag tenant in metadata (overwrite any client-supplied value — this is the
+	// basis for ownership and the tenant-scoped list).
 	meta, _ := m["metadata"].(map[string]any)
 	if meta == nil {
 		meta = map[string]any{}
@@ -423,8 +529,69 @@ func (g *Gateway) handleCreate(w http.ResponseWriter, r *http.Request, t Tenant)
 	w.Write(respBody)
 }
 
+// handleDelete proxies the destroy to the box, then settles the meter ONLY when
+// the box confirms removal — 2xx, or 404/410 meaning it was already gone
+// (reconciliation). On a 5xx/transient failure capacity is NOT freed, since the
+// sandbox may still be running. Ownership is already checked by the caller.
+func (g *Gateway) handleDelete(w http.ResponseWriter, r *http.Request, id string) {
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	g.proxy.ServeHTTP(rec, r)
+	if rec.status < 300 || rec.status == http.StatusNotFound || rec.status == http.StatusGone {
+		g.ledger.recordClose(id, time.Now().Unix())
+	}
+}
+
+// handleList proxies the list (preserving the caller's path + query so /v2 and
+// /cubeapi/v1 shapes work) and returns ONLY the sandboxes this tenant owns. The
+// tenant post-filter is authoritative, so a crafted metadata query can't widen
+// the result set. If the body can't be parsed as an array we return [] rather
+// than risk leaking another tenant's sandboxes.
+func (g *Gateway) handleList(w http.ResponseWriter, r *http.Request, t Tenant) {
+	req, _ := http.NewRequest(http.MethodGet, g.upstream.String()+r.URL.Path, nil)
+	req.URL.RawQuery = r.URL.RawQuery
+	copyHeaders(req.Header, r.Header)
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+
+	var list []map[string]any
+	w.Header().Set("Content-Type", "application/json")
+	if json.Unmarshal(body, &list) != nil {
+		w.Write([]byte("[]"))
+		return
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, s := range list {
+		if meta, ok := s["metadata"].(map[string]any); ok {
+			if tn, _ := meta["tenant"].(string); tn == t.ID {
+				out = append(out, s)
+			}
+		}
+	}
+	b, _ := json.Marshal(out)
+	w.Write(b)
+}
+
 func (g *Gateway) handleAdmin(w http.ResponseWriter, r *http.Request) {
-	if g.admin == "" || r.Header.Get("X-Admin-Token") != g.admin {
+	// Constant-time compare so the admin token isn't a timing oracle.
+	if g.admin == "" ||
+		subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Admin-Token")), []byte(g.admin)) != 1 {
 		writeErr(w, http.StatusUnauthorized, "admin token required")
 		return
 	}
@@ -520,9 +687,13 @@ func (g *Gateway) openByTenant() map[string]int {
 	return out
 }
 
+// copyHeaders forwards request headers to the upstream hop but ALWAYS strips the
+// caller's inbound credentials, so a tenant key never reaches cube-api.
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
-		if strings.EqualFold(k, "Content-Length") {
+		if strings.EqualFold(k, "Content-Length") ||
+			strings.EqualFold(k, "Authorization") ||
+			strings.EqualFold(k, "X-API-Key") {
 			continue
 		}
 		for _, v := range vs {
@@ -537,6 +708,10 @@ func asInt(v any) int {
 		return int(n)
 	case int:
 		return n
+	case string:
+		if i, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
+			return i
+		}
 	}
 	return 0
 }
@@ -547,6 +722,8 @@ func main() {
 	tenantsPath := flag.String("tenants", env("GATEWAY_TENANTS", "tenants.json"), "tenants config file")
 	usagePath := flag.String("usage", env("GATEWAY_USAGE_LOG", "usage.jsonl"), "usage ledger (JSONL)")
 	admin := flag.String("admin-token", env("GATEWAY_ADMIN_TOKEN", ""), "admin API token")
+	defaultCPU := flag.Int("default-cpu", envInt("GATEWAY_DEFAULT_CPU", 1), "vCPU charged to an unclamped, unsized sandbox")
+	defaultMemMB := flag.Int("default-mem-mb", envInt("GATEWAY_DEFAULT_MEM_MB", 512), "memory MB charged to an unclamped, unsized sandbox")
 	fleetNodes := flag.Int("fleet-nodes", envInt("GATEWAY_FLEET_NODES", 1), "worker nodes in the fleet")
 	fleetVCPU := flag.Int("fleet-vcpu", envInt("GATEWAY_FLEET_VCPU", 0), "total schedulable vCPU across the fleet (0=unset)")
 	fleetMemMB := flag.Int("fleet-mem-mb", envInt("GATEWAY_FLEET_MEM_MB", 0), "total schedulable memory MB across the fleet (0=unset)")
@@ -580,18 +757,30 @@ func main() {
 		log.Fatalf("ledger: %v", err)
 	}
 
+	// The transparent proxy must also strip inbound tenant credentials so they
+	// never reach cube-api on the proxied (ownership-gated) paths.
+	rp := httputil.NewSingleHostReverseProxy(upURL)
+	baseDirector := rp.Director
+	rp.Director = func(req *http.Request) {
+		baseDirector(req)
+		req.Header.Del("Authorization")
+		req.Header.Del("X-Api-Key")
+	}
+
 	g := &Gateway{
-		tenants:  tenants,
-		byID:     byID,
-		upstream: upURL,
-		proxy:    httputil.NewSingleHostReverseProxy(upURL),
-		ledger:   ledger,
-		admin:    *admin,
-		client:   &http.Client{Timeout: 60 * time.Second},
-		fleetNodes: *fleetNodes,
-		fleetVCPU:  *fleetVCPU,
-		fleetMemMB: *fleetMemMB,
-		targetUtil: *targetUtil,
+		tenants:      tenants,
+		byID:         byID,
+		upstream:     upURL,
+		proxy:        rp,
+		ledger:       ledger,
+		admin:        *admin,
+		client:       &http.Client{Timeout: 60 * time.Second},
+		defaultCPU:   *defaultCPU,
+		defaultMemMB: *defaultMemMB,
+		fleetNodes:   *fleetNodes,
+		fleetVCPU:    *fleetVCPU,
+		fleetMemMB:   *fleetMemMB,
+		targetUtil:   *targetUtil,
 	}
 
 	log.Printf("cube gateway: listening %s -> %s | tenants=%d | usage=%s",
