@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ONE_CLICK_RUNTIME_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOLBOX_ROOT="${ONE_CLICK_TOOLBOX_ROOT:-/usr/local/services/cubetoolbox}"
+TOOLBOX_ROOT="/usr/local/services/cubetoolbox"
 ENV_FILE="${ONE_CLICK_RUNTIME_ENV_FILE:-${TOOLBOX_ROOT}/.one-click.env}"
 
 if [[ -f "${ENV_FILE}" ]]; then
@@ -30,6 +30,11 @@ die() {
   exit 1
 }
 
+# shellcheck source=../common/validation.sh
+source "${ONE_CLICK_RUNTIME_SCRIPT_DIR}/../common/validation.sh"
+# shellcheck source=../common/cubelet_config.sh
+source "${ONE_CLICK_RUNTIME_SCRIPT_DIR}/../common/cubelet_config.sh"
+
 require_cmd() {
   local cmd="$1"
   command -v "${cmd}" >/dev/null 2>&1 || die "required command not found: ${cmd}"
@@ -52,7 +57,6 @@ cubelet_storage_backend_from_config() {
 validate_cubelet_cow_startup_deps() {
   local config_path="$1"
   ensure_file "${config_path}"
-  require_cmd rg
   require_cmd sed
 
   local storage_backend
@@ -121,6 +125,24 @@ ensure_bind_mount_file() {
   [[ -f "${path}" ]] || die "required bind mount source file not found: ${path}"
 }
 
+# Escape VALUE so it can be safely interpolated into the replacement text of a
+# sed `s<delim>...<delim>...<delim>` expression. Escapes backslashes, '&' (the
+# whole-match reference) and the substitution delimiter (default '/'); pass the
+# delimiter actually used at the call site (e.g. '#') so values containing it do
+# not terminate the command. Backslash is written as '\\' in the bracket
+# expression so it is unambiguously a member across POSIX and GNU sed (GNU sed
+# treats a bare '\<delim>' as the plain delimiter, dropping backslash from the
+# set). Embedded newlines / carriage returns are stripped as defense-in-depth:
+# an unescaped newline would terminate the sed command and allow a crafted value
+# (e.g. a password read from .env) to inject arbitrary sed script. This is the
+# single shared helper for every one-click runtime script; do not re-define it
+# per-script (that historically caused inconsistent escaping semantics).
+escape_sed() {
+  local value="$1"
+  local delim="${2:-/}"
+  printf '%s' "${value}" | tr -d '\n\r' | sed "s/[\\\\${delim}&]/\\\\&/g"
+}
+
 render_template_atomic() {
   local template="$1"
   local output="$2"
@@ -163,7 +185,10 @@ resolve_control_plane_cubemaster_addr() {
   local addr="${ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR:-}"
   local ip="${ONE_CLICK_CONTROL_PLANE_IP:-}"
   local default_addr="${CUBEMASTER_ADDR:-127.0.0.1:8089}"
-  local port="${default_addr##*:}"
+  # 8089 is the cubemaster protocol port (a fixed constant), NOT derived from
+  # CUBEMASTER_ADDR -- that variable is the control node's local listen address;
+  # using its port here was an accidental coupling that broke when they differed.
+  local cubemaster_port=8089
 
   if [[ "${role}" != "compute" ]]; then
     printf '%s\n' "${default_addr}"
@@ -171,16 +196,72 @@ resolve_control_plane_cubemaster_addr() {
   fi
 
   if [[ -n "${addr}" ]]; then
+    validate_host_port "${addr}" "ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR"
     printf '%s\n' "${addr}"
     return 0
   fi
 
   if [[ -n "${ip}" ]]; then
-    printf '%s:%s\n' "${ip}" "${port}"
+    validate_ipv4_literal "${ip}" "ONE_CLICK_CONTROL_PLANE_IP"
+    validate_host_port "${ip}:${cubemaster_port}" "ONE_CLICK_CONTROL_PLANE_IP-derived cubemaster address"
+    printf '%s:%s\n' "${ip}" "${cubemaster_port}"
     return 0
   fi
 
   die "ONE_CLICK_CONTROL_PLANE_IP or ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR is required for compute role"
+}
+
+resolve_control_plane_cubeops_addr() {
+  local role
+  role="$(one_click_deploy_role)"
+  local addr="${ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR:-}"
+  local ip="${ONE_CLICK_CONTROL_PLANE_IP:-}"
+  local default_addr="${CUBEOPS_ADDR:-127.0.0.1:3010}"
+  local cubeops_port=3010
+
+  if [[ "${role}" != "compute" ]]; then
+    printf '%s\n' "${default_addr}"
+    return 0
+  fi
+
+  if [[ -n "${addr}" ]]; then
+    validate_host_port "${addr}" "ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR"
+    printf '%s\n' "${addr}"
+    return 0
+  fi
+
+  if [[ -n "${ip}" ]]; then
+    validate_ipv4_literal "${ip}" "ONE_CLICK_CONTROL_PLANE_IP"
+    validate_host_port "${ip}:${cubeops_port}" "ONE_CLICK_CONTROL_PLANE_IP-derived cubeops address"
+    printf '%s:%s\n' "${ip}" "${cubeops_port}"
+    return 0
+  fi
+
+  die "ONE_CLICK_CONTROL_PLANE_IP or ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR is required for compute role"
+}
+
+command_output_has_exact_line() {
+  local needle="$1"
+  shift
+
+  require_cmd grep
+
+  local output
+  output="$("$@" 2>/dev/null || true)"
+  [[ -n "${output}" ]] || return 1
+  grep -Fxq -- "${needle}" <<<"${output}"
+}
+
+command_output_contains_fixed_string() {
+  local needle="$1"
+  shift
+
+  require_cmd grep
+
+  local output
+  output="$("$@" 2>/dev/null || true)"
+  [[ -n "${output}" ]] || return 1
+  grep -Fq -- "${needle}" <<<"${output}"
 }
 
 start_with_pidfile() {
@@ -233,7 +314,7 @@ pid_matches_pattern() {
     return 0
   fi
 
-  pgrep -f -- "${pattern}" | rg -x -- "${pid}" >/dev/null 2>&1
+  command_output_has_exact_line "${pid}" pgrep -f -- "${pattern}"
 }
 
 refresh_pidfile_from_pattern() {
@@ -301,7 +382,7 @@ stop_by_pidfile() {
 
 container_exists() {
   local name="$1"
-  docker ps -a --format '{{.Names}}' | rg -x "${name}" >/dev/null 2>&1
+  command_output_has_exact_line "${name}" docker ps -a --format '{{.Names}}'
 }
 
 docker_rm_if_exists() {
@@ -316,6 +397,11 @@ docker_rm_if_exists() {
   # cover this graceful stop.
   docker stop -t "${stop_timeout}" "${name}" >/dev/null 2>&1 || true
   docker rm "${name}" >/dev/null 2>&1 || true
+}
+
+docker_image_exists() {
+  local image_ref="$1"
+  docker image inspect "${image_ref}" >/dev/null 2>&1
 }
 
 wait_for_http() {

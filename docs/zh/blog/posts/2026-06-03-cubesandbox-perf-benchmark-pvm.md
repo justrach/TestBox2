@@ -33,14 +33,14 @@ CubeSandbox 面向 AI Agent 代码执行场景设计，极速冷启动和高并�
 | 机器类型 | 腾讯云[标准型云服务器 SA9.4XLARGE32](https://cloud.tencent.com/document/product/213/11518)（可在腾讯云控制台购买同款） |
 | 可用区 | — |
 | OS | OpenCloudOS 9.4 |
-| 内核 | `6.6.69-cube.pvm.host.005.x` |
+| 内核 | `6.6.69-opencloudos9.cubesandbox.pvm.host` |
 | CPU 型号 | AMD EPYC 9K65 @ — |
 | CPU 配置 | 1 Socket × 16 Core × 1 Thread = **16 逻辑核** |
 | NUMA 节点 | 1（node0: 0-15） |
 | 内存总量 | **32 GiB** |
 | 系统盘 | `/dev/vda` 200 GiB 增强型 SSD 云硬盘，格式化为 XFS，挂载至 `/` |
 
-> **SA9.4XLARGE32** 是腾讯云标准型第九代实例，搭载 AMD EPYC 9K65 处理器，适合通用计算场景。本文运行 PVM（Parallel Virtual Machine）内核，支持嵌套虚拟化，可在普通云服务器上运行 CubeSandbox。如需复现本文测试，可前往[腾讯云 CVM 购买页](https://buy.cloud.tencent.com/cvm)选购同款。
+> **SA9.4XLARGE32** 是腾讯云标准型第九代实例，搭载 AMD EPYC 9K65 处理器，适合通用计算场景。本文运行 PVM（Pagetable-based Virtual Machine）内核，支持嵌套虚拟化，可在普通云服务器上运行 CubeSandbox。如需复现本文测试，可前往[腾讯云 CVM 购买页](https://buy.cloud.tencent.com/cvm)选购同款。
 
 > 安装 CubeSandbox 请参照[快速开始指南](../../guide/quickstart.md)。
 
@@ -99,7 +99,7 @@ cubemastercli tpl list
 ```bash
 pip install e2b-code-interpreter
 
-export CUBE_API_URL=http://<your-server-ip>:3000
+export E2B_API_URL=http://<your-server-ip>:3000
 export E2B_API_KEY=e2b_000000           # 本地部署填任意非空字符串
 export CUBE_TEMPLATE_ID=<your-template-id>  # 上一步 cubemastercli tpl list 查到的 ID
 export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem  # mkcert 证书路径
@@ -260,10 +260,10 @@ cd examples/snapshot-rollback-clone
 pip install -r requirements.txt   # 安装 cubesandbox SDK
 
 # 以下环境变量为所有 4.x 压测脚本的前置，每个新 shell 都需先 export（或写入 env.sh 后 source）
-export E2B_API_URL=http://<your-server-ip>:3000
-export CUBE_API_URL=http://<your-server-ip>:3000   # 与 E2B_API_URL 保持一致
-export E2B_API_KEY=e2b_000000                       # 本地部署填任意非空字符串
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>          # cubemastercli tpl list 查到的 ID
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>       # 在 CubeProxy 本机运行时可写 127.0.0.1
+export CUBE_PROXY_PORT_HTTP=80                      # CubeProxy 监听端口, 默认 80
 ```
 
 > 下文 4.1~4.5 各节命令块默认你已在当前 shell 完成上述 `export`（脚本通过 `env.py` 读取这些变量）。换新终端窗口请重新 export。
@@ -279,9 +279,10 @@ export CUBE_TEMPLATE_ID=<your-template-id>          # cubemastercli tpl list 查
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单档机制，并发档位在命令行控制；逐档串行调用：
 python bench_snapshot_concurrency.py -c 1  -n 5
@@ -310,9 +311,10 @@ python bench_snapshot_concurrency.py -c 10 -n 5 --no-header
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单档机制，脏页大小在命令行控制（-d 即写入量 MB）；按需逐档调用：
 python bench_snapshot_dirty.py -d 0    -n 3
@@ -353,9 +355,10 @@ python bench_snapshot_dirty.py -d 1024 -n 3 --no-header
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单档机制，档位在命令行控制；按需逐档调用：
 python bench_create_concurrency.py -c 1  -n 3
@@ -384,9 +387,10 @@ python bench_create_concurrency.py -c 20 -n 3 --no-header
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单档机制，档位在命令行控制；按需逐档调用：
 python bench_rollback_concurrency.py -c 1  -n 5
@@ -417,9 +421,10 @@ python bench_rollback_concurrency.py -c 10 -n 5 --no-header
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单场景机制，n/并发/轮数在命令行控制；按需逐场景调用：
 python bench_clone_concurrency.py -n 1  -c 1  --rounds 5
@@ -449,9 +454,10 @@ Clone 单沙箱约 **271 ms**；10 沙箱 5 并发时整批 wall 约 **542 ms**�
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单档机制，档位在命令行控制；按需逐档调用：
 python bench_pause_resume_concurrency.py -c 1  -n 5

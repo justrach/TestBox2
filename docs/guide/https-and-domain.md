@@ -87,6 +87,67 @@ When to use which:
 
 Both modes coexist on every CubeProxy instance and share the same Redis-backed routing metadata; no additional configuration is required to enable the path form.
 
+## Customizing the Host Seen by Sandbox Services
+
+Some web frameworks validate the HTTP `Host`, while Cube public URLs use
+`<port>-<sandbox-id>.<domain>` by default. Set the E2B-compatible
+`network.maskRequestHost` option at sandbox creation time to customize the Host
+CubeProxy forwards to user services:
+
+```python
+from cubesandbox import Sandbox
+
+sandbox = Sandbox.create(
+    network={
+        "mask_request_host": "localhost:${PORT}",
+    },
+)
+```
+
+`${PORT}` is expanded per request using the sandbox service port parsed from
+the public URL or path route:
+
+```text
+port 3000 -> Host: localhost:3000
+port 8080 -> Host: localhost:8080
+```
+
+The external URL, DNS, and TLS SNI remain unchanged. When masking is applied,
+CubeProxy preserves the original request Host in `X-Forwarded-Host`. The same
+behavior applies to host-based routes, path-based routes, and user-service
+WebSocket handshakes.
+
+`maskRequestHost` is a per-sandbox, create-only option. Envd port `49983` is
+exempt so commands, files, and PTY protocols keep their existing authority.
+Requests sent directly to a SandboxIP or node HostPort bypass CubeProxy and are
+not rewritten.
+
+---
+
+## gRPC Ingress (Plaintext HTTP/2)
+
+CubeProxy also exposes a dedicated listener for sandbox gRPC services. The default port is `9090` and can be changed via `CUBE_PROXY_GRPC_PORT` in one-click deployments.
+
+Clients dial the CubeProxy IP over plaintext HTTP/2 and identify the target sandbox with the gRPC `:authority` pseudo-header, using the same `<container-port>-<sandbox-id>` format as host-based HTTP routing:
+
+```
+<container-port>-<sandbox-id>
+```
+
+For example, to reach sandbox `abc123` on container port `49983` through CubeProxy at `10.0.0.5`:
+
+```
+dial: 10.0.0.5:9090
+:authority: 49983-abc123
+```
+
+This mode is intended for gRPC clients that cannot rely on wildcard DNS or TLS on CubeProxy. It reuses the same Redis-backed routing metadata as host-based HTTP routing.
+
+When a sandbox is created with `network.allow_public_traffic = false`, the same
+`e2b-traffic-access-token` / `cube-traffic-access-token` checks apply on this
+listener too. Pass the token as gRPC metadata (or the equivalent request header)
+on every call; see [Restrict Public Access](./restrict-public-access.md).
+
 ---
 
 ## HTTPS Certificate Configuration

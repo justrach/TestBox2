@@ -13,19 +13,23 @@ use crate::common::CResult;
 use crate::sandbox::config::{Fs, VirtioFs};
 use crate::sandbox::disk::Disk;
 use crate::sandbox::net::Net;
-use crate::sandbox::pmem::Pmem;
+use crate::sandbox::pmem::{Pmem, HYP_AGENT_ID, HYP_OS_IMAGE_ID};
 
 use cube_hypervisor::config::{RateLimiterConfig, TokenBucketConfig};
 use cube_hypervisor::vm_config::{
-    ConsoleConfig, ConsoleOutputMode, CpuTopology, DiskConfig, FsConfig, MacAddr, NetConfig,
-    PayloadConfig, PmemConfig, RngConfig, VmConfig as VC, VsockConfig,
+    BalloonConfig, ConsoleConfig, ConsoleOutputMode, CpuTopology, DiskConfig, FsConfig,
+    IvshmemConfig, MacAddr, NetConfig, PayloadConfig, PmemConfig, RngConfig, VmConfig as VC,
+    VsockConfig,
 };
 use cube_hypervisor::vmm_config::VmmConfig;
 
 use log::LevelFilter;
 use serde::de::Visitor;
 use serde::{Deserialize, Serialize};
-const IMAGE_PATH: &str = "/usr/local/services/cubetoolbox/cube-image/cube-guest-image-cpu.img";
+
+pub const IMAGE_PATH: &str = "/usr/local/services/cubetoolbox/cube-image/cube-guest-image-cpu.img";
+/// Independent cube-agent.ext4 (virtio-pmem1). Prefer this over baking agent into guest image.
+pub const DEFAULT_AGENT_PATH: &str = "/usr/local/services/cubetoolbox/cube-agent/cube-agent.ext4";
 
 pub const VIRTIO_FS_TAG: &str = "cubeShared";
 pub const VIRTIO_FS_ID: &str = "cube-fs";
@@ -52,6 +56,7 @@ impl HypConfig {
 
 #[derive(Clone, Debug)]
 pub struct VmConfig {
+    pub ivshmem: Option<IvshmemConfig>,
     pub vcpus: u32,
     pub memory_size: u64,
     pub dirty_log: bool,
@@ -68,17 +73,41 @@ pub struct VmConfig {
     pub rng: RngConfig,
 }
 
-impl Default for VmConfig {
-    fn default() -> Self {
-        let params = vec![
+impl VmConfig {
+    /// Builtin pmem0=OS image, pmem1=agent.ext4.
+    /// Keep in sync with sandbox/pmem.rs DEVICE_INDEX_OFFSET (=2).
+    pub fn builtin_pmems(os_image_path: &str, agent_path: &str) -> Vec<PmemConfig> {
+        vec![
+            PmemConfig {
+                file: PathBuf::from(os_image_path),
+                discard_writes: true,
+                id: Some(HYP_OS_IMAGE_ID.to_string()),
+                ..Default::default()
+            },
+            PmemConfig {
+                file: PathBuf::from(agent_path),
+                discard_writes: true,
+                id: Some(HYP_AGENT_ID.to_string()),
+                ..Default::default()
+            },
+        ]
+    }
+
+    pub fn new(os_image_path: &str, agent_path: &str) -> Self {
+        let mut params = vec![
             "root=/dev/pmem0".to_string(),
             "rootflags=dax,errors=remount-ro ro".to_string(),
             "rootfstype=ext4".to_string(),
             "panic=1".to_string(),
-            "no_timer_check".to_string(),
-            "noreplace-smp".to_string(),
-            "printk.devkmsg=on".to_string(),
-            "console=hvc0".to_string(),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        params.extend(["no_timer_check".to_string(), "noreplace-smp".to_string()]);
+        params.extend(["printk.devkmsg=on".to_string()]);
+        #[cfg(target_arch = "aarch64")]
+        params.push("console=ttyAMA0,115200".to_string());
+        #[cfg(not(target_arch = "aarch64"))]
+        params.push("console=hvc0".to_string());
+        params.extend([
             "net.ifnames=0".to_string(),
             "audit=0".to_string(),
             "LANG=C".to_string(),
@@ -87,13 +116,9 @@ impl Default for VmConfig {
             "agent.debug_console".to_string(),
             "agent.debug_console_vport=1026".to_string(),
             "mitigations=off".to_string(),
-        ];
+        ]);
 
-        let pmems = vec![PmemConfig {
-            file: PathBuf::from(IMAGE_PATH),
-            discard_writes: true,
-            ..Default::default()
-        }];
+        let pmems = Self::builtin_pmems(os_image_path, agent_path);
 
         //console/serial
         let console = ConsoleConfig {
@@ -101,6 +126,7 @@ impl Default for VmConfig {
             ..Default::default()
         };
         VmConfig {
+            ivshmem: None,
             vcpus: 0,
             memory_size: 0,
             dirty_log: false,
@@ -122,6 +148,12 @@ impl Default for VmConfig {
     }
 }
 
+impl Default for VmConfig {
+    fn default() -> Self {
+        Self::new(IMAGE_PATH, DEFAULT_AGENT_PATH)
+    }
+}
+
 impl VmConfig {
     pub fn to_vm_config(&self) -> VC {
         let mut vc = VC::default();
@@ -138,6 +170,11 @@ impl VmConfig {
 
         vc.memory.size = self.memory_size * MI_B;
         vc.memory.dirty_log = self.dirty_log;
+        vc.balloon = Some(BalloonConfig {
+            size: 0,
+            deflate_on_oom: false,
+            free_page_reporting: true,
+        });
 
         let cmds = self.cmdlines.join(" ").to_string();
         let payload = PayloadConfig {
@@ -164,7 +201,18 @@ impl VmConfig {
         if let Some(vs) = self.vsock.clone() {
             vc.vsock = Some(vs)
         }
+        if let Some(ivshmem) = self.ivshmem.clone() {
+            vc.ivshmem = Some(ivshmem)
+        }
         vc
+    }
+
+    /// Enable ivshmem shared memory channel with a caller-supplied backend
+    /// file path. The caller is responsible for creating and sizing the
+    /// file before calling this. This keeps the shim agnostic of the
+    /// backend naming convention.
+    pub fn enable_ivshmem(&mut self, path: PathBuf, size: usize) {
+        self.ivshmem = Some(IvshmemConfig { path, size });
     }
 
     pub fn add_cmdline(&mut self, cmd: String) -> &mut Self {
@@ -437,29 +485,46 @@ mod tests {
     use crate::common::utils::Utils;
     use crate::{
         common::utils::DISK_DEVICE_ID_PRE,
-        hypervisor::config::{VmConfig, IMAGE_PATH},
+        hypervisor::config::{VmConfig, DEFAULT_AGENT_PATH, IMAGE_PATH},
         sandbox::disk::Disk,
+        sandbox::pmem::{HYP_AGENT_ID, HYP_OS_IMAGE_ID},
     };
     #[test]
     fn utils_config_dft() {
         let config = VmConfig::default();
+        let hypervisor_config = config.to_vm_config();
 
-        //default
+        //default: pmem0=OS, pmem1=agent
         assert!(config.pmems.is_some());
-        let pmem = config.pmems.unwrap();
+        let pmem = config.pmems.as_ref().unwrap();
+        assert_eq!(pmem.len(), 2);
         assert_eq!(pmem[0].file, PathBuf::from(IMAGE_PATH));
+        assert_eq!(pmem[0].id.as_deref(), Some(HYP_OS_IMAGE_ID));
+        assert!(pmem[0].discard_writes);
+        assert_eq!(pmem[1].file, PathBuf::from(DEFAULT_AGENT_PATH));
+        assert_eq!(pmem[1].id.as_deref(), Some(HYP_AGENT_ID));
+        assert!(pmem[1].discard_writes);
         assert_eq!(config.console.mode, ConsoleOutputMode::Tty);
         assert_eq!(config.rng.src, PathBuf::from("/dev/urandom"));
+        let balloon = hypervisor_config.balloon.unwrap();
+        assert_eq!(balloon.size, 0);
+        assert!(!balloon.deflate_on_oom);
+        assert!(balloon.free_page_reporting);
 
-        let params = vec![
+        let mut params = vec![
             "root=/dev/pmem0".to_string(),
             "rootflags=dax,errors=remount-ro ro".to_string(),
             "rootfstype=ext4".to_string(),
             "panic=1".to_string(),
-            "no_timer_check".to_string(),
-            "noreplace-smp".to_string(),
-            "printk.devkmsg=on".to_string(),
-            "console=hvc0".to_string(),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        params.extend(["no_timer_check".to_string(), "noreplace-smp".to_string()]);
+        params.extend(["printk.devkmsg=on".to_string()]);
+        #[cfg(target_arch = "aarch64")]
+        params.push("console=ttyAMA0,115200".to_string());
+        #[cfg(not(target_arch = "aarch64"))]
+        params.push("console=hvc0".to_string());
+        params.extend([
             "net.ifnames=0".to_string(),
             "audit=0".to_string(),
             "LANG=C".to_string(),
@@ -468,8 +533,18 @@ mod tests {
             "agent.debug_console".to_string(),
             "agent.debug_console_vport=1026".to_string(),
             "mitigations=off".to_string(),
-        ];
+        ]);
         assert_eq!(config.cmdlines, params);
+    }
+
+    #[test]
+    fn builtin_pmems_order_and_ids() {
+        let pmems = VmConfig::builtin_pmems("/os.img", "/agent.ext4");
+        assert_eq!(pmems.len(), 2);
+        assert_eq!(pmems[0].file, PathBuf::from("/os.img"));
+        assert_eq!(pmems[0].id.as_deref(), Some(HYP_OS_IMAGE_ID));
+        assert_eq!(pmems[1].file, PathBuf::from("/agent.ext4"));
+        assert_eq!(pmems[1].id.as_deref(), Some(HYP_AGENT_ID));
     }
 
     #[test]

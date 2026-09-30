@@ -44,10 +44,13 @@ Cube Sandbox 提供了基于 Docker 的构建镜像，以确保一致的构建�
 # 构建构建镜像
 make builder-image
 
+# 中国大陆用户可通过镜像源获取 apt 软件包
+make builder-image MIRROR=cn
+
 # 进入构建容器的交互式 Shell
 make builder-shell
 
-# 构建所有 Go 组件（CubeMaster、Cubelet、network-agent）
+# 构建所有 Go 组件（CubeMaster、Cubelet、…）
 make all
 
 # 构建单个组件
@@ -55,6 +58,9 @@ make cubemaster
 make cubelet
 make agent
 make shim
+
+# 清理本地 Go/Rust 编译产物（不清全局缓存）
+make clean
 ```
 
 完整的构建目标列表请参见 [Makefile](./Makefile)。
@@ -71,14 +77,13 @@ make shim
 | `agent/` | Rust | 运行在每个沙箱内部的 Guest Daemon |
 | `hypervisor/` | Rust | 基于 KVM 的 MicroVM 管理器（Cloud Hypervisor 分支） |
 | `mvs/` / `CubeNet/` | Go | CubeVS 基于 eBPF 的网络隔离 |
-| `network-agent/` | Go | 网络管理服务 |
 | `deploy/` | Shell | 部署脚本与 Guest 镜像工具 |
 | `examples/` | Python | SDK 示例与端到端使用场景 |
 | `docs/` | Markdown | VitePress 文档站（中英双语） |
 
 ## 提交 Pull Request
 
-1. **Fork** 仓库，并从 `main` 分支创建功能分支。
+1. **Fork** 仓库，并从 `master` 分支创建功能分支。
 2. **修改代码** — 保持每个提交专注且原子化。
 3. **测试** — 确保现有测试和 Lint 检查均能通过。
 4. **添加测试** — 行为变更时请补充针对性的测试覆盖。
@@ -132,6 +137,15 @@ Signed-off-by: Your Name <your.email@example.com>
 - **Go** — 遵循标准 `gofmt` 格式化规范及项目约定。
 - **Rust** — 遵循 `rustfmt` 和 `clippy` 的建议。
 - **文档** — 使用清晰简洁的语言，中英文文档应保持同步。
+
+## Issue / PR 关闭规则
+
+Issue 与 PR 会在以下条件下被关闭：
+
+- **`need-info` 超时未回复**：维护者要求补充信息或修改后，作者**超过两周未回应**，将被作为过期项关闭。待补充所需信息或完成修改后可重新打开。
+- **已解决或被取代**：问题已修复、功能已实现，或已被其他 PR/方案取代。
+- **不在项目范围内 / 不予处理**：关闭时会说明原因。
+- **重复提交**：关闭并附上原始 Issue/PR 链接。
 
 ## 报告安全问题
 

@@ -16,7 +16,6 @@ import (
 	"github.com/containerd/plugin/registry"
 
 	"github.com/containerd/plugin"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	pb "github.com/tencentcloud/CubeSandbox/Cubelet/api/services/nbi/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/recov"
@@ -24,7 +23,8 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/trace"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 	"google.golang.org/grpc"
 )
 
@@ -92,7 +92,7 @@ func (s *CubeAPIServer) InitHost(ctx context.Context, in *pb.InitRequest) (*pb.I
 		if !ret.IsSuccessCode(rsp.GetCode()) {
 			cubelogCode = CubeLog.CodeInternalError
 			CubeLog.WithContext(ctx).Errorf("InitHost fail:%+v", rsp)
-			workflow.RecordCreateMetric(ctx, fmt.Errorf(rsp.Message), constants.CubeboxServiceID.ID(), time.Since(start))
+			workflow.RecordCreateMetric(ctx, fmt.Errorf("%s", rsp.Message), constants.CubeboxServiceID.ID(), time.Since(start))
 		} else {
 			workflow.RecordCreateMetric(ctx, nil, constants.CubeboxServiceID.ID(), time.Since(start))
 		}

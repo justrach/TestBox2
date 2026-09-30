@@ -6,12 +6,11 @@ package cubebox
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 var inspecMetaData = cli.Command{
@@ -43,17 +42,11 @@ var inspecMetaData = cli.Command{
 			return err
 		}
 		for _, id := range ids {
-			found := false
-			for _, item := range resp.Items {
-				if strings.HasPrefix(item.GetId(), id) {
-					boxIDs = append(boxIDs, item.GetId())
-					found = true
-					break
-				}
+			resolved, err := resolveSandboxIDFromList(resp.Items, id)
+			if err != nil {
+				return err
 			}
-			if !found {
-				return fmt.Errorf("cubebox %s not found", id)
-			}
+			boxIDs = append(boxIDs, resolved)
 		}
 
 		for _, id := range boxIDs {

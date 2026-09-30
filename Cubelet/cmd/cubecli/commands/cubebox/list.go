@@ -15,16 +15,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/urfave/cli/v2"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands/container"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 var ListCommand = &cli.Command{
 	Name:    "list",
 	Aliases: []string{"ls"},
-	Usage:   "Warning: `cuebcli ls` is deprecated, please use `cubecli cubebox ls` instead",
+	Usage:   "Warning: `cubecli ls` is deprecated, please use `cubecli cubebox ls` instead",
 	ArgsUsage: "[flags] [<filter>, ...]\n" +
 		"io.kubernetes.cri.container-type [container|sandbox]\n" +
 		"io.kubernetes.cri.sandbox-id xx",
@@ -246,7 +246,7 @@ func formatTime(created int64) string {
 var ListSandboxCommand = &cli.Command{
 	Name:    "sandboxes",
 	Aliases: []string{"s"},
-	Usage:   "list cubebox sandboxs",
+	Usage:   "list cubebox sandboxes",
 	ArgsUsage: "[flags] [<filter>, ...]\n" +
 		"io.kubernetes.cri.container-type [container|sandbox]\n" +
 		"io.kubernetes.cri.sandbox-id xx",

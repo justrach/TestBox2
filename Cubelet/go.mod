@@ -1,9 +1,9 @@
 module github.com/tencentcloud/CubeSandbox/Cubelet
 
-go 1.24.8
+go 1.25.7
 
 require (
-	github.com/cilium/ebpf v0.17.3 // indirect
+	github.com/cilium/ebpf v0.17.3
 	github.com/containerd/console v1.0.5
 	github.com/containerd/continuity v0.4.5
 	github.com/containerd/fifo v1.1.0
@@ -34,9 +34,11 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/tatsushid/go-fastping v0.0.0-20160109021039-d7bb493dee3e
 	github.com/tchap/go-patricia/v2 v2.3.3
-	github.com/tencentcloud/CubeSandbox/cubelog v0.1.1-0.20260113105508-a996703fa42f
+	github.com/tencentcloud/CubeSandbox/pkgs/CubeLog v0.1.1-0.20260113105508-a996703fa42f
+	github.com/tencentcloud/CubeSandbox/pkgs/proto v0.0.0
 	github.com/vishvananda/netlink v1.3.1
 	go.etcd.io/bbolt v1.4.3
+	golang.org/x/mod v0.29.0
 	golang.org/x/net v0.47.0
 	golang.org/x/sync v0.18.0
 	golang.org/x/sys v0.38.0
@@ -74,6 +76,7 @@ require (
 	github.com/docker/go-events v0.0.0-20190806004212-e31b211e4f1c // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
+	github.com/florianl/go-tc v0.4.1 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.8 // indirect
 	github.com/gin-contrib/sse v1.1.0 // indirect
@@ -97,11 +100,13 @@ require (
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/intel/goresctrl v0.10.0 // indirect
+	github.com/josharian/native v1.1.0 // indirect
 	github.com/klauspost/compress v1.18.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/mdlayher/netlink v1.7.2 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/miekg/pkcs11 v1.1.1 // indirect
 	github.com/minio/blake2b-simd v0.0.0-20160723061019-3f5f724cb5b1 // indirect
@@ -153,7 +158,6 @@ require (
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	golang.org/x/arch v0.20.0 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
-	golang.org/x/mod v0.29.0 // indirect
 	golang.org/x/oauth2 v0.32.0 // indirect
 	golang.org/x/tools v0.38.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251103181224-f26f9409b101 // indirect
@@ -189,6 +193,7 @@ require (
 	github.com/opencontainers/selinux v1.13.1
 	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/prometheus/client_golang v1.23.2
+	github.com/tencentcloud/CubeSandbox/CubeNet/cubevs v0.0.0
 	github.com/urfave/cli/v2 v2.27.7
 	go.uber.org/mock v0.6.0
 	golang.org/x/term v0.37.0
@@ -203,9 +208,12 @@ require (
 
 replace (
 	github.com/gogo/googleapis => github.com/gogo/googleapis v1.3.2
-	github.com/tencentcloud/CubeSandbox/cubelog => ../cubelog
+	github.com/tencentcloud/CubeSandbox/pkgs/CubeLog => ../pkgs/CubeLog
+	github.com/tencentcloud/CubeSandbox/pkgs/proto => ../pkgs/proto
 	google.golang.org/genproto => google.golang.org/genproto v0.0.0-20240123012728-ef4313101c80
 	google.golang.org/grpc => google.golang.org/grpc v1.67.1
 	// use 0.25.16 instande of latest that 0.25.16 have v1alpha2 and v1 runtime API
 	k8s.io/cri-api => k8s.io/cri-api v0.25.16
 )
+
+replace github.com/tencentcloud/CubeSandbox/CubeNet/cubevs => ../CubeNet/cubevs

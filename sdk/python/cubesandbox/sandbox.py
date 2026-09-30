@@ -3,28 +3,76 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Callable, Dict
 
 import httpx
 import requests
 
 from ._commands import CommandResult, Commands
-from ._config import Config
+from ._config import Config, _auth_headers
 from ._exceptions import ApiError, AuthenticationError, CubeSandboxError, SandboxNotFoundError, TemplateNotFoundError
 from ._filesystem import Filesystem
-from ._models import Execution, ExecutionError, OutputMessage, Result, SnapshotInfo
+from ._models import Execution, ExecutionError, OutputMessage, Result, SandboxInfo, SnapshotInfo
+from ._policy import (
+    Rule,
+    _build_network_payload,
+    _build_network_update_body,
+)
+from ._pty import Pty
 from ._stream import _parse_line
 from ._transport import build_client
+from ._volume import VolumeMountsArg, _serialize_volume_mounts
 
 JUPYTER_PORT = 49999
+
+#: Never-timeout sentinel. See docs/guide/lifecycle.md.
+NEVER_TIMEOUT = -1
+
+class _CloneCleanup:
+    """Process-local ownership of one clone operation's temporary snapshot."""
+
+    def __init__(self, snapshot_id: str, remaining: int, config: Config) -> None:
+        self.snapshot_id = snapshot_id
+        self.remaining = remaining
+        self.config = config
+        self._released: set[str] = set()
+        self._cleanup_started = False
+        self._lock = threading.Lock()
+
+    def release(self, sandbox_id: str) -> None:
+        with self._lock:
+            if sandbox_id in self._released:
+                return
+            self._released.add(sandbox_id)
+            self.remaining -= 1
+            should_cleanup = self.remaining == 0
+        if should_cleanup:
+            self.cleanup()
+
+    def cleanup(self) -> None:
+        """Start best-effort deletion once, including failure backstops."""
+        with self._lock:
+            if self._cleanup_started:
+                return
+            self._cleanup_started = True
+        try:
+            Sandbox.delete_snapshot(self.snapshot_id, config=self.config)
+        except Exception:  # noqa: BLE001 — best-effort snapshot cleanup
+            return
 
 
 def _check_response(resp: requests.Response) -> None:
     if resp.ok:
         return
     try:
-        msg = resp.json().get("message") or resp.json().get("detail") or resp.text
-    except Exception:
+        body = resp.json()
+        msg = (
+            (body.get("message") or body.get("detail") or resp.text)
+            if isinstance(body, dict)
+            else resp.text
+        )
+    except (ValueError, requests.JSONDecodeError):
         msg = resp.text or f"HTTP {resp.status_code}"
     code = resp.status_code
     if code in (401, 403):
@@ -32,6 +80,31 @@ def _check_response(resp: requests.Response) -> None:
     if code == 404:
         raise (TemplateNotFoundError if "template" in msg.lower() else SandboxNotFoundError)(msg, code)
     raise ApiError(msg, code)
+
+
+_VALID_ON_TIMEOUT = ("kill", "pause")
+
+
+def _serialize_lifecycle(lifecycle: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate a snake_case ``lifecycle`` dict to the camelCase wire shape
+    used by CubeAPI (and by the e2b SDK).
+
+    Validates ``on_timeout`` early so misspellings ("paused", "Pause") raise
+    a clean ``ValueError`` at the call site instead of producing an opaque
+    HTTP 4xx from the server.
+    """
+    out: Dict[str, Any] = {}
+    on_timeout = lifecycle.get("on_timeout")
+    if on_timeout is not None:
+        if on_timeout not in _VALID_ON_TIMEOUT:
+            raise ValueError(
+                f"lifecycle.on_timeout must be one of {_VALID_ON_TIMEOUT!r}, "
+                f"got {on_timeout!r}"
+            )
+        out["onTimeout"] = on_timeout
+    if "auto_resume" in lifecycle:
+        out["autoResume"] = bool(lifecycle["auto_resume"])
+    return out
 
 
 class Sandbox:
@@ -52,6 +125,8 @@ class Sandbox:
         self._client: httpx.Client | None = None
         self._commands = Commands(self)
         self._files = Filesystem(self)
+        self._pty = Pty(self)
+        self._clone_cleanup: _CloneCleanup | None = None
 
 
     @property
@@ -65,6 +140,25 @@ class Sandbox:
     @property
     def domain(self) -> str:
         return self._data.get("domain") or self._config.sandbox_domain
+
+    @property
+    def traffic_access_token(self) -> str | None:
+        """Per-sandbox token returned when ``network.allow_public_traffic=False``.
+
+        Send it as either the ``e2b-traffic-access-token`` (E2B-compatible)
+        or ``cube-traffic-access-token`` header on every request to the
+        sandbox's public URL — CubeProxy rejects unauthenticated traffic
+        with HTTP 403 when the sandbox was created with public access
+        restricted.
+
+        ``None`` for sandboxes with the default (publicly reachable)
+        configuration, including instances obtained via :meth:`connect` /
+        :meth:`resume` (the token is only delivered on the original create
+        response). Persist it client-side at create time if you need it
+        later.
+        """
+        token = self._data.get("trafficAccessToken")
+        return token or None
 
     def get_host(self, port: int) -> str:
         """Return the virtual hostname for a sandbox port.
@@ -81,6 +175,10 @@ class Sandbox:
     def files(self) -> "Filesystem":
         return self._files
 
+    @property
+    def pty(self) -> "Pty":
+        return self._pty
+
 
     @classmethod
     def create(
@@ -89,9 +187,13 @@ class Sandbox:
         *,
         timeout: int | None = None,
         env_vars: Dict[str, str] | None = None,
+        envs: Dict[str, str] | None = None,
         metadata: Dict[str, str] | None = None,
+        distribution_scope: list[str] | None = None,
         allow_internet_access: bool = True,
         network: Dict[str, Any] | None = None,
+        lifecycle: Dict[str, Any] | None = None,
+        volume_mounts: VolumeMountsArg | None = None,
         config: Config | None = None,
         **kwargs: Any,
     ) -> "Sandbox":
@@ -99,16 +201,67 @@ class Sandbox:
 
         Args:
             template: Template ID. Falls back to ``CUBE_TEMPLATE_ID`` env var.
-            timeout: Sandbox TTL in seconds. Defaults to ``Config.timeout`` (300).
+            timeout: Sandbox idle timeout in seconds (``None`` omits the field).
+                See ``docs/guide/lifecycle.md``.
             env_vars: Environment variables injected into the sandbox.
+            envs: E2B-compatible alias for ``env_vars``. When both aliases are
+                provided, they must contain the same values.
             metadata: Arbitrary key-value metadata (e.g. network-policy, host-mount).
+            distribution_scope: Compute node IDs or host IPs eligible to run the
+                sandbox. Pass a single entry to pin the sandbox to one node.
+            allow_internet_access: When ``False``, the sandbox is blocked from
+                making outbound traffic to the public internet.
+            network: Egress network policy. Accepts keys:
+                - ``allow_out`` / ``deny_out``: lists of CIDRs or hostnames (L3/L4).
+                - ``mask_request_host``: Host authority forwarded to user services;
+                  ``${PORT}`` expands to the requested sandbox port.
+                - ``rules``: list of :class:`~cubesandbox.Rule` dataclasses (or
+                  equivalent dicts with snake_case keys) for L7 host/path/SNI
+                  matching, audit, and credential injection. For E2B parity,
+                  a host-keyed mapping of per-host request transforms (e.g.
+                  ``{"api.example.com": [{"transform": {"headers": {...}}}]}``)
+                  is also accepted and converted into equivalent CubeEgress
+                  inject rules.
+            lifecycle: Optional dict mirroring the e2b SDK's ``lifecycle``
+                object (https://e2b.dev/docs/sandbox/auto-resume). Accepts
+                two keys:
+
+                - ``on_timeout``: ``"kill"`` (default) or ``"pause"``. When
+                  ``"pause"``, an idle sandbox is suspended instead of
+                  deleted; its memory snapshot survives across the pause.
+                - ``auto_resume``: ``bool``, default ``False``. Only
+                  meaningful when ``on_timeout="pause"``. When ``True``, the
+                  next request hitting the paused sandbox transparently
+                  wakes it back up. When ``False`` you must call
+                  :meth:`connect` to resume manually.
+
+                Absent ``lifecycle`` keeps today's behaviour (idle sandboxes
+                are killed).
+            volume_mounts: Optional dict mapping mount paths to volumes
+                (e2b-compatible). Key is the sandbox mount path, value is a
+                :class:`~cubesandbox.Volume`,
+                :class:`~cubesandbox.VolumeInfo`, or plain ``volumeID`` string.
+                Wrap any of those in :class:`~cubesandbox.VolumeMount` to set
+                Cube-specific attachment options such as ``read_only``::
+
+                    Sandbox.create(volume_mounts={"/workspace": vol})
+                    Sandbox.create(volume_mounts={"/workspace": "vol-123"})
+                    Sandbox.create(
+                        volume_mounts={"/dataset": VolumeMount(vol, read_only=True)}
+                    )
+
+                Each value must resolve to an existing ``volumeID`` created via
+                :meth:`cubesandbox.Volume.create`. ``read_only`` applies to this
+                sandbox attachment; it does not make the volume an immutable
+                snapshot.
             config: SDK config. Uses default (env-based) config if omitted.
 
         Returns:
             A running :class:`Sandbox` instance.
 
         Raises:
-            ValueError: If no template ID is provided.
+            ValueError: If no template ID is provided, or if ``lifecycle``
+                contains an unsupported ``on_timeout`` value.
             ApiError: On unexpected backend error (HTTP 500).
         """
         cfg = config or Config()
@@ -116,39 +269,60 @@ class Sandbox:
         if not tpl:
             raise ValueError("template is required. Set CUBE_TEMPLATE_ID or pass template=")
 
-        payload: dict = {"templateID": tpl, "timeout": timeout or cfg.timeout}
-        if env_vars:
-            payload["envVars"] = env_vars
+        if env_vars is not None and envs is not None and env_vars != envs:
+            raise ValueError("env_vars and envs must match when both are provided")
+        sandbox_env_vars = env_vars if env_vars is not None else envs
+
+        # Omitted when None; see docs/guide/lifecycle.md.
+        payload: dict = {"templateID": tpl}
+        if timeout is not None:
+            payload["timeout"] = timeout
+        if sandbox_env_vars:
+            payload["envVars"] = sandbox_env_vars
         if metadata:
             payload["metadata"] = metadata
+        if distribution_scope:
+            payload["distributionScope"] = distribution_scope
         if not allow_internet_access:
             payload["allow_internet_access"] = False
         if network:
-            net: dict = {}
-            if "allow_public_traffic" in network:
-                net["allowPublicTraffic"] = network["allow_public_traffic"]
-            if "allow_out" in network:
-                net["allowOut"] = network["allow_out"]
-            if "deny_out" in network:
-                net["denyOut"] = network["deny_out"]
+            net = _build_network_payload(network, allow_internet_access=allow_internet_access)
             if net:
                 payload["network"] = net
+        # Lifecycle: opt-in. Wire shape mirrors e2b
+        # (https://e2b.dev/docs/sandbox/auto-resume) — a nested object with
+        # camelCase keys. Absent => server-side default ("kill" on timeout).
+        if lifecycle:
+            payload["lifecycle"] = _serialize_lifecycle(lifecycle)
+        if volume_mounts:
+            payload["volumeMounts"] = _serialize_volume_mounts(volume_mounts)
         payload.update(kwargs)
 
         s = requests.Session()
         resp = s.post(f"{cfg.api_url}/sandboxes", json=payload,
-                      headers={"Content-Type": "application/json"})
+                      headers={"Content-Type": "application/json", **_auth_headers(cfg)})
         _check_response(resp)
         return cls(resp.json(), config=cfg)
 
     @classmethod
-    def connect(cls, sandbox_id: str, *, config: Config | None = None) -> "Sandbox":
+    def connect(
+        cls,
+        sandbox_id: str,
+        timeout: int | None = None,
+        *,
+        config: Config | None = None,
+    ) -> "Sandbox":
         """POST /sandboxes/:sandboxID/connect - Connect to an existing sandbox.
 
         Resumes the sandbox if it is currently paused.
 
         Args:
             sandbox_id: Sandbox identifier.
+            timeout: Sandbox idle timeout in seconds after connecting. ``None``
+                keeps the current timeout, ``-1`` disables idle expiry, and a
+                positive value ensures at least that much remaining lifetime
+                (running and paused sandboxes are never shortened). ``0`` and
+                values below ``-1`` are rejected.
             config: SDK config. Uses default (env-based) config if omitted.
 
         Returns:
@@ -156,13 +330,18 @@ class Sandbox:
 
         Raises:
             SandboxNotFoundError: If the sandbox does not exist (HTTP 404).
-            ApiError: On unexpected backend error (HTTP 500).
+            ApiError: If the timeout is ``0`` or below ``-1`` (HTTP 400), an
+                overlapping lifecycle transition prevents the connection
+                (HTTP 409), or an unexpected backend error occurs.
         """
         cfg = config or Config()
         s = requests.Session()
+        body: dict[str, int] = {}
+        if timeout is not None:
+            body["timeout"] = timeout
         resp = s.post(f"{cfg.api_url}/sandboxes/{sandbox_id}/connect",
-                      json={"timeout": cfg.timeout},
-                      headers={"Content-Type": "application/json"})
+                      json=body,
+                      headers={"Content-Type": "application/json", **_auth_headers(cfg)})
         _check_response(resp)
         return cls(resp.json(), config=cfg)
 
@@ -180,7 +359,7 @@ class Sandbox:
         """
         cfg = config or Config()
         s = requests.Session()
-        resp = s.get(f"{cfg.api_url}/sandboxes")
+        resp = s.get(f"{cfg.api_url}/sandboxes", headers=_auth_headers(cfg))
         _check_response(resp)
         return resp.json()
 
@@ -198,7 +377,7 @@ class Sandbox:
         """
         cfg = config or Config()
         s = requests.Session()
-        resp = s.get(f"{cfg.api_url}/v2/sandboxes")
+        resp = s.get(f"{cfg.api_url}/v2/sandboxes", headers=_auth_headers(cfg))
         _check_response(resp)
         return resp.json()
 
@@ -215,7 +394,7 @@ class Sandbox:
         """
         cfg = config or Config()
         s = requests.Session()
-        resp = s.get(f"{cfg.api_url}/health")
+        resp = s.get(f"{cfg.api_url}/health", headers=_auth_headers(cfg))
         _check_response(resp)
         return resp.json()
 
@@ -319,7 +498,7 @@ class Sandbox:
                 f"Sandbox {self.sandbox_id!r} did not reach 'paused' state within {timeout}s"
             )
 
-    def resume(self, timeout: int = 300) -> None:
+    def resume(self, timeout: int | None = None) -> None:
         """POST /sandboxes/:sandboxID/resume - Resume a paused sandbox.
 
         .. deprecated::
@@ -327,16 +506,71 @@ class Sandbox:
             and returns a fresh :class:`Sandbox` instance.
 
         Args:
-            timeout: Sandbox TTL in seconds after resume (default: 300).
+            timeout: Sandbox TTL in seconds after resume (``None`` omits the field).
+                See ``docs/guide/lifecycle.md``.
 
         Raises:
             SandboxNotFoundError: If the sandbox does not exist (HTTP 404).
             ApiError: If the sandbox is already running (HTTP 409) or on
                 unexpected backend error (HTTP 500).
         """
+        body: dict = {}
+        if timeout is not None:
+            body["timeout"] = timeout
         resp = self._session.post(
             f"{self._config.api_url}/sandboxes/{self.sandbox_id}/resume",
+            json=body,
+        )
+        _check_response(resp)
+
+    def set_timeout(self, timeout: int) -> None:
+        """POST /sandboxes/:sandboxID/timeout - Set sandbox idle timeout.
+
+        Args:
+            timeout: New idle timeout in seconds. ``0`` requests immediate
+                timeout; positive values set a normal TTL; ``NEVER_TIMEOUT``
+                (-1) disables idle timeout entirely.
+
+        Raises:
+            SandboxNotFoundError: If the sandbox does not exist (HTTP 404).
+            ApiError: If the timeout is invalid or on unexpected backend error.
+        """
+        resp = self._session.post(
+            f"{self._config.api_url}/sandboxes/{self.sandbox_id}/timeout",
             json={"timeout": timeout},
+        )
+        _check_response(resp)
+
+    def update_network(self, network: Dict[str, Any] | None = None) -> None:
+        """PUT /sandboxes/:sandboxID/network - Replace the egress policy.
+
+        Takes the whole policy as one object, including
+        ``allow_internet_access``, matching E2B's ``SandboxNetworkUpdate``. The
+        create path keeps ``allow_internet_access`` as a separate argument
+        because E2B's create does too; the asymmetry is upstream's, and matching
+        it is what lets code written against either SDK work unchanged.
+
+        Takes effect on established connections too, not just new ones: a
+        connection the new policy no longer allows is reset rather than left
+        running until it closes.
+
+        Args:
+            network: The complete desired policy. A replacement, not a patch —
+                an omitted key is cleared, and ``None`` clears everything.
+                Accepts ``allow_out``, ``deny_out``, ``rules``,
+                ``allow_internet_access``, plus the CubeSandbox extensions
+                ``allow_public_traffic`` and ``mask_request_host``. ``rules``
+                takes either CubeEgress's list of rules or E2B's
+                ``{host: [{transform: ...}]}`` mapping.
+
+        Raises:
+            SandboxNotFoundError: If the sandbox does not exist (HTTP 404).
+            ApiError: If the policy is invalid (HTTP 400), the sandbox is not
+                running (HTTP 409), or on unexpected backend error.
+        """
+        resp = self._session.put(
+            f"{self._config.api_url}/sandboxes/{self.sandbox_id}/network",
+            json=_build_network_update_body(network or {}),
         )
         _check_response(resp)
 
@@ -349,13 +583,22 @@ class Sandbox:
         """
         resp = self._session.delete(f"{self._config.api_url}/sandboxes/{self.sandbox_id}")
         _check_response(resp)
+        if self._clone_cleanup is not None:
+            self._clone_cleanup.release(self.sandbox_id)
 
-    def get_info(self) -> dict:
+    def get_info(self) -> SandboxInfo:
         """GET /sandboxes/:sandboxID - Get sandbox detail.
 
         Returns:
-            A dict containing ``sandboxID``, ``state``, ``cpuCount``,
-            ``memoryMB``, ``startedAt``, and other sandbox metadata.
+            A :class:`SandboxInfo` exposing E2B-compatible ``snake_case``
+            attributes (``sandbox_id``, ``template_id``, ``sandbox_domain``,
+            ``started_at`` / ``end_at`` as ``datetime``, ``state`` as
+            ``SandboxState | str | None``, ``cpu_count``, ``memory_mb``,
+            ``envd_version``, ``metadata``, ``name`` ...), plus the
+            CubeSandbox-specific ``disk_size_mb`` attribute. For backward
+            compatibility the object is also a dict containing the raw CubeAPI
+            JSON snapshot (excluding the sensitive ``envdAccessToken``), e.g.
+            ``info["sandboxID"]`` or ``info.get("state")``.
 
         Raises:
             SandboxNotFoundError: If the sandbox does not exist (HTTP 404).
@@ -363,7 +606,7 @@ class Sandbox:
         """
         resp = self._session.get(f"{self._config.api_url}/sandboxes/{self.sandbox_id}")
         _check_response(resp)
-        return resp.json()
+        return SandboxInfo.from_dict(resp.json())
 
 
     def __enter__(self) -> "Sandbox":
@@ -449,7 +692,7 @@ class Sandbox:
         if next_token is not None:
             params["nextToken"] = next_token
         s = requests.Session()
-        resp = s.get(f"{cfg.api_url}/snapshots", params=params)
+        resp = s.get(f"{cfg.api_url}/snapshots", params=params, headers=_auth_headers(cfg))
         _check_response(resp)
         items = [SnapshotInfo.from_dict(d) for d in (resp.json() or [])]
         nt = resp.headers.get("x-next-token") or None
@@ -473,7 +716,7 @@ class Sandbox:
         """
         cfg = config or Config()
         s = requests.Session()
-        resp = s.delete(f"{cfg.api_url}/templates/{snapshot_id}")
+        resp = s.delete(f"{cfg.api_url}/templates/{snapshot_id}", headers=_auth_headers(cfg))
         _check_response(resp)
 
     # 1.4 — create_from_snapshot is covered by Sandbox.create(template=snapshot_id).
@@ -548,15 +791,17 @@ class Sandbox:
 
         1. :meth:`create_snapshot` — capture the current state.
         2. :func:`Sandbox.create` × n — spin up *n* sandboxes from the snapshot.
-        3. :meth:`delete_snapshot` — clean up the ephemeral snapshot.
+        3. Attach shared cleanup state to the clones. The temporary snapshot
+           is deleted after the last clone is killed through this SDK process.
 
         If any sandbox creation fails, **all sibling sandboxes that did
         succeed are killed** before the exception propagates. This prevents
         leaked sandboxes when a partial failure happens halfway through a
         concurrent fan-out — the alternative (returning a partial list and
         raising) loses one or the other in any caller that doesn't carefully
-        wrap the call in try/except. ``delete_snapshot`` for the ephemeral
-        snapshot is still best-effort and runs unconditionally.
+        wrap the call in try/except. Snapshot cleanup is best-effort and is
+        process-local; server-side timeout or deletion by another process is
+        not observable by this SDK instance.
 
         Args:
             n: Number of clones to create (default: 1).
@@ -590,63 +835,88 @@ class Sandbox:
 
         sandboxes: list[Sandbox] = []
         first_error: BaseException | None = None
-        try:
-            if concurrency <= 1 or n <= 1:
-                # Sequential: short-circuit on first failure to preserve the
-                # historical fail-fast behaviour. Anything created before the
-                # failure stays in ``sandboxes`` and is returned via finally.
-                for _ in range(n):
-                    try:
-                        sandboxes.append(_create_one())
-                    except BaseException as exc:  # noqa: BLE001
-                        first_error = exc
-                        break
-            else:
-                # Local import: keeps the default (sequential) path free of
-                # threading machinery for callers that never opt-in.
-                from concurrent.futures import ThreadPoolExecutor, as_completed
+        if concurrency <= 1 or n <= 1:
+            # Sequential: short-circuit on first failure to preserve the
+            # historical fail-fast behaviour.
+            for _ in range(n):
+                try:
+                    sandboxes.append(_create_one())
+                except BaseException as exc:  # noqa: BLE001
+                    first_error = exc
+                    break
+        else:
+            # Local import: keeps the default (sequential) path free of
+            # threading machinery for callers that never opt-in.
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                workers = min(n, concurrency)
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = [pool.submit(_create_one) for _ in range(n)]
-                    # Drain every future — never leak a Sandbox just because
-                    # an earlier sibling raised. We collect successes and the
-                    # first exception, then decide what to do once all futures
-                    # have settled.
-                    for fut in as_completed(futures):
-                        try:
-                            sandboxes.append(fut.result())
-                        except BaseException as exc:  # noqa: BLE001
-                            if first_error is None:
-                                first_error = exc
-                            # Keep draining: another in-flight create may
-                            # still succeed and we must not drop its result.
-        finally:
-            try:
-                Sandbox.delete_snapshot(snap_id, config=cfg)
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
+            workers = min(n, concurrency)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_create_one) for _ in range(n)]
+                # Drain every future — never leak a Sandbox just because
+                # an earlier sibling raised. We collect successes and the
+                # first exception, then decide what to do once all futures
+                # have settled.
+                for fut in as_completed(futures):
+                    try:
+                        sandboxes.append(fut.result())
+                    except BaseException as exc:  # noqa: BLE001
+                        if first_error is None:
+                            first_error = exc
+                        # Keep draining: another in-flight create may
+                        # still succeed and we must not drop its result.
+        cleanup = _CloneCleanup(snap_id, len(sandboxes), cfg)
+        for sb in sandboxes:
+            sb._clone_cleanup = cleanup
 
         if first_error is not None:
             # We hit at least one failure. The caller asked for *n* clones
             # and got fewer — there is no clean way to return both partial
             # successes and an exception, so kill the orphans and propagate.
-            # This is "all-or-nothing" semantics for the failure case;
-            # without it, a partial result is silently lost when we raise.
+            # This is "all-or-nothing" semantics for the failure case.
             for sb in sandboxes:
                 try:
                     sb.kill()
                 except Exception:  # noqa: BLE001 — best-effort cleanup
                     pass
+            # A failed kill cannot release its ownership. Force the idempotent
+            # backstop after every surviving sibling has been attempted.
+            cleanup.cleanup()
             raise first_error
+
+        if not sandboxes:
+            try:
+                Sandbox.delete_snapshot(snap_id, config=cfg)
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
         return sandboxes
 
 
     def _build_session(self) -> requests.Session:
         s = requests.Session()
-        s.headers.update({"Content-Type": "application/json"})
+        s.headers.update({"Content-Type": "application/json", **_auth_headers(self._config)})
         return s
 
     def _build_data_client(self) -> httpx.Client:
         """Build an HTTP client for CubeProxy-routed sandbox data-plane APIs."""
-        return build_client(self._config)
+        return build_client(self._config, headers=self._traffic_token_headers())
+
+    def _traffic_token_headers(self) -> dict[str, str]:
+        """Headers that must accompany every CubeProxy data-plane request.
+
+        When the sandbox was created with ``network.allow_public_traffic=False``,
+        CubeProxy rejects unauthenticated traffic with 403. Attaching the token
+        as a default header on the httpx client covers run_code, the Connect
+        commands path, and filesystem read/write in one place.
+
+        Data-plane requests are also routed through CubeAPI's auth middleware,
+        which requires ``X-API-Key`` (or ``Authorization: Bearer``) whenever the
+        backend is started with an auth-callback URL. We therefore attach the
+        API key here as well so run_code / commands / filesystem / pty all
+        authenticate. When no key is configured ``_auth_headers`` returns ``{}``
+        and behavior is unchanged.
+        """
+        headers = _auth_headers(self._config)
+        token = self.traffic_access_token
+        if token:
+            headers["e2b-traffic-access-token"] = token
+        return headers

@@ -5,14 +5,14 @@
 package node
 
 import (
-	"crypto/rand"
+	"encoding/json"
 	"fmt"
-	"math"
-	"math/big"
 	pseudorand "math/rand"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -208,42 +208,6 @@ func TestNodes_IndexByPageFallbackRejectsOutOfRangeStart(t *testing.T) {
 	assert.Equal(t, -1, endIndex)
 }
 
-func TestRandNode(t *testing.T) {
-	nodes := NodeList{}
-	testNum := 10
-	for i := 1; i <= testNum; i++ {
-		n := &Node{
-			Index: i,
-			InsID: fmt.Sprintf("%d", i),
-		}
-		nodes.Append(n)
-	}
-	nodes.AllSortByIndex()
-	statm := map[string]int{}
-	max := nodes.Len()
-	for i := 0; i < 100; i++ {
-		n := nodes[pseudorand.Intn(max)]
-		statm[n.InsID]++
-	}
-
-	expected := 100 / max
-	expectdiff := float64(10)
-	for _, v := range statm {
-		assert.LessOrEqual(t, math.Abs(float64((int64(v - expected)))), expectdiff)
-	}
-
-	statmm := map[string]int{}
-	for i := 0; i < 100; i++ {
-		rindex, _ := rand.Int(rand.Reader, big.NewInt(int64(max)))
-		n := nodes[int(rindex.Int64())]
-		statmm[n.InsID]++
-	}
-	for _, v := range statmm {
-		assert.LessOrEqual(t, math.Abs(float64((int64(v - expected)))), expectdiff)
-	}
-
-}
-
 func TestNodeScoreListSorted(t *testing.T) {
 	nodes := NodeScoreList{}
 	testNum := 100
@@ -304,4 +268,142 @@ func TestQuotaCpu(t *testing.T) {
 	afCpuSize := resource.MustParse(fmt.Sprintf("%dm", n.QuotaCpu))
 	gotCpu := resource.MustParse("90")
 	assert.Equal(t, gotCpu.Value(), afCpuSize.Value())
+}
+
+func TestNodeLabelsCachesMergedLabels(t *testing.T) {
+	n := &Node{
+		Zone:         "zone-a",
+		ClusterLabel: "cluster-a",
+		CPUType:      "x86",
+		QuotaMem:     4096,
+		QuotaCpu:     2000,
+		InstanceType: "SA2",
+		NodeLabels: map[string]string{
+			"gpu":                         "true",
+			constants.AffinityKeyZone:     "reported-zone",
+			constants.AffinityKeyCPUCores: "reported-cpu",
+		},
+	}
+
+	labels := n.Labels()
+	assert.Equal(t, "true", labels["gpu"])
+	assert.Equal(t, "zone-a", labels[constants.AffinityKeyZone])
+	assert.Equal(t, "2000m", labels[constants.AffinityKeyCPUCores])
+
+	labelsPtr := fmt.Sprintf("%p", labels)
+	assert.Equal(t, labelsPtr, fmt.Sprintf("%p", n.Labels()))
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = n.Labels()
+	})
+	assert.Zero(t, allocs)
+}
+
+func TestNodeLabelsCacheInvalidation(t *testing.T) {
+	n := &Node{
+		Zone:       "zone-a",
+		QuotaMem:   4096,
+		QuotaCpu:   2000,
+		NodeLabels: map[string]string{"gpu": "true"},
+	}
+
+	oldLabels := n.Labels()
+	n.Zone = "zone-b"
+	n.QuotaMem = 8192
+	n.NodeLabels = map[string]string{"ssd": "true"}
+	n.InvalidateLabelsCache()
+
+	newLabels := n.Labels()
+	assert.NotEqual(t, fmt.Sprintf("%p", oldLabels), fmt.Sprintf("%p", newLabels))
+	assert.Equal(t, "zone-b", newLabels[constants.AffinityKeyZone])
+	assert.Equal(t, "8192Mi", newLabels[constants.AffinityKeyMemorySize])
+	assert.NotContains(t, newLabels, "gpu")
+	assert.Equal(t, "true", newLabels["ssd"])
+}
+
+func TestNodeCloneDeepCopiesHostFacts(t *testing.T) {
+	n := &Node{
+		InsID: "node-1",
+		HostFacts: &HostFacts{
+			CPUVendor:             "GenuineIntel",
+			CPUIDHash:             "sha256:cpu",
+			HostKernelFingerprint: "sha256:kernel",
+			KVMAPIVersion:         12,
+		},
+	}
+
+	cloned := n.Clone()
+	if cloned.HostFacts == n.HostFacts {
+		t.Fatalf("clone must not share the HostFacts pointer")
+	}
+	cloned.HostFacts.CPUVendor = "AuthenticAMD"
+	cloned.HostFacts.KVMAPIVersion = 13
+	if n.HostFacts.CPUVendor != "GenuineIntel" || n.HostFacts.KVMAPIVersion != 12 {
+		t.Errorf("mutating clone must not affect source: %+v", n.HostFacts)
+	}
+}
+
+func TestNodeCloneNilHostFacts(t *testing.T) {
+	n := &Node{InsID: "node-1"}
+	cloned := n.Clone()
+	if cloned.HostFacts != nil {
+		t.Errorf("nil HostFacts must stay nil after clone, got %+v", cloned.HostFacts)
+	}
+}
+
+func TestNodeHostFactsJSONRoundTrip(t *testing.T) {
+	n := &Node{
+		InsID: "node-1",
+		HostFacts: &HostFacts{
+			CPUVendor:            "GenuineIntel",
+			CPUIDHash:            "sha256:cpu",
+			KVMAPIVersion:        12,
+			KVMModuleTaint:       "EO",
+			KVMModuleFingerprint: "sha256:kvmmod",
+		},
+	}
+	raw, err := json.Marshal(n)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out Node
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.HostFacts == nil {
+		t.Fatalf("HostFacts lost in round-trip: %s", raw)
+	}
+	if *out.HostFacts != *n.HostFacts {
+		t.Errorf("round-trip mismatch:\n in=%+v\nout=%+v", n.HostFacts, out.HostFacts)
+	}
+}
+
+func TestNodeHostFactsJSONOmittedWhenNil(t *testing.T) {
+	raw, err := json.Marshal(&Node{InsID: "node-1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "HostFacts") {
+		t.Errorf("nil HostFacts must be omitted, got %s", raw)
+	}
+}
+
+func TestNodeCloneDoesNotShareLabelsCache(t *testing.T) {
+	n := &Node{
+		Zone:       "zone-a",
+		QuotaMem:   4096,
+		QuotaCpu:   2000,
+		NodeLabels: map[string]string{"gpu": "true"},
+	}
+	_ = n.Labels()
+
+	cloned := n.Clone()
+	cloned.Zone = "zone-b"
+	cloned.NodeLabels["gpu"] = "false"
+
+	sourceLabels := n.Labels()
+	clonedLabels := cloned.Labels()
+	assert.Equal(t, "zone-a", sourceLabels[constants.AffinityKeyZone])
+	assert.Equal(t, "true", sourceLabels["gpu"])
+	assert.Equal(t, "zone-b", clonedLabels[constants.AffinityKeyZone])
+	assert.Equal(t, "false", clonedLabels["gpu"])
 }

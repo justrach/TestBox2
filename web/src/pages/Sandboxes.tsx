@@ -12,8 +12,10 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Pause, Play, Trash2, Search, Plus } from 'lucide-react';
-import { formatBytes, formatRelative, short } from '@/lib/utils';
+import { formatBytes, formatCpu, formatRelative, short } from '@/lib/utils';
 import { cn } from '@/lib/utils';
+import { formatSandboxActionError } from '@/lib/sandboxActionError';
+import { SandboxActionErrorBanner } from '@/components/SandboxActionErrorBanner';
 
 type StateFilter = 'all' | 'running' | 'paused';
 
@@ -23,38 +25,74 @@ export default function SandboxesPage() {
   const qc = useQueryClient();
   const { t } = useTranslation('sandboxes');
 
-  const { data, isLoading } = useQuery({
-    queryKey: ['sandboxes', stateFilter],
-    queryFn: () =>
-      sandboxApi.list({ state: stateFilter === 'all' ? undefined : stateFilter }),
+  const { data, isLoading, refetch } = useQuery({
+    queryKey: ['sandboxes'],
+    queryFn: () => sandboxApi.list(),
     refetchInterval: 5_000,
   });
 
+  const onStateFilterChange = (next: StateFilter) => {
+    if (next === stateFilter) return;
+    setStateFilter(next);
+    void refetch();
+  };
+
   const [pendingId, setPendingId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const onLifecycleError = (err: unknown) => {
+    setActionError(formatSandboxActionError(err, t));
+  };
 
   const killMut = useMutation({
-    mutationFn: (id: string) => { setPendingId(id); return sandboxApi.kill(id); },
-    onSettled: () => { setPendingId(null); qc.invalidateQueries({ queryKey: ['sandboxes'] }); },
+    mutationFn: (id: string) => {
+      setPendingId(id);
+      return sandboxApi.kill(id);
+    },
+    onMutate: () => setActionError(null),
+    onError: onLifecycleError,
+    onSettled: () => {
+      setPendingId(null);
+      qc.invalidateQueries({ queryKey: ['sandboxes'] });
+    },
   });
   const pauseMut = useMutation({
-    mutationFn: (id: string) => { setPendingId(id); return sandboxApi.pause(id); },
-    onSettled: () => { setPendingId(null); qc.invalidateQueries({ queryKey: ['sandboxes'] }); },
+    mutationFn: (id: string) => {
+      setPendingId(id);
+      return sandboxApi.pause(id);
+    },
+    onMutate: () => setActionError(null),
+    onError: onLifecycleError,
+    onSettled: () => {
+      setPendingId(null);
+      qc.invalidateQueries({ queryKey: ['sandboxes'] });
+    },
   });
   const resumeMut = useMutation({
-    mutationFn: (id: string) => { setPendingId(id); return sandboxApi.resume(id); },
-    onSettled: () => { setPendingId(null); qc.invalidateQueries({ queryKey: ['sandboxes'] }); },
+    mutationFn: (id: string) => {
+      setPendingId(id);
+      return sandboxApi.resume(id);
+    },
+    onMutate: () => setActionError(null),
+    onError: onLifecycleError,
+    onSettled: () => {
+      setPendingId(null);
+      qc.invalidateQueries({ queryKey: ['sandboxes'] });
+    },
   });
 
   const filtered = useMemo(() => {
     if (!data) return [];
-    if (!q.trim()) return data;
+    const stateFiltered =
+      stateFilter === 'all' ? data : data.filter((sb) => (sb.state ?? 'running') === stateFilter);
+    if (!q.trim()) return stateFiltered;
     const needle = q.toLowerCase();
-    return data.filter((sb) =>
+    return stateFiltered.filter((sb) =>
       [sb.sandboxID, sb.templateID, sb.alias, sb.clientID]
         .filter(Boolean)
         .some((v) => String(v).toLowerCase().includes(needle)),
     );
-  }, [data, q]);
+  }, [data, q, stateFilter]);
 
   const STATE_TABS: { key: StateFilter; label: string }[] = [
     { key: 'all', label: t('filter.all') },
@@ -76,6 +114,8 @@ export default function SandboxesPage() {
         </Link>
       </header>
 
+      <SandboxActionErrorBanner message={actionError} onDismiss={() => setActionError(null)} />
+
       <Card className="!p-3">
         <div className="flex items-center gap-2">
           <div className="relative flex-1">
@@ -95,7 +135,7 @@ export default function SandboxesPage() {
             {STATE_TABS.map(({ key, label }) => (
               <button
                 key={key}
-                onClick={() => setStateFilter(key)}
+                onClick={() => onStateFilterChange(key)}
                 className={cn(
                   'rounded-md px-3 py-1 text-xs font-medium transition-all',
                   stateFilter === key
@@ -110,8 +150,8 @@ export default function SandboxesPage() {
                     className={cn(
                       'ml-1.5 rounded-full px-1.5 py-0.5 text-xs text-num',
                       key === 'running'
-                        ? 'bg-cube-emerald/20 text-cube-emerald'
-                        : 'bg-cube-amber/20 text-cube-amber',
+                        ? 'bg-cube-ok/20 text-cube-ok'
+                        : 'bg-cube-warn/20 text-cube-warn',
                     )}
                   >
                     {data.filter((sb) => (sb.state ?? 'running') === key).length}
@@ -192,23 +232,41 @@ function Row({
       </div>
       <div className="truncate text-xs text-muted-foreground">{sb.templateID ?? '—'}</div>
       <div className="text-xs text-muted-foreground text-num">
-        {sb.cpuCount != null ? t('vcpu', { count: sb.cpuCount }) : '—'}
+        {formatCpu(sb.cpuMilli, sb.cpuCount)}
       </div>
       <div className="text-xs text-muted-foreground text-num">{formatBytes(sb.memoryMB)}</div>
       <div className="text-xs text-muted-foreground/80 text-num">{sb.clientID || '—'}</div>
       <div className="text-xs text-muted-foreground">{formatRelative(sb.startedAt)}</div>
       <div className="flex justify-end gap-1">
         {state === 'paused' ? (
-          <Button size="icon" variant="ghost" title={t('actions.resume')} onClick={onResume} disabled={busy}>
+          <Button
+            size="icon"
+            variant="ghost"
+            title={t('actions.resume')}
+            onClick={onResume}
+            disabled={busy}
+          >
             <Play size={14} />
           </Button>
         ) : (
-          <Button size="icon" variant="ghost" title={t('actions.pause')} onClick={onPause} disabled={busy}>
+          <Button
+            size="icon"
+            variant="ghost"
+            title={t('actions.pause')}
+            onClick={onPause}
+            disabled={busy}
+          >
             <Pause size={14} />
           </Button>
         )}
-        <Button size="icon" variant="ghost" title={t('actions.kill')} onClick={onKill} disabled={busy}>
-          <Trash2 size={14} className="text-cube-rose" />
+        <Button
+          size="icon"
+          variant="ghost"
+          title={t('actions.kill')}
+          onClick={onKill}
+          disabled={busy}
+        >
+          <Trash2 size={14} className="text-cube-err" />
         </Button>
       </div>
     </div>

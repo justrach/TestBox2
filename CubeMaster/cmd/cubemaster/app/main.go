@@ -19,13 +19,13 @@ import (
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/dao"
-	_ "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/dao/driver/mysql" // register mysql driver
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/recov"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet/grpcconn"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/instancecache"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/lifecycle"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/nodemeta"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler"
@@ -33,7 +33,15 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/task"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	volumeplugin "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/volume/plugin"
+	_ "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/volume/plugin/binary"
+	_ "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/volume/plugin/rpc"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao"
+	_ "github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/mysql"    // register mysql driver
+	_ "github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao/driver/postgres" // register postgres driver
+	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/migrate"
+	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/tombstone"
 )
 
 type App struct {
@@ -51,7 +59,6 @@ func (a *App) Run() {
 		ctx, cancel = context.WithCancel(context.Background())
 	)
 	defer cancel()
-
 
 	cfg := config.GetConfig()
 
@@ -123,25 +130,61 @@ func coreInit(ctx context.Context, cfg *config.Config) error {
 
 	log.Init(config.GetLogConfig())
 
+	if err := templatecenter.InitArtifactStore(ctx); err != nil {
+		return fmt.Errorf("artifact store: %w", err)
+	}
+
 	errorcode.InitCubeCodeRetryMap(cfg)
 
 	task.InitTask(ctx, cfg)
 
 	grpcconn.Init(ctx)
 
-	if cfg.OssDBConfig == nil || cfg.InstanceDBConfig == nil {
-		CubeLog.WithContext(ctx).Warnf("run in degraded mode: oss/instance db config missing, skip localcache/instancecache/scheduler/sandbox init")
+	if cfg.InstanceDBConfig == nil {
+		CubeLog.WithContext(ctx).Warnf("run in degraded mode: instance db config missing, skip localcache/instancecache/scheduler/sandbox init")
 		return nil
 	}
 
 	// Run schema migrations BEFORE any business package Init so they all
-	// see the HEAD schema. Migration uses the same connection pool the
-	// dao facade hands back via dao.Default(); business packages that
-	// still use db.Init() get their own pool but talk to the same MySQL
-	// instance, so they observe the post-migration schema.
+	// see the HEAD schema. Migration uses the single dao.Default() handle
+	// that dao.Open establishes below, so every business package observes
+	// the post-migration schema.
 	if err := initDatabaseSchema(ctx, cfg); err != nil {
 		return fmt.Errorf("dao migrate: %w", err)
 	}
+
+	// Launch the scheduled tombstone purger (issue #973): hard-purges
+	// soft-deleted rows older than the configured retention. Registered
+	// here (not in templatecenter.Init) because it is a DB-level concern;
+	// it runs only after the schema is migrated and dao.Default() is
+	// usable, and stops when ctx is cancelled. DISABLED by default: the purge is
+	// irreversible, so operators must opt in via soft_delete_purge.enable: true
+	// (review: upgrading must not silently hard-delete retained tombstones).
+	sp := cfg.SoftDeletePurge
+	spEnabled := false
+	if sp != nil && sp.Enable != nil {
+		spEnabled = *sp.Enable
+	}
+	var spRetention, spInterval time.Duration
+	if sp != nil {
+		spRetention = sp.Retention
+		spInterval = sp.Interval
+	}
+	tombstone.Start(ctx, dao.Default(), tombstone.Config{
+		Enabled:   spEnabled,
+		DryRun:    sp != nil && sp.DryRun,
+		Retention: spRetention,
+		Interval:  spInterval,
+		TablesFn: func() []string {
+			// Resolve per pass from the LIVE config so the purge table list tracks
+			// disable_hard_delete across a hot-reload (the app reads it live on every
+			// delete); a boot-time snapshot would otherwise diverge and purge rows the
+			// operator just chose to retain.
+			c := config.GetConfig()
+			return cubeMasterPurgeTables(c != nil && c.Common != nil && c.Common.DisableHardDelete)
+		},
+		LockName: "cubemaster_tombstone_purge_v1",
+	})
 
 	if err := nodemeta.Init(ctx); err != nil {
 		stdlog.Fatalf("nodemeta init fail:%v", err)
@@ -163,6 +206,19 @@ func coreInit(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
+	if err := initVolumePlugins(cfg); err != nil {
+		stdlog.Fatalf("volume plugin init fail:%v", err)
+		return err
+	}
+
+	// lifecycle wires the auto-pause / auto-resume metadata channel into the
+	// sandbox create/destroy hooks. It is non-fatal: a Redis hiccup must not
+	// block CubeMaster from serving sandboxes, only the sidecar's view goes
+	// stale until the next reconcile.
+	if err := lifecycle.Init(ctx); err != nil {
+		log.G(ctx).Warnf("lifecycle init fail (non-fatal): %v", err)
+	}
+
 	scheduler.InitScheduler(ctx)
 
 	if err := sandbox.Init(ctx, cfg); err != nil {
@@ -180,46 +236,24 @@ func coreInit(ctx context.Context, cfg *config.Config) error {
 // process; whoever loses the lock race blocks until the winner is done,
 // then sees the schema is already at HEAD and returns immediately.
 func initDatabaseSchema(ctx context.Context, cfg *config.Config) error {
-	// The schema produced by pkg/base/dao/migrate/migrations is a single
-	// catalog covering both the OSS-side tables (t_cube_host_*, t_cube_node_*,
-	// ...) and the instance-side tables (t_cube_template_*, t_cube_instance_*,
-	// t_cube_sandbox_spec, ...). Running migrations against only one of the
-	// two configured databases would silently leave the other half empty, so
-	// any deployment that genuinely points the two configs at different
-	// physical databases is unsupported and must fail fast at startup.
-	if inst, oss := cfg.InstanceDBConfig, cfg.OssDBConfig; inst != nil && oss != nil {
-		if inst.Driver != oss.Driver || inst.Addr != oss.Addr || inst.DBName != oss.DBName {
-			return fmt.Errorf(
-				"dao: instance_db_config and ossdb_config must point to the same physical database "+
-					"(instance=%s/%s/%s, oss=%s/%s/%s); split-database deployments are not supported by the current schema",
-				inst.Driver, inst.Addr, inst.DBName,
-				oss.Driver, oss.Addr, oss.DBName,
-			)
-		}
-	}
-	src := cfg.InstanceDBConfig
-	if src == nil {
-		src = cfg.OssDBConfig
-	}
-	if src == nil {
-		return fmt.Errorf("dao: neither instance_db_config nor ossdb_config is set")
-	}
-	daoCfg := dao.Config{
-		Driver:                      src.Driver,
-		Addr:                        src.Addr,
-		User:                        src.User,
-		Pwd:                         src.Pwd,
-		DBName:                      src.DBName,
-		ConnTimeoutSeconds:          src.ConnTimeout,
-		ReadTimeoutSeconds:          src.ReadTimeout,
-		WriteTimeoutSeconds:         src.WriteTimeout,
-		MaxIdleConns:                src.MaxIdleConns,
-		MaxOpenConns:                src.MaxOpenConns,
-		MaxConnLifeTimeSeconds:      src.MaxConnLifeTimeSeconds,
-		MigrationLockTimeoutSeconds: src.MigrationLockTimeoutSeconds,
+	// Migrations put every table in the one configured database; build the
+	// dao config through the shared helper so both dao.Open identities match.
+	daoCfg, err := db.ConfigFromDBConfig(cfg.InstanceDBConfig)
+	if err != nil {
+		return fmt.Errorf("dao: %w", err)
 	}
 	if _, err := dao.Open(ctx, daoCfg); err != nil {
 		return fmt.Errorf("dao open: %w", err)
+	}
+	// A runtime account with no DDL permission cannot run the migrator (not even
+	// the fingerprint CREATE TABLE), so let such a deployment skip migration and
+	// apply schema out-of-band with a privileged account. Default is enabled,
+	// so unset/typo never disables migration.
+	if !migrate.AutoMigrationEnabled() {
+		CubeLog.WithContext(ctx).Warnf(
+			"CUBE_AUTO_MIGRATION=false: skipping schema migration; DDL must be " +
+				"applied out-of-band by a privileged account")
+		return nil
 	}
 	if err := dao.Migrate(ctx); err != nil {
 		return fmt.Errorf("dao migrate: %w", err)
@@ -293,4 +327,30 @@ func setLogLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	CubeLog.SetLevel(CubeLog.StringToLevel(strings.ToUpper(l)))
+}
+
+// initVolumePlugins registers external Controller Hook Plugins (binary or rpc).
+func initVolumePlugins(cfg *config.Config) error {
+	if err := volumeplugin.ValidateConfigs(cfg.VolumePlugins); err != nil {
+		return err
+	}
+	for _, pc := range cfg.VolumePlugins {
+		switch pc.Type {
+		case "binary":
+			if err := volumeplugin.LoadBinary(pc); err != nil {
+				return fmt.Errorf("load volume plugin %q: %w", pc.Name, err)
+			}
+			CubeLog.Infof("[volume] registered binary plugin %q at %s", pc.Name, pc.BinaryPath)
+		case "rpc":
+			if err := volumeplugin.LoadRPC(pc); err != nil {
+				return fmt.Errorf("load volume plugin %q: %w", pc.Name, err)
+			}
+			CubeLog.Infof("[volume] registered rpc plugin %q at %s", pc.Name, pc.SocketPath)
+		case "", "builtin":
+			// built-in plugins register themselves via init(); nothing to do.
+		default:
+			return fmt.Errorf("volume plugin %q: unknown type %q", pc.Name, pc.Type)
+		}
+	}
+	return nil
 }

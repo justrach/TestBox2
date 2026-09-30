@@ -14,13 +14,15 @@ import json
 import struct
 import threading
 import time
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 
-from cubesandbox import CommandResult, Template
-from cubesandbox._commands import Commands, _collect_process_events
+from cubesandbox import NEVER_TIMEOUT, CommandResult, Template
+from cubesandbox._template import TemplateInfo
+from cubesandbox._commands import Commands
 from cubesandbox._config import Config
 from cubesandbox._exceptions import (
     ApiError,
@@ -30,7 +32,15 @@ from cubesandbox._exceptions import (
     TemplateNotFoundError,
 )
 from cubesandbox._filesystem import Filesystem
-from cubesandbox._models import Execution, ExecutionError, Logs, OutputMessage, Result
+from cubesandbox._models import (
+    Execution,
+    ExecutionError,
+    Logs,
+    OutputMessage,
+    Result,
+    SandboxInfo,
+    SandboxState,
+)
 from cubesandbox._stream import _parse_line
 from cubesandbox.sandbox import Sandbox
 
@@ -69,6 +79,23 @@ def make_sandbox(**data_overrides) -> Sandbox:
     return Sandbox(d, config=make_config())
 
 
+def _recording_client(transport: httpx.MockTransport, seen: dict) -> httpx.Client:
+    """An httpx client that records the timeout each request was given.
+
+    MockTransport answers synchronously and enforces no timeouts at all, so the
+    value a caller passes is only observable by recording it here.
+    """
+    client = httpx.Client(transport=transport)
+    stream = client.stream
+
+    def recording_stream(*args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return stream(*args, **kwargs)
+
+    client.stream = recording_stream
+    return client
+
+
 def connect_envelope(flags: int, payload: str) -> bytes:
     raw = payload.encode("utf-8")
     return bytes([flags]) + struct.pack(">I", len(raw)) + raw
@@ -103,11 +130,53 @@ class TestCreate:
         assert body["templateID"] == "tpl-foo"
         assert body["timeout"] == 600
 
+    def test_create_omits_timeout_when_absent(self):
+        # No timeout argument → the field is omitted so CubeMaster applies its
+        # server-side default (no implicit client fill).
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(template="tpl-foo", config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert "timeout" not in body
+
+    def test_create_sends_explicit_zero_timeout(self):
+        # An explicit 0 must be forwarded as-is (not dropped as falsy).
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(template="tpl-foo", timeout=0, config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert body["timeout"] == 0
+
+    def test_create_sends_never_timeout(self):
+        # NEVER_TIMEOUT must be forwarded as -1.
+        from cubesandbox import NEVER_TIMEOUT
+
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(template="tpl-foo", timeout=NEVER_TIMEOUT, config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert body["timeout"] == -1
+
     def test_create_sends_env_vars(self):
         with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
             Sandbox.create(env_vars={"FOO": "bar"}, config=make_config())
         body = m.call_args.kwargs["json"]
         assert body["envVars"] == {"FOO": "bar"}
+
+    def test_create_accepts_e2b_envs_alias(self):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(envs={"FOO": "bar"}, config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert body["envVars"] == {"FOO": "bar"}
+
+    def test_create_accepts_matching_environment_aliases(self):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(
+                env_vars={"FOO": "bar"}, envs={"FOO": "bar"}, config=make_config()
+            )
+        body = m.call_args.kwargs["json"]
+        assert body["envVars"] == {"FOO": "bar"}
+
+    def test_create_rejects_conflicting_environment_aliases(self):
+        with pytest.raises(ValueError, match="env_vars and envs"):
+            Sandbox.create(env_vars={"FOO": "bar"}, envs={"FOO": "baz"}, config=make_config())
 
     def test_create_sends_metadata(self):
         meta = {"network-policy": "deny-all"}
@@ -115,6 +184,19 @@ class TestCreate:
             Sandbox.create(metadata=meta, config=make_config())
         body = m.call_args.kwargs["json"]
         assert body["metadata"] == meta
+
+    def test_create_sends_distribution_scope(self):
+        scope = ["node-a", "10.0.0.12"]
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(distribution_scope=scope, config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert body["distributionScope"] == scope
+
+    def test_create_default_distribution_scope_omitted(self):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert "distributionScope" not in body
 
     def test_create_template_not_found(self):
         with patch("requests.Session.post",
@@ -140,12 +222,6 @@ class TestCreate:
         body = m.call_args.kwargs["json"]
         assert "allow_internet_access" not in body
 
-    def test_create_network_allow_public_traffic(self):
-        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
-            Sandbox.create(network={"allow_public_traffic": False}, config=make_config())
-        body = m.call_args.kwargs["json"]
-        assert body["network"]["allowPublicTraffic"] is False
-
     def test_create_network_allow_out(self):
         with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
             Sandbox.create(network={"allow_out": ["8.8.8.8/32"]}, config=make_config())
@@ -158,11 +234,467 @@ class TestCreate:
         body = m.call_args.kwargs["json"]
         assert body["network"]["denyOut"] == ["0.0.0.0/0"]
 
+    def test_create_network_mask_request_host(self):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(
+                network={"mask_request_host": "localhost:${PORT}"},
+                config=make_config(),
+            )
+        body = m.call_args.kwargs["json"]
+        assert body["network"]["maskRequestHost"] == "localhost:${PORT}"
+
     def test_create_network_empty_not_in_payload(self):
         with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
             Sandbox.create(network={}, config=make_config())
         body = m.call_args.kwargs["json"]
         assert "network" not in body
+
+    def test_create_default_lifecycle_omitted(self):
+        # Default behavior must remain wire-compatible with pre-feature
+        # callers: when ``lifecycle`` isn't set, the SDK must emit a
+        # payload that's byte-identical to the historical one — no
+        # ``lifecycle``, ``autoPause``, or ``autoResume`` keys.
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert "lifecycle" not in body
+        assert "autoPause" not in body
+        assert "autoResume" not in body
+
+    def test_create_lifecycle_pause_on_timeout(self):
+        # `on_timeout="pause"` alone (no auto_resume) should ship a
+        # camelCase nested object and nothing else lifecycle-related.
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(
+                lifecycle={"on_timeout": "pause"},
+                config=make_config(),
+            )
+        body = m.call_args.kwargs["json"]
+        assert body["lifecycle"] == {"onTimeout": "pause"}
+
+    def test_create_lifecycle_pause_with_auto_resume(self):
+        # The full e2b-shaped lifecycle: pause on timeout AND auto-resume on
+        # next request. Wire shape mirrors
+        # https://e2b.dev/docs/sandbox/auto-resume verbatim.
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(
+                lifecycle={"on_timeout": "pause", "auto_resume": True},
+                config=make_config(),
+            )
+        body = m.call_args.kwargs["json"]
+        assert body["lifecycle"] == {"onTimeout": "pause", "autoResume": True}
+
+    def test_create_lifecycle_kill_explicit(self):
+        # Explicit "kill" is identical to the default but the user might
+        # set it for clarity. Make sure it round-trips.
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(
+                lifecycle={"on_timeout": "kill"},
+                config=make_config(),
+            )
+        body = m.call_args.kwargs["json"]
+        assert body["lifecycle"] == {"onTimeout": "kill"}
+
+    def test_create_lifecycle_invalid_on_timeout_raises(self):
+        # Mistyped values must fail client-side, before we hit the network,
+        # so the user gets a stack trace pointing at their source.
+        with pytest.raises(ValueError, match="on_timeout"):
+            Sandbox.create(
+                lifecycle={"on_timeout": "Pause"},  # capital P
+                config=make_config(),
+            )
+
+    def test_create_lifecycle_auto_resume_only(self):
+        # Asymmetric input — auto_resume without on_timeout — is allowed
+        # and just translates literally; it's the server's job to enforce
+        # that auto_resume only matters when on_timeout="pause".
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(
+                lifecycle={"auto_resume": True},
+                config=make_config(),
+            )
+        body = m.call_args.kwargs["json"]
+        assert body["lifecycle"] == {"autoResume": True}
+
+
+# ── domain filtering (DNS allow-list) ────────────────────────────────────────
+
+class TestDomainFiltering:
+    def _payload_for_network(self, network, **kwargs):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(network=network, config=make_config(), **kwargs)
+        return m.call_args.kwargs["json"]
+
+    @pytest.mark.parametrize("domain", [
+        "api.github.com",
+        "api.deepseek.com",
+        "example.com",
+    ])
+    def test_create_network_allow_out_accepts_domain_target(self, domain):
+        body = self._payload_for_network({
+            "allow_out": [domain],
+            "deny_out": ["0.0.0.0/0"],
+        })
+        assert body["network"]["allowOut"] == [domain]
+        assert body["network"]["denyOut"] == ["0.0.0.0/0"]
+        assert "rules" not in body["network"]
+
+    @pytest.mark.parametrize("domain", [
+        "*.example.com",
+        "*.githubusercontent.com",
+        "*.internal.example.org",
+    ])
+    def test_create_network_allow_out_accepts_wildcard_domain_target(self, domain):
+        body = self._payload_for_network({
+            "allow_out": [domain],
+            "deny_out": ["0.0.0.0/0"],
+        })
+        assert body["network"]["allowOut"] == [domain]
+
+    def test_create_network_allow_out_preserves_mixed_domain_and_cidr_targets(self):
+        allow_out = ["api.deepseek.com", "172.67.0.0/16", "*.githubusercontent.com"]
+        body = self._payload_for_network({"allow_out": allow_out, "deny_out": ["0.0.0.0/0"]})
+        assert body["network"]["allowOut"] == allow_out
+
+    def test_create_network_allow_out_preserves_order_and_duplicates(self):
+        allow_out = ["api.example.com", "*.example.com", "api.example.com"]
+        body = self._payload_for_network({"allow_out": allow_out, "deny_out": ["0.0.0.0/0"]})
+        assert body["network"]["allowOut"] == allow_out
+
+    def test_create_network_domain_filtering_preserves_literal_domain_values(self):
+        allow_out = ["API.Example.COM", "service.example.com."]
+        body = self._payload_for_network({"allow_out": allow_out, "deny_out": ["0.0.0.0/0"]})
+        assert body["network"]["allowOut"] == allow_out
+
+    def test_create_network_domain_filtering_with_deny_all_mode(self):
+        allow_out = ["api.example.com", "*.example.org"]
+        body = self._payload_for_network(
+            {"allow_out": allow_out},
+            allow_internet_access=False,
+        )
+        assert body["allow_internet_access"] is False
+        assert body["network"]["allowOut"] == allow_out
+        assert "denyOut" not in body["network"]
+
+    def test_create_network_domain_filtering_rejects_without_deny_all(self):
+        with pytest.raises(ApiError, match="must disable public outbound traffic or include '0.0.0.0/0' in deny_out") as exc:
+            Sandbox.create(
+                network={"allow_out": ["api.example.com"], "deny_out": ["203.0.113.0/24"]},
+                config=make_config(),
+            )
+        assert exc.value.status_code == 400
+
+    def test_create_network_domain_filtering_accepts_deny_all_among_other_deny_out(self):
+        allow_out = ["api.example.com", "*.example.org"]
+        deny_out = ["203.0.113.0/24", "0.0.0.0/0"]
+        body = self._payload_for_network({
+            "allow_out": allow_out,
+            "deny_out": deny_out,
+        })
+        assert body["network"]["allowOut"] == allow_out
+        assert body["network"]["denyOut"] == deny_out
+
+    def test_create_network_domain_filtering_alongside_l7_rules(self):
+        from cubesandbox import Action, Match, Rule
+        allow_out = ["api.github.com", "*.githubusercontent.com"]
+        rules = [Rule(
+            name="github_api",
+            match=Match(host="api.github.com", path="/repos/*"),
+            action=Action(allow=True, audit="metadata"),
+        )]
+        body = self._payload_for_network({
+            "allow_out": allow_out,
+            "deny_out": ["0.0.0.0/0"],
+            "rules": rules,
+        })
+        assert body["network"]["allowOut"] == allow_out
+        assert body["network"]["denyOut"] == ["0.0.0.0/0"]
+        assert body["network"]["rules"] == [{
+            "name": "github_api",
+            "match": {"host": "api.github.com", "path": "/repos/*"},
+            "action": {"allow": True, "audit": "metadata"},
+        }]
+
+    def test_create_network_empty_allow_out_is_still_sent(self):
+        body = self._payload_for_network({"allow_out": []})
+        assert body["network"]["allowOut"] == []
+
+
+# ── network rules (L7 policy) ────────────────────────────────────────────────
+
+class TestNetworkRules:
+    def test_create_network_rules_dataclass(self):
+        from cubesandbox import Action, Match, Rule
+        rules = [Rule(
+            name="deepseek_api",
+            match=Match(scheme="https", host="api.deepseek.com",
+                        method=["POST"], path="/v1/chat",
+                        sni="api.deepseek.com"),
+            action=Action(allow=True, audit="metadata"),
+        )]
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(network={"rules": rules}, config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert body["network"]["rules"] == [{
+            "name": "deepseek_api",
+            "match": {
+                "scheme": "https",
+                "host": "api.deepseek.com",
+                "method": ["POST"],
+                "path": "/v1/chat",
+                "sni": "api.deepseek.com",
+            },
+            "action": {"allow": True, "audit": "metadata"},
+        }]
+
+    def test_create_network_rules_dict_passthrough(self):
+        # Plain-dict rules pass through verbatim to the wire — no
+        # snake_case → camelCase rename happens for match keys today.
+        rules = [{
+            "name": "deepseek_api",
+            "match": {"path": "/v1/chat", "sni": "api.deepseek.com"},
+            "action": {"allow": True},
+        }]
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(network={"rules": rules}, config=make_config())
+        body = m.call_args.kwargs["json"]
+        wire = body["network"]["rules"][0]
+        assert wire["name"] == "deepseek_api"
+        assert wire["match"]["path"] == "/v1/chat"
+        assert wire["match"]["sni"] == "api.deepseek.com"
+
+    def test_create_network_rules_with_inject(self):
+        from cubesandbox import Action, Inject, Match, Rule
+        rules = [Rule(
+            name="r1",
+            match=Match(host="api.example.com"),
+            action=Action(allow=True, inject=[
+                Inject(header="Authorization", format="Bearer ${SECRET}", secret="sk_xxx"),
+            ]),
+        )]
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(network={"rules": rules}, config=make_config())
+        body = m.call_args.kwargs["json"]
+        inject_wire = body["network"]["rules"][0]["action"]["inject"]
+        assert inject_wire == [{
+            "header": "Authorization",
+            "secret": "sk_xxx",
+            "format": "Bearer ${SECRET}",
+        }]
+
+    def test_create_network_rules_alongside_allow_out(self):
+        from cubesandbox import Action, Match, Rule
+        rules = [Rule(name="r1", match=Match(host="x.com"), action=Action(allow=True))]
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(
+                network={"allow_out": ["1.2.3.0/24"], "rules": rules},
+                config=make_config(),
+            )
+        body = m.call_args.kwargs["json"]
+        assert body["network"]["allowOut"] == ["1.2.3.0/24"]
+        assert len(body["network"]["rules"]) == 1
+
+    def test_create_network_rules_domain_only_does_not_require_deny_all(self):
+        from cubesandbox import Action, Match, Rule
+        rules = [Rule(name="r1", match=Match(host="x.com"), action=Action(allow=True))]
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(network={"rules": rules}, config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert body["network"]["rules"][0]["match"]["host"] == "x.com"
+        assert "denyOut" not in body["network"]
+
+    def test_create_network_rules_empty_list_omitted(self):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(network={"rules": []}, config=make_config())
+        body = m.call_args.kwargs["json"]
+        assert "network" not in body
+
+    def test_inject_render(self):
+        from cubesandbox import Inject
+        assert Inject(header="Authorization", format="Bearer ${SECRET}",
+                      secret="sk_xxx").render() == "Bearer sk_xxx"
+        # no format → defaults to "${SECRET}"
+        assert Inject(header="X-Token", secret="abc").render() == "abc"
+
+    def test_match_to_wire_omits_none_fields(self):
+        from cubesandbox import Match
+        wire = Match(host="example.com").to_wire()
+        assert wire == {"host": "example.com"}
+        assert "scheme" not in wire
+
+    def test_action_to_wire_omits_none_inject_and_audit(self):
+        from cubesandbox import Action
+        assert Action(allow=False).to_wire() == {"allow": False}
+
+
+# ── E2B per-host request transforms compatibility ───────────────────────────
+
+class TestE2BPerHostTransforms:
+    """Verify that E2B's host-keyed ``network.rules`` mapping is converted
+    to the equivalent CubeEgress L7 inject rules on the wire.
+
+    The compatibility layer must:
+    - Translate ``{host: [{transform: {headers: {...}}}]}`` into one Rule per
+      transform entry, with ``match.host`` set and ``action.allow=True``.
+    - Materialize each header pair as one :class:`Inject` (header/secret).
+    - Coexist with ``allow_out`` / ``deny_out`` and the typed list-of-Rule shape.
+    - Reject malformed inputs eagerly (better than silently dropping rules).
+    """
+
+    def _payload(self, network, **kwargs):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            Sandbox.create(network=network, config=make_config(), **kwargs)
+        return m.call_args.kwargs["json"]
+
+    def test_single_host_single_header(self):
+        body = self._payload({
+            "rules": {
+                "api.example.com": [
+                    {"transform": {"headers": {"X-Header": "Content"}}},
+                ],
+            },
+        })
+        rules = body["network"]["rules"]
+        assert rules == [{
+            "name": "e2b-transform-api.example.com",
+            "match": {"host": "api.example.com"},
+            "action": {
+                "allow": True,
+                "inject": [{"header": "X-Header", "secret": "Content"}],
+            },
+        }]
+
+    def test_single_host_multiple_headers(self):
+        body = self._payload({
+            "rules": {
+                "api.example.com": [
+                    {"transform": {"headers": {
+                        "Authorization": "Bearer sk_xxx",
+                        "X-Trace": "on",
+                    }}},
+                ],
+            },
+        })
+        inject = body["network"]["rules"][0]["action"]["inject"]
+        # Order follows dict insertion order — preserve it for deterministic
+        # audit logs and to match the user's intent.
+        assert inject == [
+            {"header": "Authorization", "secret": "Bearer sk_xxx"},
+            {"header": "X-Trace", "secret": "on"},
+        ]
+
+    def test_multiple_hosts(self):
+        body = self._payload({
+            "rules": {
+                "api.example.com": [{"transform": {"headers": {"X-A": "1"}}}],
+                "api.other.com":   [{"transform": {"headers": {"X-B": "2"}}}],
+            },
+        })
+        rules = body["network"]["rules"]
+        hosts = [r["match"]["host"] for r in rules]
+        assert hosts == ["api.example.com", "api.other.com"]
+        assert all(r["action"]["allow"] is True for r in rules)
+
+    def test_multiple_transform_entries_per_host_get_indexed_names(self):
+        body = self._payload({
+            "rules": {
+                "api.example.com": [
+                    {"transform": {"headers": {"X-A": "1"}}},
+                    {"transform": {"headers": {"X-B": "2"}}},
+                ],
+            },
+        })
+        rules = body["network"]["rules"]
+        assert [r["name"] for r in rules] == [
+            "e2b-transform-api.example.com-0",
+            "e2b-transform-api.example.com-1",
+        ]
+        assert rules[0]["action"]["inject"] == [{"header": "X-A", "secret": "1"}]
+        assert rules[1]["action"]["inject"] == [{"header": "X-B", "secret": "2"}]
+
+    def test_alongside_allow_out_and_deny_out(self):
+        # Mirrors the canonical E2B usage: the host must still be referenced
+        # via allow_out for traffic to flow at all — registering a rule alone
+        # does not grant egress.
+        body = self._payload({
+            "allow_out": ["api.example.com"],
+            "deny_out": ["0.0.0.0/0"],
+            "rules": {
+                "api.example.com": [{"transform": {"headers": {"X-Header": "Content"}}}],
+            },
+        })
+        assert body["network"]["allowOut"] == ["api.example.com"]
+        assert body["network"]["denyOut"] == ["0.0.0.0/0"]
+        assert body["network"]["rules"][0]["match"]["host"] == "api.example.com"
+
+    def test_empty_dict_rules_omits_network(self):
+        body = self._payload({"rules": {}})
+        # ``rules={}`` is just as empty as ``rules=[]``: the SDK should not
+        # emit a stub network block when no policy was configured.
+        assert "network" not in body
+
+    def test_typed_rule_list_unaffected(self):
+        # Regression: switching the converter on must not change the
+        # behaviour of the existing typed-Rule path.
+        from cubesandbox import Action, Match, Rule
+        rules = [Rule(name="r1", match=Match(host="x.com"), action=Action(allow=True))]
+        body = self._payload({"rules": rules})
+        assert body["network"]["rules"] == [{
+            "name": "r1",
+            "match": {"host": "x.com"},
+            "action": {"allow": True},
+        }]
+
+    def test_rejects_non_dict_transform(self):
+        with pytest.raises(ValueError, match="transform must be a dict"):
+            Sandbox.create(
+                network={"rules": {"api.example.com": [{"transform": "oops"}]}},
+                config=make_config(),
+            )
+
+    def test_rejects_missing_headers(self):
+        with pytest.raises(ValueError, match="requires a 'headers' field"):
+            Sandbox.create(
+                network={"rules": {"api.example.com": [{"transform": {}}]}},
+                config=make_config(),
+            )
+
+    def test_rejects_unsupported_transform_keys(self):
+        # We refuse silently dropping unknown transform kinds — better to
+        # surface the gap than ship a sandbox that's missing the rewrite the
+        # caller expected.
+        with pytest.raises(ValueError, match="unsupported keys"):
+            Sandbox.create(
+                network={"rules": {"api.example.com": [
+                    {"transform": {"headers": {"X-A": "1"}, "body": "ignored"}},
+                ]}},
+                config=make_config(),
+            )
+
+    def test_rejects_non_string_header_value(self):
+        with pytest.raises(ValueError, match="must be a string"):
+            Sandbox.create(
+                network={"rules": {"api.example.com": [
+                    {"transform": {"headers": {"X-Count": 42}}},
+                ]}},
+                config=make_config(),
+            )
+
+    def test_rejects_unsupported_entry_keys(self):
+        with pytest.raises(ValueError, match="unsupported keys"):
+            Sandbox.create(
+                network={"rules": {"api.example.com": [
+                    {"transform": {"headers": {"X-A": "1"}}, "extra": True},
+                ]}},
+                config=make_config(),
+            )
+
+    def test_rejects_non_list_entries(self):
+        with pytest.raises(ValueError, match="must be a list of transform entries"):
+            Sandbox.create(
+                network={"rules": {"api.example.com": {"transform": {"headers": {}}}}},
+                config=make_config(),
+            )
 
 
 # ── POST /sandboxes/:id/connect ───────────────────────────────────────────────
@@ -179,13 +711,21 @@ class TestConnect:
             with pytest.raises(SandboxNotFoundError):
                 Sandbox.connect(SANDBOX_ID, config=make_config())
 
-    def test_connect_sends_timeout(self):
+    def test_connect_omits_timeout(self):
+        # connect no longer fabricates a timeout: the field must be absent so
+        # the server keeps its own timeout policy.
         cfg = make_config()
         cfg.timeout = 600
         with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA)) as m:
             Sandbox.connect(SANDBOX_ID, config=cfg)
         body = m.call_args.kwargs["json"]
-        assert body["timeout"] == 600
+        assert "timeout" not in body
+
+    @pytest.mark.parametrize("timeout", [-1, 120])
+    def test_connect_sends_explicit_timeout(self, timeout):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA)) as m:
+            Sandbox.connect(SANDBOX_ID, timeout, config=make_config())
+        assert m.call_args.kwargs["json"]["timeout"] == timeout
 
 
 # ── GET /sandboxes ────────────────────────────────────────────────────────────
@@ -196,6 +736,22 @@ class TestListSandboxesV1:
         with patch("requests.Session.get", return_value=mock_response(data)):
             result = Sandbox.list(config=make_config())
         assert result == data
+
+    def test_list_includes_volume_mounts(self):
+        data = [{
+            **SANDBOX_DATA,
+            "volumeMounts": [{
+                "name": "hostdir-0",
+                "path": "/mnt/data",
+                "readOnly": True,
+            }],
+        }]
+        with patch("requests.Session.get", return_value=mock_response(data)):
+            result = Sandbox.list(config=make_config())
+
+        assert len(result) == 1
+        assert result[0]["volumeMounts"][0]["path"] == "/mnt/data"
+        assert result[0]["volumeMounts"][0]["readOnly"] is True
 
     def test_list_empty(self):
         with patch("requests.Session.get", return_value=mock_response([])):
@@ -223,6 +779,23 @@ class TestListSandboxesV2:
             result = Sandbox.list_v2(config=make_config())
         assert result == data
 
+    def test_list_v2_includes_volume_mounts(self):
+        data = [{
+            **SANDBOX_DATA,
+            "volumeMounts": [{
+                "name": "hostdir-0",
+                "path": "/mnt/ro",
+                "readOnly": True,
+            }],
+        }]
+        with patch("requests.Session.get", return_value=mock_response(data)):
+            result = Sandbox.list_v2(config=make_config())
+
+        mount = result[0]["volumeMounts"][0]
+        assert mount["path"] == "/mnt/ro"
+        assert mount["readOnly"] is True
+        assert "hostPath" not in mount
+
     def test_list_v2_calls_correct_endpoint(self):
         with patch("requests.Session.get", return_value=mock_response([])) as m:
             Sandbox.list_v2(config=make_config())
@@ -248,13 +821,169 @@ class TestHealth:
 
 # ── GET /sandboxes/:id ────────────────────────────────────────────────────────
 
+FULL_INFO_DATA = {
+    "sandboxID": SANDBOX_ID,
+    "templateID": "tpl-test",
+    "alias": "my-sandbox",
+    "clientID": "client-1",
+    "domain": DOMAIN,
+    "startedAt": "2026-05-14T00:00:00Z",
+    "endAt": "2026-05-14T01:00:00Z",
+    "envdVersion": "0.0.1",
+    "cpuCount": 2,
+    "cpuMilli": 2000,
+    "memoryMB": 512,
+    "diskSizeMB": 1024,
+    "metadata": {"team": "core"},
+    "state": "running",
+}
+
+
 class TestGetInfo:
-    def test_get_info_success(self):
+    def test_sandbox_info_supports_e2b_style_construction(self):
+        info = SandboxInfo(sandbox_id="sb-direct", template_id="tpl-direct")
+        assert info.sandbox_id == "sb-direct"
+        assert info.template_id == "tpl-direct"
+        assert info["sandboxID"] == "sb-direct"
+        assert info["templateID"] == "tpl-direct"
+        assert json.loads(json.dumps(info))["sandboxID"] == "sb-direct"
+
+    def test_sandbox_info_does_not_serialize_envd_access_token(self):
+        secret = "envd-secret"
+        raw = {**FULL_INFO_DATA, "envdAccessToken": secret}
+        info = SandboxInfo.from_dict(raw)
+
+        assert info._envd_access_token == secret
+        assert info["envdAccessToken"] == secret
+        assert info.get("envdAccessToken") == secret
+        assert "envdAccessToken" not in info
+        assert "envdAccessToken" not in info.keys()
+        assert secret not in info.values()
+        assert "envdAccessToken" not in info.to_dict()
+        assert "envdAccessToken" not in info.copy()
+        assert secret not in json.dumps(info)
+
+    def test_get_info_returns_sandbox_info(self):
         sb = make_sandbox()
-        info = {**SANDBOX_DATA, "state": "paused"}
+        with patch.object(sb._session, "get", return_value=mock_response(FULL_INFO_DATA)):
+            info = sb.get_info()
+        assert isinstance(info, SandboxInfo)
+
+    def test_get_info_field_mapping(self):
+        sb = make_sandbox()
+        with patch.object(sb._session, "get", return_value=mock_response(FULL_INFO_DATA)):
+            info = sb.get_info()
+        assert info.sandbox_id == SANDBOX_ID
+        assert info.template_id == "tpl-test"
+        assert info.sandbox_domain == DOMAIN
+        assert info.cpu_count == 2
+        assert info.cpu_milli == 2000
+        assert info.memory_mb == 512
+        assert info.disk_size_mb == 1024
+        assert info.envd_version == "0.0.1"
+        assert info.name == "my-sandbox"
+        assert info.metadata == {"team": "core"}
+
+    def test_get_info_timestamp_parsing(self):
+        sb = make_sandbox()
+        with patch.object(sb._session, "get", return_value=mock_response(FULL_INFO_DATA)):
+            info = sb.get_info()
+        assert isinstance(info.started_at, datetime)
+        assert info.started_at.year == 2026
+        assert info.started_at.tzinfo is not None
+        assert isinstance(info.end_at, datetime)
+        assert info.end_at.hour == 1
+
+    def test_get_info_nanosecond_timestamp_parsing(self):
+        """CubeAPI often emits 9-digit fractional seconds; parse to microseconds."""
+        sb = make_sandbox()
+        info = {
+            **FULL_INFO_DATA,
+            "startedAt": "2026-07-16T03:03:15.877523628Z",
+            "endAt": "2026-07-16T04:03:15.877523628Z",
+        }
         with patch.object(sb._session, "get", return_value=mock_response(info)):
             result = sb.get_info()
+        assert isinstance(result.started_at, datetime)
+        assert result.started_at.microsecond == 877523
+        assert result.started_at.tzinfo is not None
+        assert isinstance(result.end_at, datetime)
+
+    def test_get_info_out_of_range_epoch_timestamp_returns_none(self):
+        sb = make_sandbox()
+        info = {**FULL_INFO_DATA, "startedAt": 10**30}
+        with patch.object(sb._session, "get", return_value=mock_response(info)):
+            result = sb.get_info()
+        assert result.started_at is None
+
+    def test_get_info_state_normalization(self):
+        sb = make_sandbox()
+        info = {**FULL_INFO_DATA, "state": "paused"}
+        with patch.object(sb._session, "get", return_value=mock_response(info)):
+            result = sb.get_info()
+        assert result.state == SandboxState.PAUSED
+        assert result.state == "paused"
+        assert str(result.state) == "paused"
+
+    def test_get_info_unknown_state_falls_back_to_string(self):
+        sb = make_sandbox()
+        info = {**FULL_INFO_DATA, "state": "hibernating"}
+        with patch.object(sb._session, "get", return_value=mock_response(info)):
+            result = sb.get_info()
+        assert result.state == "hibernating"
+
+    def test_get_info_dict_access_backward_compat(self):
+        sb = make_sandbox()
+        info = {**FULL_INFO_DATA, "state": "paused"}
+        with patch.object(sb._session, "get", return_value=mock_response(info)):
+            result = sb.get_info()
+        assert isinstance(result, dict)
+        assert len(result) == len(info)
+        assert list(result) == list(info)
+        assert result["sandboxID"] == SANDBOX_ID
         assert result["state"] == "paused"
+        assert result.get("state") == "paused"
+        assert result.get("missing", "default") == "default"
+        assert "cpuCount" in result
+        assert dict(result.items())["state"] == "paused"
+        assert "paused" in list(result.values())
+        assert json.loads(json.dumps(result)) == info
+        assert result.copy() == info
+        copied = SandboxInfo.from_dict(info)
+        assert copied.pop("state") == "paused"
+        assert "state" not in copied
+
+    def test_get_info_missing_optional_fields(self):
+        sb = make_sandbox()
+        minimal = {"sandboxID": SANDBOX_ID, "templateID": "tpl-test"}
+        with patch.object(sb._session, "get", return_value=mock_response(minimal)):
+            info = sb.get_info()
+        assert info.started_at is None
+        assert info.end_at is None
+        assert info.cpu_count is None
+        assert info.cpu_milli is None
+        assert info.metadata == {}
+        assert info.state is None
+
+    def test_get_info_includes_volume_mounts(self):
+        sb = make_sandbox()
+        info = {
+            **SANDBOX_DATA,
+            "volumeMounts": [{
+                "name": "hostdir-0",
+                "path": "/mnt/data",
+                "readOnly": True,
+            }],
+        }
+        with patch.object(sb._session, "get", return_value=mock_response(info)):
+            result = sb.get_info()
+
+        mounts = result["volumeMounts"]
+        assert len(mounts) == 1
+        assert mounts[0]["name"] == "hostdir-0"
+        assert mounts[0]["path"] == "/mnt/data"
+        assert mounts[0]["readOnly"] is True
+        assert "hostPath" not in mounts[0]
 
     def test_get_info_not_found(self):
         sb = make_sandbox()
@@ -343,13 +1072,35 @@ class TestResume:
         body = m.call_args.kwargs["json"]
         assert body["timeout"] == 120
 
-    def test_resume_default_timeout(self):
+    def test_resume_omits_timeout_by_default(self):
+        # resume() with no argument must omit the timeout field so the server
+        # keeps its own timeout policy.
         sb = make_sandbox()
         with patch.object(sb._session, "post",
                           return_value=mock_response(SANDBOX_DATA, status=201)) as m:
             sb.resume()
         body = m.call_args.kwargs["json"]
-        assert body["timeout"] == 300
+        assert "timeout" not in body
+
+    def test_resume_explicit_zero_is_sent(self):
+        # An explicit 0 must be forwarded as-is (not dropped as falsy).
+        sb = make_sandbox()
+        with patch.object(sb._session, "post",
+                          return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            sb.resume(timeout=0)
+        body = m.call_args.kwargs["json"]
+        assert body["timeout"] == 0
+
+    def test_resume_sends_never_timeout(self):
+        # NEVER_TIMEOUT must be forwarded as -1.
+        from cubesandbox import NEVER_TIMEOUT
+
+        sb = make_sandbox()
+        with patch.object(sb._session, "post",
+                          return_value=mock_response(SANDBOX_DATA, status=201)) as m:
+            sb.resume(timeout=NEVER_TIMEOUT)
+        body = m.call_args.kwargs["json"]
+        assert body["timeout"] == -1
 
     def test_resume_not_found(self):
         sb = make_sandbox()
@@ -357,6 +1108,37 @@ class TestResume:
                           return_value=mock_response({"message": "not found"}, status=404)):
             with pytest.raises(SandboxNotFoundError):
                 sb.resume()
+
+
+# ── POST /sandboxes/:id/timeout ───────────────────────────────────────────────
+
+class TestSetTimeout:
+    def test_set_timeout_success(self):
+        sb = make_sandbox()
+        with patch.object(sb._session, "post", return_value=mock_response(status=204)) as m:
+            sb.set_timeout(120)
+        assert m.call_args.args[0] == f"{sb._config.api_url}/sandboxes/{SANDBOX_ID}/timeout"
+        assert m.call_args.kwargs["json"] == {"timeout": 120}
+
+    def test_set_timeout_sends_explicit_zero(self):
+        sb = make_sandbox()
+        with patch.object(sb._session, "post", return_value=mock_response(status=204)) as m:
+            sb.set_timeout(0)
+        assert m.call_args.kwargs["json"] == {"timeout": 0}
+
+    def test_set_timeout_sends_never_timeout(self):
+        from cubesandbox import NEVER_TIMEOUT
+        sb = make_sandbox()
+        with patch.object(sb._session, "post", return_value=mock_response(status=204)) as m:
+            sb.set_timeout(NEVER_TIMEOUT)
+        assert m.call_args.kwargs["json"] == {"timeout": -1}
+
+    def test_set_timeout_not_found(self):
+        sb = make_sandbox()
+        with patch.object(sb._session, "post",
+                          return_value=mock_response({"message": "not found"}, status=404)):
+            with pytest.raises(SandboxNotFoundError):
+                sb.set_timeout(120)
 
 
 # ── properties / get_host ─────────────────────────────────────────────────────
@@ -436,6 +1218,26 @@ class TestExecutionModel:
         ex = Execution(results=[Result(text="2", is_main_result=True)])
         assert '"results"' in ex.to_json()
         assert '"text": "2"' in ex.to_json()
+
+    def test_logs_to_json_returns_json_string(self):
+        logs = Logs(stdout=["a"], stderr=["b"])
+        assert json.loads(logs.to_json()) == {"stdout": ["a"], "stderr": ["b"]}
+
+    def test_execution_error_to_json_returns_json_string(self):
+        error = ExecutionError("e", "v")
+        assert json.loads(error.to_json()) == {"name": "e", "value": "v", "traceback": ""}
+
+    def test_execution_to_json_roundtrip_preserves_nested_objects(self):
+        execution = Execution(
+            results=[],
+            logs=Logs(stdout=["a"], stderr=["b"]),
+            error=ExecutionError("e", "v"),
+        )
+
+        parsed = json.loads(execution.to_json())
+        assert isinstance(parsed["logs"], dict)
+        assert parsed["logs"]["stdout"] == ["a"]
+        assert isinstance(parsed["error"], dict)
 
     def test_output_message_e2b_and_legacy_aliases(self):
         msg = OutputMessage("hello\n", 123, True)
@@ -601,10 +1403,7 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             result = sb.commands.run("echo hello", cwd="/work", env={"A": "B"})
 
         assert result.stdout == "hello\nworld\n"
@@ -620,6 +1419,83 @@ class TestCommands:
         assert seen["payload"]["process"]["cwd"] == "/work"
         assert seen["payload"]["process"]["envs"] == {"A": "B"}
         assert seen["payload"]["process"]["args"] == ["-l", "-c", "echo hello"]
+
+    def test_run_defaults_cwd_to_empty(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = decode_connect_payload(request.content)
+            body = b"".join(
+                [
+                    connect_envelope(0, '{"event":{"end":{"exitCode":0,"exited":true}}}'),
+                    connect_envelope(0x02, "{}"),
+                ]
+            )
+            return httpx.Response(200, stream=httpx.ByteStream(body))
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            result = sb.commands.run("pwd", user="nobody")
+
+        assert result.exit_code == 0
+        assert seen["payload"]["process"]["cwd"] == ""
+
+    # envd reads Connect-Timeout-Ms as a hard wall-clock deadline, so a
+    # non-positive one has already passed and the request is never answered.
+    # Both values below arrive in ordinary use: 0 is how the e2b SDK spells
+    # "no deadline", and NEVER_TIMEOUT is how this one does.
+    #
+    # The client-side deadline is asserted as well as the header. httpx reads
+    # the same number, and only None disables it there -- 0 times out every
+    # socket operation at once and -1 is rejected -- so forwarding the raw
+    # value would trade the hang for an immediate failure. MockTransport
+    # enforces no timeouts at all, which is why what was passed is inspected
+    # rather than its effect.
+    @pytest.mark.parametrize("timeout", [0, NEVER_TIMEOUT])
+    def test_run_omits_non_positive_timeout_header(self, timeout):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["headers"] = request.headers
+            body = b"".join(
+                [
+                    connect_envelope(0, '{"event":{"end":{"exitCode":0,"exited":true}}}'),
+                    connect_envelope(0x02, "{}"),
+                ]
+            )
+            return httpx.Response(200, stream=httpx.ByteStream(body))
+
+        client = _recording_client(httpx.MockTransport(handler), seen)
+        with patch.object(sb, "_build_data_client", return_value=client):
+            result = sb.commands.run("echo hi", timeout=timeout)
+
+        assert result.exit_code == 0
+        assert "connect-timeout-ms" not in seen["headers"]
+        assert seen["timeout"] is None
+
+    def test_run_sends_positive_timeout_header(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["headers"] = request.headers
+            body = b"".join(
+                [
+                    connect_envelope(0, '{"event":{"end":{"exitCode":0,"exited":true}}}'),
+                    connect_envelope(0x02, "{}"),
+                ]
+            )
+            return httpx.Response(200, stream=httpx.ByteStream(body))
+
+        client = _recording_client(httpx.MockTransport(handler), seen)
+        with patch.object(sb, "_build_data_client", return_value=client):
+            result = sb.commands.run("echo hi", timeout=30)
+
+        assert result.exit_code == 0
+        assert seen["headers"]["connect-timeout-ms"] == "30000"
+        assert seen["timeout"] == 30
 
     def test_run_stderr_event(self):
         sb = make_sandbox()
@@ -637,10 +1513,7 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             result = sb.commands.run("echo warn >&2")
 
         assert result.stdout == ""
@@ -661,10 +1534,7 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             result = sb.commands.run("false")
         assert result.exit_code == 1
 
@@ -682,10 +1552,7 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             result = sb.commands.run("false")
         assert result.exit_code == 7
 
@@ -706,37 +1573,9 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             result = sb.commands.run("kill")
         assert result.exit_code == 137
-
-    def test_collect_process_events_prefers_status_when_exit_code_unset(self):
-        class End:
-            exit_code = 0
-            status = "exit status 7"
-            exited = True
-            error = ""
-
-            def HasField(self, name):
-                return False
-
-        class Event:
-            end = End()
-
-            def HasField(self, name):
-                return name == "end"
-
-        class Response:
-            event = Event()
-
-            def HasField(self, name):
-                return name == "event"
-
-        result = _collect_process_events([Response()])
-        assert result.exit_code == 7
 
     def test_run_timeout_forwarded(self):
         sb = make_sandbox()
@@ -754,10 +1593,7 @@ class TestCommands:
             return httpx.Response(200, stream=httpx.ByteStream(body))
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             sb.commands.run("sleep 1", timeout=5.0)
         assert seen["headers"]["connect-timeout-ms"] == "5000"
 
@@ -768,10 +1604,7 @@ class TestCommands:
             return httpx.Response(400, json={"message": "sandbox is not ready"})
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with (
-            patch.object(Commands, "_run_with_e2b_connect", side_effect=ImportError),
-            patch.object(sb, "_build_data_client", return_value=client),
-        ):
+        with patch.object(sb, "_build_data_client", return_value=client):
             with pytest.raises(RuntimeError, match="HTTP 400: sandbox is not ready"):
                 sb.commands.run("echo hello")
 
@@ -881,8 +1714,401 @@ class TestFilesystem:
         assert "multipart/form-data" in seen["content_type"]
         assert b"file content" in seen["body"]
 
+    def test_list_success(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["method"] = request.method
+            seen["host"] = request.url.host
+            seen["path"] = request.url.path
+            seen["content_type"] = request.headers.get("content-type")
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={
+                "entries": [
+                    {"name": "a.txt", "type": "FILE_TYPE_FILE", "path": "/tmp/a.txt",
+                     "size": "10", "permissions": "-rw-r--r--"},
+                    {"name": "sub", "type": "FILE_TYPE_DIRECTORY", "path": "/tmp/sub",
+                     "size": "0", "permissions": "drwxr-xr-x"},
+                ]
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            entries = sb.files.list("/tmp")
+        assert seen["method"] == "POST"
+        assert seen["host"] == f"49983-{SANDBOX_ID}.{DOMAIN}"
+        assert seen["path"] == "/filesystem.Filesystem/ListDir"
+        assert seen["content_type"] == "application/json"
+        assert seen["body"] == {"path": "/tmp"}
+        assert len(entries) == 2
+        assert entries[0]["name"] == "a.txt"
+        assert entries[1]["type"] == "FILE_TYPE_DIRECTORY"
+
+    def test_list_returns_empty_for_empty_dir(self):
+        sb = make_sandbox()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            entries = sb.files.list("/empty")
+        assert entries == []
+
+    def test_list_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={"entries": []})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            sb.files.list("/tmp", user="nobody")
+
+        assert seen["body"] == {"path": "/tmp"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
+
+    def test_stat_success(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={
+                "entry": {"name": "hello.txt", "type": "FILE_TYPE_FILE",
+                          "path": "/tmp/hello.txt", "size": "30"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            entry = sb.files.stat("/tmp/hello.txt")
+        assert seen["body"] == {"path": "/tmp/hello.txt"}
+        assert entry["name"] == "hello.txt"
+        assert entry["size"] == "30"
+
+    def test_stat_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={
+                "entry": {"name": "hello.txt", "type": "FILE_TYPE_FILE", "path": "/tmp/hello.txt", "size": "30"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            entry = sb.files.stat("/tmp/hello.txt", user="nobody")
+
+        assert seen["body"] == {"path": "/tmp/hello.txt"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
+        assert entry["name"] == "hello.txt"
+
+    def test_exists_returns_true(self):
+        sb = make_sandbox()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "entry": {"name": "f.txt", "type": "FILE_TYPE_FILE", "path": "/tmp/f.txt"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            assert sb.files.exists("/tmp/f.txt") is True
+
+    def test_exists_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={
+                "entry": {"name": "f.txt", "type": "FILE_TYPE_FILE", "path": "/tmp/f.txt"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            assert sb.files.exists("/tmp/f.txt", user="nobody") is True
+
+        assert seen["body"] == {"path": "/tmp/f.txt"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
+
+    def test_exists_returns_false_on_404(self):
+        sb = make_sandbox()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={
+                "code": "not_found", "message": "file not found: /tmp/missing.txt"
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            assert sb.files.exists("/tmp/missing.txt") is False
+
+    def test_remove_success(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["path"] = request.url.path
+            return httpx.Response(200, json={})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            sb.files.remove("/tmp/old.txt")
+        assert seen["path"] == "/filesystem.Filesystem/Remove"
+        assert seen["body"] == {"path": "/tmp/old.txt"}
+
+    def test_remove_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            sb.files.remove("/tmp/old.txt", user="nobody")
+
+        assert seen["body"] == {"path": "/tmp/old.txt"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
+
+    def test_rename_success(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={
+                "entry": {"name": "new.txt", "type": "FILE_TYPE_FILE",
+                          "path": "/tmp/new.txt"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            entry = sb.files.rename("/tmp/old.txt", "/tmp/new.txt")
+        assert seen["body"] == {"source": "/tmp/old.txt", "destination": "/tmp/new.txt"}
+        assert entry["name"] == "new.txt"
+
+    def test_rename_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={
+                "entry": {"name": "new.txt", "type": "FILE_TYPE_FILE", "path": "/tmp/new.txt"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            entry = sb.files.rename("/tmp/old.txt", "/tmp/new.txt", user="nobody")
+
+        assert seen["body"] == {"source": "/tmp/old.txt", "destination": "/tmp/new.txt"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
+        assert entry["name"] == "new.txt"
+
+    def test_make_dir_success(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={
+                "entry": {"name": "newdir", "type": "FILE_TYPE_DIRECTORY",
+                          "path": "/tmp/newdir"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            entry = sb.files.make_dir("/tmp/newdir")
+        assert seen["body"] == {"path": "/tmp/newdir"}
+        assert entry["type"] == "FILE_TYPE_DIRECTORY"
+
+    def test_make_dir_includes_user_when_provided(self):
+        sb = make_sandbox()
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["authorization"] = request.headers.get("authorization")
+            return httpx.Response(200, json={
+                "entry": {"name": "newdir", "type": "FILE_TYPE_DIRECTORY", "path": "/tmp/newdir"}
+            })
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            entry = sb.files.make_dir("/tmp/newdir", user="nobody")
+
+        assert seen["body"] == {"path": "/tmp/newdir"}
+        assert seen["authorization"] == "Basic bm9ib2R5Og=="
+        assert entry["type"] == "FILE_TYPE_DIRECTORY"
+
+    def test_write_files_success(self):
+        sb = make_sandbox()
+        paths = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.params.get("path"))
+            return httpx.Response(200, json=[{"path": request.url.params.get("path")}])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            n = sb.files.write_files([
+                ("/tmp/a.txt", "aaa"),
+                ("/tmp/b.txt", b"bbb"),
+                ("/tmp/c.txt", "ccc"),
+            ])
+        assert n == 3
+        assert paths == ["/tmp/a.txt", "/tmp/b.txt", "/tmp/c.txt"]
+
+    def test_write_files_stops_on_error(self):
+        sb = make_sandbox()
+        calls = {"count": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["count"] += 1
+            path = request.url.params.get("path", "")
+            if path == "/tmp/b.txt":
+                return httpx.Response(500, json={"message": "disk full"})
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            with pytest.raises(IOError, match="write_files failed at /tmp/b.txt"):
+                sb.files.write_files([
+                    ("/tmp/a.txt", "ok"),
+                    ("/tmp/b.txt", "fail"),
+                    ("/tmp/c.txt", "skip"),
+                ])
+
+    def test_filesystem_rpc_raises_on_error(self):
+        sb = make_sandbox()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"message": "internal error"})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            with pytest.raises(IOError, match="Filesystem ListDir failed"):
+                sb.files.list("/tmp")
+
+    def test_watch_dir_receives_events(self):
+        sb = make_sandbox()
+
+        def _connect_frame(flags, payload_str):
+            raw = payload_str.encode()
+            return struct.pack(">bI", flags, len(raw)) + raw
+
+        stream_data = b"".join([
+            _connect_frame(0, '{"start":{}}'),
+            _connect_frame(0, '{"filesystem":{"name":"a.txt","type":"EVENT_TYPE_CREATE"}}'),
+            _connect_frame(0, '{"filesystem":{"name":"a.txt","type":"EVENT_TYPE_WRITE"}}'),
+            _connect_frame(0, '{"filesystem":{"name":"b.txt","type":"EVENT_TYPE_REMOVE"}}'),
+        ])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=httpx.ByteStream(stream_data))
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            with sb.files.watch_dir("/tmp/test") as watcher:
+                events = list(watcher)
+
+        assert len(events) == 3
+        assert events[0]["name"] == "a.txt"
+        assert events[0]["type"] == "EVENT_TYPE_CREATE"
+        assert events[1]["type"] == "EVENT_TYPE_WRITE"
+        assert events[2]["name"] == "b.txt"
+        assert events[2]["type"] == "EVENT_TYPE_REMOVE"
+
+    def test_watch_dir_error_from_server(self):
+        sb = make_sandbox()
+
+        def _connect_frame(flags, payload_str):
+            raw = payload_str.encode()
+            return struct.pack(">bI", flags, len(raw)) + raw
+
+        stream_data = _connect_frame(
+            0x02, '{"error":{"code":"not_found","message":"path not found"}}'
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=httpx.ByteStream(stream_data))
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            with sb.files.watch_dir("/nonexistent") as watcher:
+                with pytest.raises(IOError, match="path not found"):
+                    list(watcher)
+
+    def test_watch_dir_http_error(self):
+        sb = make_sandbox()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, text="not found")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            with pytest.raises(IOError, match="WatchDir failed"):
+                sb.files.watch_dir("/tmp/test")
+
     def test_files_property(self):
         assert isinstance(make_sandbox().files, Filesystem)
+
+
+# ── IPOverrideTransport ───────────────────────────────────────────────────────
+
+class TestIPOverrideTransport:
+    """IPOverrideTransport must copy request content for all body types."""
+
+    def _handle(self, request: httpx.Request) -> None:
+        """Run handle_request and assert the request body was copied successfully
+        before the connection attempt fails."""
+        from cubesandbox._transport import IPOverrideTransport
+
+        transport = IPOverrideTransport("127.0.0.1", 1)
+        with pytest.raises(httpx.ConnectError):
+            transport.handle_request(request)
+
+    def test_content_bytes(self):
+        """content=bytes (files.write first attempt) must not raise."""
+        req = httpx.Request(
+            "POST",
+            "http://49983-sb-test.cube.app/files",
+            params={"path": "/tmp/t.txt", "username": "root"},
+            content=b"hello",
+        )
+        self._handle(req)
+
+    def test_files_multipart(self):
+        """files= multipart (files.write fallback) must reach ConnectError."""
+        req = httpx.Request(
+            "POST",
+            "http://49983-sb-test.cube.app/files",
+            params={"path": "/tmp/t.txt", "username": "root"},
+            files={"file": ("t.txt", b"hello")},
+        )
+        self._handle(req)
+
+    def test_get_no_body(self):
+        """GET (files.read) with no body must reach ConnectError."""
+        req = httpx.Request(
+            "GET",
+            "http://49983-sb-test.cube.app/files",
+            params={"path": "/tmp/t.txt", "username": "root"},
+        )
+        self._handle(req)
 
 
 # ── close / __del__ ───────────────────────────────────────────────────────────
@@ -1054,9 +2280,14 @@ class TestClone:
         stack, _snap, create_p, delete_p = self._patch_clone_internals()
         with stack:
             result = sb.clone()
-        assert len(result) == 1
-        assert create_p.call_count == 1
-        delete_p.assert_called_once()
+            assert len(result) == 1
+            assert create_p.call_count == 1
+            delete_p.assert_not_called()
+
+            response = MagicMock(ok=True)
+            with patch.object(result[0]._session, "delete", return_value=response):
+                result[0].kill()
+            delete_p.assert_called_once_with("snap-test", config=sb._config)
 
     def test_clone_n_sequential(self):
         sb = make_sandbox()
@@ -1086,14 +2317,52 @@ class TestClone:
         for call in create_p.call_args_list:
             assert call.kwargs["template"] == "snap-xyz"
 
-    def test_clone_deletes_snapshot_on_success(self):
+    def test_clone_deletes_snapshot_after_last_clone_is_killed(self):
         sb = make_sandbox()
         stack, _snap, _create, delete_p = self._patch_clone_internals(
             snapshot_id="snap-to-clean"
         )
         with stack:
-            sb.clone(n=3)
-        delete_p.assert_called_once_with("snap-to-clean", config=sb._config)
+            clones = sb.clone(n=3)
+            delete_p.assert_not_called()
+            response = MagicMock(ok=True)
+            for clone in clones:
+                with patch.object(clone._session, "delete", return_value=response):
+                    clone.kill()
+            delete_p.assert_called_once_with("snap-to-clean", config=sb._config)
+
+    def test_clone_cleanup_is_idempotent_for_repeated_kill(self):
+        sb = make_sandbox()
+        stack, _snap, _create, delete_p = self._patch_clone_internals()
+        with stack:
+            clone = sb.clone()[0]
+            response = MagicMock(ok=True)
+            with patch.object(clone._session, "delete", return_value=response):
+                clone.kill()
+                clone.kill()
+            delete_p.assert_called_once()
+
+    def test_clone_cleanup_is_thread_safe(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        sb = make_sandbox()
+        stack, _snap, _create, delete_p = self._patch_clone_internals()
+        with stack:
+            clones = sb.clone(n=8)
+            response = MagicMock(ok=True)
+            patches = [
+                patch.object(clone._session, "delete", return_value=response)
+                for clone in clones
+            ]
+            for session_patch in patches:
+                session_patch.start()
+            try:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    list(pool.map(lambda clone: clone.kill(), clones))
+            finally:
+                for session_patch in patches:
+                    session_patch.stop()
+            delete_p.assert_called_once()
 
     def test_clone_deletes_snapshot_even_on_error(self):
         """If a Sandbox.create call raises, the ephemeral snapshot is still
@@ -1116,8 +2385,12 @@ class TestClone:
         stack, _snap, _create, delete_p = self._patch_clone_internals()
         delete_p.side_effect = ApiError("snapshot delete failed")
         with stack:
-            result = sb.clone(n=2)  # should not raise
-        assert len(result) == 2
+            result = sb.clone(n=2)
+            response = MagicMock(ok=True)
+            for clone in result:
+                with patch.object(clone._session, "delete", return_value=response):
+                    clone.kill()  # should not raise
+            assert len(result) == 2
 
     # ─── concurrent ──────────────────────────────────────────────────────────
 
@@ -1183,8 +2456,9 @@ class TestClone:
             with pytest.raises(ApiError, match="create failed"):
                 sb.clone(n=5, concurrency=3)
 
-        # Snapshot got cleaned up exactly once.
-        delete_p.assert_called_once()
+        # kill() is mocked and therefore cannot release clone ownership. The
+        # error-path backstop must still delete the temporary snapshot.
+        delete_p.assert_called_once_with("snap-partial", config=sb._config)
         # Every sandbox that ``Sandbox.create`` actually returned must have
         # been killed by clone() before it raised. We assert the count
         # matches what _flaky produced — n=5 with the 3rd raising means 4
@@ -1361,6 +2635,180 @@ class TestTemplateAPI:
         )
         assert job.job_id == "job-001"
         assert job.template_id == "tpl-python"
+
+    def test_build_forwards_create_from_image_options(self):
+        body = {
+            "jobID": "job-002",
+            "templateID": "tpl-network",
+            "status": "accepted",
+            "phase": "",
+            "progress": 0,
+        }
+        config = make_config()
+
+        with patch("requests.Session.post", return_value=mock_response(body)) as post:
+            Template.build(
+                image="registry.example.com/app:latest",
+                writable_layer_size="20Gi",
+                network_type="tap",
+                nodes=["node-a", "10.0.0.12"],
+                registry_username="pull-user",
+                registry_password="pull-pass",
+                command=["/bin/sh", "-c"],
+                args=["sleep infinity"],
+                dns=["8.8.8.8", "1.1.1.1"],
+                allow_out=["172.67.0.0/16"],
+                deny_out=["10.0.0.0/8"],
+                enable_ivshmem=True,
+                config=config,
+            )
+
+        post.assert_called_once_with(
+            "http://localhost:3000/templates",
+            json={
+                "image": "registry.example.com/app:latest",
+                "writableLayerSize": "20Gi",
+                "networkType": "tap",
+                "nodes": ["node-a", "10.0.0.12"],
+                "registryUsername": "pull-user",
+                "registryPassword": "pull-pass",
+                "command": ["/bin/sh", "-c"],
+                "args": ["sleep infinity"],
+                "dns": ["8.8.8.8", "1.1.1.1"],
+                "allowOut": ["172.67.0.0/16"],
+                "denyOut": ["10.0.0.0/8"],
+                "enableIvshmem": True,
+            },
+            headers={"Content-Type": "application/json"},
+        )
+
+    def test_build_rejects_allow_out_domain_without_deny_all(self):
+        with pytest.raises(ApiError, match="must disable public outbound traffic or include '0.0.0.0/0' in deny_out") as exc:
+            Template.build(
+                image="registry.example.com/app:latest",
+                allow_out=["api.example.com"],
+                config=make_config(),
+            )
+        assert exc.value.status_code == 400
+
+    def test_build_accepts_allow_out_domain_when_internet_disabled(self):
+        body = {
+            "jobID": "job-domain",
+            "templateID": "tpl-domain",
+            "status": "accepted",
+        }
+
+        with patch("requests.Session.post", return_value=mock_response(body)) as post:
+            Template.build(
+                image="registry.example.com/app:latest",
+                allow_out=["api.example.com"],
+                allow_internet_access=False,
+                config=make_config(),
+            )
+
+        sent = post.call_args.kwargs["json"]
+        assert sent["allowOut"] == ["api.example.com"]
+        assert sent["allowInternetAccess"] is False
+        assert "denyOut" not in sent
+
+    def test_build_accepts_allow_out_domain_with_deny_all(self):
+        body = {
+            "jobID": "job-domain",
+            "templateID": "tpl-domain",
+            "status": "accepted",
+        }
+        config = make_config()
+
+        with patch("requests.Session.post", return_value=mock_response(body)) as post:
+            Template.build(
+                image="registry.example.com/app:latest",
+                allow_out=["api.example.com"],
+                deny_out=["0.0.0.0/0"],
+                config=config,
+            )
+
+        sent = post.call_args.kwargs["json"]
+        assert sent["allowOut"] == ["api.example.com"]
+        assert sent["denyOut"] == ["0.0.0.0/0"]
+
+    def test_template_info_from_dict_handles_empty_aliases(self):
+        info = TemplateInfo.from_dict({
+            "templateID": "tpl-test",
+            "aliases": [],
+            "networkType": "tap",
+            "allowInternetAccess": True,
+        })
+        assert info.template_id == "tpl-test"
+        assert info.name == ""
+        assert info.network_type == "tap"
+        assert info.allow_internet_access is True
+
+    def test_template_info_from_dict_name_fallback_from_aliases(self):
+        info = TemplateInfo.from_dict({
+            "templateID": "tpl-alias",
+            "aliases": ["my-alias"],
+        })
+        assert info.name == "my-alias"
+
+    def test_build_forwards_name_into_payload(self):
+        body = {"jobID": "job-name", "templateID": "tpl-name", "status": "accepted"}
+        with patch("requests.Session.post", return_value=mock_response(body)) as post:
+            Template.build(image="python:3.11-slim", name="my-alias", config=make_config())
+        sent = post.call_args.kwargs["json"]
+        assert sent["name"] == "my-alias"
+        assert sent["image"] == "python:3.11-slim"
+
+    def test_build_omits_name_when_none(self):
+        body = {"jobID": "j", "templateID": "t", "status": "accepted"}
+        with patch("requests.Session.post", return_value=mock_response(body)) as post:
+            Template.build(image="python:3.11-slim", config=make_config())
+        assert "name" not in post.call_args.kwargs["json"]
+
+    def test_set_alias_forwards_put_with_alias(self):
+        body = {"templateID": "tpl-1", "aliases": ["my-alias"], "status": "READY"}
+        with patch("requests.Session.put", return_value=mock_response(body)) as put:
+            info = Template.set_alias("tpl-1", "my-alias", config=make_config())
+        assert put.call_args.args[0].endswith("/templates/tpl-1/alias")
+        assert put.call_args.kwargs["json"] == {"alias": "my-alias"}
+        assert info.template_id == "tpl-1"
+        assert info.name == "my-alias"
+
+    def test_set_alias_clear_sends_empty_string(self):
+        body = {"templateID": "tpl-1", "aliases": [], "status": "READY"}
+        with patch("requests.Session.put", return_value=mock_response(body)) as put:
+            info = Template.set_alias("tpl-1", None, config=make_config())
+        assert put.call_args.kwargs["json"] == {"alias": ""}
+        assert info.name == ""
+
+    def test_template_get_parses_network_fields(self):
+        body = {
+            "templateID": "tpl-network",
+            "status": "READY",
+            "networkType": "tap",
+            "allowInternetAccess": False,
+            "createRequest": {
+                "network_type": "tap",
+                "cubevs_context": {
+                    "allowInternetAccess": False,
+                    "allowOut": ["172.67.0.0/16"],
+                    "denyOut": ["10.0.0.0/8"],
+                },
+            },
+        }
+        config = make_config()
+
+        with patch("requests.Session.get", return_value=mock_response(body)) as get:
+            info = Template.get("tpl-network", config=config)
+
+        get.assert_called_once_with(
+            "http://localhost:3000/templates/tpl-network",
+            params={},
+            headers={}
+        )
+        assert info.template_id == "tpl-network"
+        assert info.network_type == "tap"
+        assert info.allow_internet_access is False
+        assert info.create_request["cubevs_context"]["allowOut"] == ["172.67.0.0/16"]
 
     def test_build_rejects_unsupported_models(self):
         with pytest.raises(ValueError, match="image is required"):

@@ -6,14 +6,14 @@ package instancecache
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/rediskey"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/wrapredis"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 func trace(ctx context.Context, action string, op string, start time.Time, err error) {
@@ -32,19 +32,19 @@ func trace(ctx context.Context, action string, op string, start time.Time, err e
 	}
 }
 
+// KeyMetadata builds the namespaced metadata key for the given segments.
 func KeyMetadata(objs ...string) string {
-	segs := []string{"instance", "metadata"}
-	segs = append(segs, objs...)
-	return strings.Join(segs, ":")
+	return rediskey.InstanceMeta(objs...)
 }
 
-func MetadataSet(ctx context.Context, key string, value string) (err error) {
-	const (
-		redisOp = "SET"
-	)
+func MetadataSet(ctx context.Context, value string, objs ...string) (err error) {
+	const redisOp = "SET"
 	start := time.Now()
-	defer trace(ctx, "Create", redisOp, start, err)
-	_, err = wrapredis.GetRedis(wrapredis.RedisMetaData).Do(redisOp, key, value)
+	defer func() {
+		trace(ctx, "Create", redisOp, start, err)
+	}()
+	key := rediskey.InstanceMeta(objs...)
+	_, err = wrapredis.GetRedis().Do(redisOp, key, value)
 	if err != nil {
 		log.G(ctx).Errorf("redis %s error, key: %s, err: %s", redisOp, key, err)
 		return err
@@ -55,14 +55,14 @@ func MetadataSet(ctx context.Context, key string, value string) (err error) {
 	return nil
 }
 
-func MetadataPush(ctx context.Context, key string, value string) (err error) {
-	const (
-		redisOp = "RPUSH"
-	)
+func MetadataPush(ctx context.Context, value string, objs ...string) (err error) {
+	const redisOp = "RPUSH"
 	start := time.Now()
-	defer trace(ctx, "Create", redisOp, start, err)
-
-	_, err = wrapredis.GetRedis(wrapredis.RedisMetaData).Do(redisOp, key, value)
+	defer func() {
+		trace(ctx, "Create", redisOp, start, err)
+	}()
+	key := rediskey.InstanceMeta(objs...)
+	_, err = wrapredis.GetRedis().Do(redisOp, key, value)
 	if err != nil {
 		log.G(ctx).Errorf("redis %s error, key: %s, err: %s", redisOp, key, err)
 		return err
@@ -73,14 +73,14 @@ func MetadataPush(ctx context.Context, key string, value string) (err error) {
 	return nil
 }
 
-func MetadataLRem(ctx context.Context, key string, value string) (err error) {
-	const (
-		redisOp = "LREM"
-	)
+func MetadataLRem(ctx context.Context, value string, objs ...string) (err error) {
+	const redisOp = "LREM"
 	start := time.Now()
-	defer trace(ctx, "Destroy", redisOp, start, err)
-
-	_, err = wrapredis.GetRedis(wrapredis.RedisMetaData).Do(redisOp, key, 0, value)
+	defer func() {
+		trace(ctx, "Destroy", redisOp, start, err)
+	}()
+	key := rediskey.InstanceMeta(objs...)
+	_, err = wrapredis.GetRedis().Do(redisOp, key, 0, value)
 	if err != nil {
 		log.G(ctx).Errorf("redis %s error, key: %s, err: %s", redisOp, key, err)
 		return err
@@ -91,19 +91,25 @@ func MetadataLRem(ctx context.Context, key string, value string) (err error) {
 	return nil
 }
 
-func MetadataDel(ctx context.Context, key string) (err error) {
-	const (
-		redisOp = "DEL"
-	)
+func MetadataDel(ctx context.Context, objs ...string) (err error) {
+	const redisOp = "DEL"
 	start := time.Now()
-	defer trace(ctx, "Destroy", redisOp, start, err)
-	_, err = wrapredis.GetRedis(wrapredis.RedisMetaData).Do(redisOp, key)
-	if err != nil {
-		log.G(ctx).Errorf("redis %s error, key: %s, err: %s", redisOp, key, err)
-		return err
+	defer func() {
+		trace(ctx, "Destroy", redisOp, start, err)
+	}()
+	var firstErr error
+	for _, key := range rediskey.DeleteKeys(rediskey.InstanceMeta(objs...), rediskey.LegacyInstanceMeta(objs...)) {
+		if _, e := wrapredis.GetRedis().Do(redisOp, key); e != nil {
+			log.G(ctx).Errorf("redis %s error, key: %s, err: %s", redisOp, key, e)
+			if firstErr == nil {
+				firstErr = e
+			}
+			continue
+		}
+		if log.IsDebug() {
+			log.G(ctx).Debugf("redis.%s:%s", redisOp, key)
+		}
 	}
-	if log.IsDebug() {
-		log.G(ctx).Debugf("redis.%s:%s", redisOp, key)
-	}
-	return nil
+	err = firstErr
+	return err
 }

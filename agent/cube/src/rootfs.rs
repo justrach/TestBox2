@@ -75,7 +75,7 @@ pub struct PropagationContainerUmount {
 }
 
 pub fn exit_proc_failed(msg: String) {
-    println!("{}", msg);
+    eprintln!("{}", msg);
     std::process::exit(1);
 }
 
@@ -212,8 +212,7 @@ pub fn do_exec_mount() {
 #[cfg(test)]
 mod tests {
     use crate::rootfs::RootfsInfo;
-    use crate::rootfs::K_VIRTIOFS_BASE_DIR;
-    use std::env;
+
     #[test]
     fn test_rootfsinfo_new() {
         let info =

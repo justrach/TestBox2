@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -34,7 +35,6 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	protobuf "google.golang.org/protobuf/proto"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	cubeimages "github.com/tencentcloud/CubeSandbox/Cubelet/internal/cube/server/images"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/netfile"
@@ -47,7 +47,8 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/cubes"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 const (
@@ -203,13 +204,15 @@ func init() {
 			}
 
 			l := &local{
-				client:        client,
-				localTask:     i.(tasks.TasksClient),
-				config:        config,
-				criImage:      obj.(*cubeimages.CubeImageService),
-				cbriManager:   cbriManager,
-				cubeboxManger: cubeboxAPIObj.(cubes.CubeboxAPI),
-				shims:         shimPlugin.(*v2.ShimManager),
+				client:         client,
+				localTask:      i.(tasks.TasksClient),
+				config:         config,
+				criImage:       obj.(*cubeimages.CubeImageService),
+				cbriManager:    cbriManager,
+				cubeboxManger:  cubeboxAPIObj.(cubes.CubeboxAPI),
+				shims:          shimPlugin.(*v2.ShimManager),
+				envdHTTPClient: newEnvdHTTPClient(),
+				envdInitPort:   defaultEnvdInitPort,
 			}
 
 			CubeLog.Info("Start recovering state")
@@ -254,9 +257,12 @@ type local struct {
 	config    *CubeConfig
 	shims     *v2.ShimManager
 
-	criImage      *cubeimages.CubeImageService
-	cbriManager   cbri.APIManager
-	cubeboxManger cubes.CubeboxAPI
+	criImage       *cubeimages.CubeImageService
+	cbriManager    cbri.APIManager
+	cubeboxManger  cubes.CubeboxAPI
+	envdHTTPClient *http.Client
+	envdInitPort   int
+	destroyFn      func(context.Context, *workflow.DestroyContext) error
 }
 
 const (
@@ -454,16 +460,15 @@ func (l *local) CleanUp(ctx context.Context, opts *workflow.CleanContext) error 
 		ctrLists = append(ctrLists, ctr)
 	}
 	ctrLists = append(ctrLists, info.FirstContainer())
+	runtimePIDs := l.collectSandboxRuntimePIDs(ctx, info)
 	for _, ctr := range ctrLists {
 		err = l.stopTask(ctx, ctr.Container)
 		if err != nil {
 			stepLog.Warnf("CleanUp stopTask %s fail: %v", sandBoxID, err)
 		}
 	}
-	if info.GetStatus() != nil &&
-		info.GetStatus().Get().Pid != 0 &&
-		utils.ProcessExists(ctx, int(info.GetStatus().Get().Pid)) {
-		return fmt.Errorf("shim process still Exists [%s]", sandBoxID)
+	if err := waitSandboxRuntimeGone(ctx, sandBoxID, runtimePIDs); err != nil {
+		return fmt.Errorf("shim process still Exists [%s]: %w", sandBoxID, err)
 	}
 
 	var (
@@ -586,6 +591,14 @@ func makeContainerConfigToSave(cfg *cubebox.ContainerConfig) *cubebox.ContainerC
 		Name:        cfg.GetName(),
 		Annotations: maps.Clone(cfg.GetAnnotations()),
 		Image:       cfg.GetImage(),
+		// Keep recreate-critical fields for Pause→Resume (sandbox_spec.json).
+		Command:         append([]string{}, cfg.GetCommand()...),
+		Args:            append([]string{}, cfg.GetArgs()...),
+		WorkingDir:      cfg.GetWorkingDir(),
+		Envs:            cfg.GetEnvs(),
+		RLimit:          cfg.GetRLimit(),
+		Probe:           cfg.GetProbe(),
+		SecurityContext: cfg.GetSecurityContext(),
 		Resources: &cubebox.Resource{
 			Cpu:      cfg.GetResources().GetCpu(),
 			CpuLimit: cfg.GetResources().GetCpuLimit(),

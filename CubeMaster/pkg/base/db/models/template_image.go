@@ -24,9 +24,25 @@ type RootfsArtifact struct {
 	GeneratedRequestJSON    string `json:"generated_request_json" gorm:"column:generated_request_json"`
 	WritableLayerSize       string `json:"writable_layer_size" gorm:"column:writable_layer_size"`
 	DownloadToken           string `json:"download_token" gorm:"column:download_token"`
-	Status                  string `json:"status" gorm:"column:status"`
-	LastError               string `json:"last_error" gorm:"column:last_error"`
-	GCDeadline              int64  `json:"gc_deadline" gorm:"column:gc_deadline"`
+	// ArtifactURL is the S3/MinIO presigned download URL persisted at build time.
+	// CubeMaster/TC may re-sign it when proxying downloads, but Cubelets now
+	// receive the stable CubeMaster download endpoint rather than this raw URL.
+	ArtifactURL string `json:"artifact_url" gorm:"column:artifact_url"`
+	// StorageBackend is "s3", "fs", or empty (legacy: infer from ArtifactURL).
+	StorageBackend string `json:"storage_backend" gorm:"column:storage_backend"`
+	// ObjectKey is the blobstore key. Empty means derive [prefix/]id.ext4.
+	ObjectKey  string `json:"object_key" gorm:"column:object_key"`
+	Status     string `json:"status" gorm:"column:status"`
+	LastError  string `json:"last_error" gorm:"column:last_error"`
+	GCDeadline int64  `json:"gc_deadline" gorm:"column:gc_deadline"`
+
+	// CubeEgress CA bake metadata (see design/cube-egress-ca-bake.md).
+	// Used for audit/triage; the artifact reuse cache key folds
+	// CubeEgressCAFingerprint into TemplateSpecFingerprint, so a CA
+	// rotation invalidates stale artifacts automatically.
+	CubeEgressCABaked          bool   `json:"cube_egress_ca_baked" gorm:"column:cube_egress_ca_baked"`
+	CubeEgressCAFingerprint    string `json:"cube_egress_ca_fingerprint" gorm:"column:cube_egress_ca_fingerprint"`
+	CubeEgressCATargetsWritten int    `json:"cube_egress_ca_targets_written" gorm:"column:cube_egress_ca_targets_written"`
 }
 
 func (RootfsArtifact) TableName() string {
@@ -66,6 +82,11 @@ type TemplateImageJob struct {
 	FailedNodeCount         int32  `json:"failed_node_count" gorm:"column:failed_node_count"`
 	TemplateStatus          string `json:"template_status" gorm:"column:template_status"`
 	ArtifactStatus          string `json:"artifact_status" gorm:"column:artifact_status"`
+	PullTotalBytes          int64  `json:"pull_total_bytes" gorm:"column:pull_total_bytes"`
+	PullDownloadedBytes     int64  `json:"pull_downloaded_bytes" gorm:"column:pull_downloaded_bytes"`
+	PullTotalLayers         int32  `json:"pull_total_layers" gorm:"column:pull_total_layers"`
+	PullCompletedLayers     int32  `json:"pull_completed_layers" gorm:"column:pull_completed_layers"`
+	PullSpeedBPS            int64  `json:"pull_speed_bps" gorm:"column:pull_speed_bps"`
 	RequestJSON             string `json:"request_json" gorm:"column:request_json"`
 	ResultJSON              string `json:"result_json" gorm:"column:result_json"`
 }

@@ -6,8 +6,12 @@
 
 ⚠️请严格按照文档操作，这样能让你在几分钟内快速体验到CubeSandbox！
 
+::: warning 生产环境注意
+如果您计划在生产环境中使用 Cube Sandbox，请参阅[网络加固](./network-hardening.md)指南，在将服务暴露到不可信网络之前完成安全加固。
+:::
+
 ::: tip 已经有支持 KVM 的服务器？
-如果你已经有一台开启了 KVM 的 x86_64 Linux 服务器（物理机或裸金属服务器），可以直接参阅[裸金属 / 物理机部署](./bare-metal-deploy.md)，跳过 PVM 安装步骤。
+如果你已经有一台开启了 KVM 的 x86_64 或 aarch64（ARM64）Linux 服务器（物理机或裸金属服务器），可以直接参阅[裸金属 / 物理机部署](./bare-metal-deploy.md)，跳过 PVM 安装步骤。
 :::
 
 ## 前置条件
@@ -15,6 +19,12 @@
 - **x86_64** 架构的云服务器（普通云服务器即可，无需 `/dev/kvm`）
 - 有 **root 权限**
 - 可访问互联网（用于下载发布包、拉取 Docker 镜像）
+
+::: warning ARM64（aarch64）主机
+本快速开始通过 **PVM** 在普通云服务器上启用 KVM，而 PVM 宿主机内核**仅支持 x86_64**（发布附件为 `*.x86_64.rpm` / `*_amd64.deb`）。PVM **不支持** ARM64。
+
+在 **aarch64（ARM64）** 上，请使用本身已提供原生 KVM 的机器（物理机 / 裸金属 ARM64 服务器），改为参阅[裸金属 / 物理机部署](./bare-metal-deploy.md)或[本地构建部署](./self-build-deploy.md) —— 两者均支持 aarch64。
+:::
 
 ### 🖥 受支持的系统
 
@@ -58,18 +68,22 @@ sudo su root
 
 ### 安装 PVM 宿主机内核
 
-前往 [CubeSandbox Releases](https://cnb.cool/CubeSandbox/CubeSandbox/-/releases) 页面，打开最新包含 PVM 内核附件的 Release，**在对应附件上右键 → 复制链接地址**，然后用 `wget` 下载。
+#### 下载内核包
 
-根据你的 Linux 发行版选择对应格式：
+PVM 宿主机内核包发布在专属的 `kernel-release-*` Release 上，请到发布页下载最新的内核主包：
+
+1. 打开 [CubeSandbox Releases 页面](https://cnb.cool/CubeSandbox/CubeSandbox/-/releases)，在过滤框输入 `kernel-release`，打开最新的一个
+2. 按你的 Linux 发行版下载**内核主包**：
+   - RPM 系：`kernel-*opencloudos9.cubesandbox.pvm.host*.x86_64.rpm`
+   - DEB 系：`linux-image-*opencloudos9.cubesandbox.pvm.host*_amd64.deb`
+
+<small>`kernel-headers-*`、`-dbg` 等为可选包，无需下载。</small>
 
 #### RPM 系（OpenCloudOS、RHEL、CentOS、TencentOS、Fedora）
 
-在 [Release 附件列表](https://cnb.cool/CubeSandbox/CubeSandbox/-/releases/) 中找到 `kernel-*cube.pvm.host*.x86_64.rpm`，右键复制下载链接：
+安装下载好的内核包：
 
 ```bash
-# 将下面的 URL 替换为你从 Releases 页面右键复制的实际下载链接
-wget "<kernel rpm 下载链接>"
-
 # 若宿主机已有更高版本内核，--oldpackage 跳过版本号比较
 rpm -ivh --oldpackage kernel-*.rpm
 ```
@@ -95,13 +109,10 @@ curl -sL https://cnb.cool/CubeSandbox/CubeSandbox/-/git/raw/master/deploy/pvm/gr
 
 #### DEB 系（Ubuntu、Debian）
 
-在 [Release 附件列表](https://cnb.cool/CubeSandbox/CubeSandbox/-/releases/) 中找到 `linux-image-*cube.pvm.host*_amd64.deb`，右键复制下载链接：
+安装下载好的内核包：
 
 ```bash
-# 将下面的 URL 替换为你从 Releases 页面右键复制的实际下载链接
-wget "<linux-image deb 下载链接>"
-
-dpkg -i linux-image-*cube.pvm.host*.deb
+dpkg -i linux-image-*opencloudos9.cubesandbox.pvm.host*.deb
 ```
 
 设置 PVM 内核为默认启动项：
@@ -111,7 +122,7 @@ dpkg -i linux-image-*cube.pvm.host*.deb
 ls /boot/vmlinuz-*
 
 # 将 GRUB 默认启动项指向 PVM 内核（将下面的内核版本替换为上一步看到的实际版本字符串）
-KVER="$(ls /boot/vmlinuz-*cube.pvm.host* | sed 's|/boot/vmlinuz-||' | tail -1)"
+KVER="$(ls /boot/vmlinuz-*opencloudos9.cubesandbox.pvm.host* | sed 's|/boot/vmlinuz-||' | tail -1)"
 sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"Advanced options for Ubuntu>Ubuntu, with Linux ${KVER}\"|" \
   /etc/default/grub
 ```
@@ -133,7 +144,7 @@ reboot
 ```bash
 # 确认内核版本
 uname -r
-# 期望输出包含：cube.pvm.host
+# 期望输出包含：opencloudos9.cubesandbox.pvm.host
 
 # 加载 PVM KVM 模块
 modprobe kvm_pvm
@@ -180,7 +191,7 @@ curl -sL https://cnb.cool/CubeSandbox/CubeSandbox/-/git/raw/master/deploy/one-cl
 
 ::: details 安装了哪些组件
 - E2B 兼容 REST API 监听在 `3000` 端口
-- CubeMaster、Cubelet、network-agent、CubeShim 作为宿主机进程运行
+- CubeMaster、内置 network runtime 的 Cubelet、CubeShim 作为宿主机进程运行
 - MySQL 和 Redis 通过 Docker Compose 管理
 - CubeProxy 提供 TLS（mkcert）和 CoreDNS 域名路由（`cube.app`）
 :::
@@ -201,6 +212,10 @@ cubemastercli tpl create-from-image \
 
 > **镜像仓库说明：** 国内优先使用 `cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-code:latest`；境外访问推荐使用 `cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-code:latest`。
 
+::: warning Multi-Arch 镜像支持情况
+目前仅 `sandbox-code:latest` 已发布为 **Multi-Arch** 镜像（同时支持 x86_64 与 aarch64/ARM64）。其他托管在 `tencentcloudcr.com` 的 cube 官方镜像仍在陆续更新 Multi-Arch 支持中，可能暂时无法在你的架构上运行。如果需要尚未覆盖架构的镜像，可参阅[从 OCI 镜像制作模板](./tutorials/template-from-image.md)并结合 Docker 的 [Multi-platform builds](https://docs.docker.com/build/building/multi-platform/) 自行构建自定义 Multi-Arch 镜像。
+:::
+
 然后，执行下面的这行命令，监控构建进度：
 
 ```bash
@@ -220,8 +235,16 @@ cubemastercli tpl watch --job-id <job_id>
 
 安装 Python SDK：
 
-```bash
+::: code-group
+```bash [yum (RPM)]
 yum install -y python3 python3-pip
+```
+```bash [apt (DEB)]
+apt update && apt install -y python3 python3-pip
+```
+:::
+
+```bash
 pip config set global.index-url https://mirrors.ustc.edu.cn/pypi/simple
 
 pip install e2b-code-interpreter

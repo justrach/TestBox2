@@ -54,6 +54,8 @@ All env vars can be overridden by the corresponding flag.
 | `-w`, `--warmup` | `0` | Warmup rounds before measurement |
 | `-m`, `--mode` | `create-delete` | `create-delete` or `create-only` |
 | `-o`, `--output` | *(none)* | Export JSON report to file |
+| `--host-mount` | *(none)* | Host mount list as a JSON array |
+| `--network-policy`, `-np` | `none` | Network policy on create: `none` (no rules) or `rules` (create with egress rules) |
 | `--api-url` | *(env)* | CubeAPI base URL |
 | `--api-key` | *(env)* | API key |
 | `--theme` | `auto` | Color theme: `dark`, `light`, or `auto` |
@@ -77,6 +79,12 @@ export CUBE_TEMPLATE_ID=<your-template-id>
 # Create-only mode, export JSON report
 ./bin/cube-bench --dry-run -c 20 -n 200 -m create-only -o report.json
 
+# Benchmark host-mount create requests
+./bin/cube-bench -c 10 -n 50 --host-mount '[{"hostPath":"/tmp/data","mountPath":"/mnt/data","readOnly":false}]'
+
+# Create with egress rules (CubeVS maps + CubeEgress policy push)
+./bin/cube-bench -c 10 -n 50 -w 2 --network-policy rules
+
 # Non-interactive output (CI / pipe)
 ./bin/cube-bench --dry-run --no-tui -c 10 -n 50
 
@@ -84,12 +92,51 @@ export CUBE_TEMPLATE_ID=<your-template-id>
 ./bin/cube-bench --dry-run --theme light -c 10 -n 100
 ```
 
+### Network policies
+
+| Policy | Create payload | What it exercises |
+|---|---|---|
+| `none` (default) | `templateID` only (+ optional `host-mount`) | Create without network rules |
+| `rules` | `allow_internet_access=false` + ~24 `allowOut` (CIDR + domain) + 6 L7 `rules` (2 with inject) | Create with network rules: CubeVS allow/dns map updates and CubeEgress policy PUT |
+
+`rules` uses a fixed built-in policy (stable fake hosts and dummy inject secrets). The bench only waits for create HTTP success; it does **not** validate dataplane allow/deny or in-guest connectivity.
+
+Suggested A/B comparison (same `-c/-n/-t`, warm the pool once):
+
+```bash
+./bin/cube-bench -c 10 -n 50 -w 2 --network-policy none -o none.json
+./bin/cube-bench -c 10 -n 50 -w 2 --network-policy rules -o rules.json
+# Prefer Δ(rules − none) on create P50/P95 as the network-sensitive signal.
+```
+
+When comparing two Cube builds (for example pre/post network refactor), fix `--network-policy rules` and change only the server under test.
+
+For `host-mount`, this CLI form is equivalent to the Python SDK pattern:
+
+```python
+metadata = {
+    "host-mount": json.dumps([
+        {"hostPath": "/tmp/data", "mountPath": "/mnt/data", "readOnly": False},
+    ])
+}
+```
+
+`cube-bench` accepts the friendlier JSON array above, compacts it once, and
+sends it as `metadata["host-mount"]` in the create request. The backend
+contract still receives `metadata` as strings:
+
+- `CubeAPI/src/services/sandboxes.rs` accepts `metadata` as `map[string]string`
+- it lifts `metadata["host-mount"]` into the sandbox annotation `host-mount`
+- `CubeMaster/pkg/service/sandbox/hostdir_mount.go` parses that annotation as
+  a JSON string into mount descriptors
+
 ## Features
 
 - Goroutine pool with configurable concurrency
 - Live TUI dashboard: progress bar, real-time QPS, rolling operation log
 - Final report: percentile table (P50/P95/P99), latency histogram, sparkline,
   and letter grade (S/A/B/C/D)
+- Built-in `--network-policy rules` mode for create-with-rules latency
 - Dark/light/auto theme detection
 - JSON report export (`-o report.json`)
 - Dry-run mode for testing without a CubeSandbox server

@@ -2,6 +2,10 @@
 
 > **适用场景：** 云服务器上 `/dev/kvm` 不可用（云服务商屏蔽了嵌套虚拟化）。如果你的机器已经支持 KVM，直接参阅[快速开始](./quickstart.md)或[本地构建部署](./self-build-deploy.md)即可。
 
+::: warning 生产环境注意
+如果您计划在生产环境中使用 Cube Sandbox，请参阅[网络加固](./network-hardening.md)指南，在将服务暴露到不可信网络之前完成安全加固。
+:::
+
 得益于 PVM，您可以在**普通的云服务器**上部署 Cube Sandbox，所有沙箱实例均运行在 PVM 支持的 Micro-VM 中。
 
 与标准部署相比，PVM 部署只额外增加两个步骤：
@@ -56,20 +60,22 @@ Ubuntu / Debian / CentOS 等其他主流发行版同样支持，按对应章节�
 
 ## 第一步：安装 PVM 宿主机内核
 
-前往 [CubeSandbox Releases](https://cnb.cool/CubeSandbox/CubeSandbox/-/releases) 页面，打开最新包含 PVM 内核附件的 Release，**在对应附件上右键 → 复制链接地址**，然后用 `wget` 下载。
+### 下载内核包
 
-根据你的 Linux 发行版选择对应格式：
+PVM 宿主机内核包发布在专属的 `kernel-release-*` Release 上，请到发布页下载最新的内核主包：
+
+1. 打开 [CubeSandbox Releases 页面](https://cnb.cool/CubeSandbox/CubeSandbox/-/releases)，在过滤框输入 `kernel-release`，打开最新的一个
+2. 按你的 Linux 发行版下载**内核主包**：
+   - RPM 系（OpenCloudOS、RHEL、CentOS、TencentOS、Fedora）：`kernel-*opencloudos9.cubesandbox.pvm.host*.x86_64.rpm`
+   - DEB 系（Ubuntu、Debian）：`linux-image-*opencloudos9.cubesandbox.pvm.host*_amd64.deb`
+
+<small>资产列表中的 `kernel-headers-*`、`-dbg` 等为可选包，无需下载。</small>
 
 ### RPM 系（OpenCloudOS、RHEL、CentOS、TencentOS、Fedora）
 
-在 [Release 附件列表](https://cnb.cool/CubeSandbox/CubeSandbox/-/releases/) 中找到以下文件，右键复制下载链接：
-
-- `kernel-*cube.pvm.host*.x86_64.rpm`（内核主包）
+安装下载好的内核包：
 
 ```bash
-# 将下面的 URL 替换为你从 Releases 页面右键复制的实际下载链接
-wget "<kernel rpm 下载链接>"
-
 # 若宿主机已有更高版本内核，--oldpackage 跳过版本号比较
 rpm -ivh --oldpackage kernel-*.rpm
 ```
@@ -95,15 +101,10 @@ curl -sL https://cnb.cool/CubeSandbox/CubeSandbox/-/git/raw/master/deploy/pvm/gr
 
 ### DEB 系（Ubuntu、Debian）
 
-在 [Release 附件列表](https://cnb.cool/CubeSandbox/CubeSandbox/-/releases/) 中找到以下文件，右键复制下载链接：
-
-- `linux-image-*cube.pvm.host*_amd64.deb`（内核主包）
+安装下载好的内核包：
 
 ```bash
-# 将下面的 URL 替换为你从 Releases 页面右键复制的实际下载链接
-wget "<linux-image deb 下载链接>"
-
-dpkg -i linux-image-*cube.pvm.host*.deb
+dpkg -i linux-image-*opencloudos9.cubesandbox.pvm.host*.deb
 ```
 
 设置 PVM 内核为默认启动项：
@@ -113,7 +114,7 @@ dpkg -i linux-image-*cube.pvm.host*.deb
 ls /boot/vmlinuz-*
 
 # 将 GRUB 默认启动项指向 PVM 内核（将下面的内核版本替换为上一步看到的实际版本字符串）
-KVER="$(ls /boot/vmlinuz-*cube.pvm.host* | sed 's|/boot/vmlinuz-||' | tail -1)"
+KVER="$(ls /boot/vmlinuz-*opencloudos9.cubesandbox.pvm.host* | sed 's|/boot/vmlinuz-||' | tail -1)"
 sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"Advanced options for Ubuntu>Ubuntu, with Linux ${KVER}\"|" \
   /etc/default/grub
 ```
@@ -135,7 +136,7 @@ reboot
 ```bash
 # 确认内核版本
 uname -r
-# 期望输出包含：cube.pvm.host
+# 期望输出包含：opencloudos9.cubesandbox.pvm.host
 
 # 加载 PVM KVM 模块
 modprobe kvm_pvm
@@ -246,7 +247,7 @@ PVM 环境就绪后，后续流程与标准部署完全一致。请参阅快速�
 
 **Q2：`lsmod | grep kvm_pvm` 无输出，或 `/dev/kvm` 不存在**
 
-**A：** 执行 `uname -r` 确认已重启进入 PVM 内核，内核版本应包含 `cube.pvm.host`。确认后手动执行 `modprobe kvm_pvm`。若仍失败，检查内核包是否正确安装：
+**A：** 执行 `uname -r` 确认已重启进入 PVM 内核，内核版本应包含 `opencloudos9.cubesandbox.pvm.host`。确认后手动执行 `modprobe kvm_pvm`。若仍失败，检查内核包是否正确安装：
 
 ```bash
 # RPM 系

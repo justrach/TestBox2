@@ -15,15 +15,20 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { cn } from '@/lib/utils';
 
 // ── Types ────────────────────────────────────────────────────────────────────
-interface MetaEntry { key: string; value: string }
+interface MetaEntry {
+  key: string;
+  value: string;
+}
 
 interface FormState {
   templateID: string;
+  timeout: string;
   meta: MetaEntry[];
 }
 
 const DEFAULT_FORM: FormState = {
   templateID: '',
+  timeout: '',
   meta: [],
 };
 
@@ -41,6 +46,16 @@ function TemplatePicker({
     queryFn: templateApi.list,
     staleTime: 30_000,
   });
+  const { data: compat } = useQuery({
+    queryKey: ['templates', 'compat'],
+    queryFn: templateApi.compat,
+    staleTime: 15_000,
+  });
+  const unpinnedTemplates = new Set(
+    (compat?.templates ?? [])
+      .filter((row) => row.overall === 'UNKNOWN')
+      .map((row) => row.templateID),
+  );
 
   if (isLoading) {
     return (
@@ -57,6 +72,7 @@ function TemplatePicker({
       {(templates ?? []).map((tpl) => {
         const statusLower = tpl.status.toLowerCase();
         const isReady = statusLower === 'ready';
+        const isUnpinned = unpinnedTemplates.has(tpl.templateID);
         const isSelected = tpl.templateID === selected;
         return (
           <button
@@ -75,10 +91,18 @@ function TemplatePicker({
             <div className="flex items-center justify-between gap-2">
               <span className="truncate font-mono text-sm font-medium">{tpl.templateID}</span>
               <Badge
-                tone={statusLower === 'ready' ? 'ok' : statusLower === 'building' ? 'warn' : 'err'}
+                tone={
+                  isUnpinned
+                    ? 'err'
+                    : statusLower === 'ready'
+                      ? 'ok'
+                      : statusLower === 'building'
+                        ? 'warn'
+                        : 'err'
+                }
                 className="shrink-0 text-xs"
               >
-                {tpl.status}
+                {isUnpinned ? t('compat.unpinned') : tpl.status}
               </Badge>
             </div>
             <span className="truncate text-xs text-muted-foreground">
@@ -146,7 +170,15 @@ function MetaEditor({
 }
 
 // ── Section wrapper ──────────────────────────────────────────────────────────
-function Section({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {
+function Section({
+  title,
+  description,
+  children,
+}: {
+  title: string;
+  description?: string;
+  children: React.ReactNode;
+}) {
   return (
     <Card>
       <CardHeader>
@@ -164,6 +196,11 @@ export default function SandboxNewPage() {
   const { t } = useTranslation('sandboxNew');
   const [form, setForm] = useState<FormState>(DEFAULT_FORM);
   const [error, setError] = useState<string | null>(null);
+  const { data: compat } = useQuery({
+    queryKey: ['templates', 'compat'],
+    queryFn: templateApi.compat,
+    staleTime: 15_000,
+  });
 
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) =>
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -174,8 +211,10 @@ export default function SandboxNewPage() {
       form.meta.forEach(({ key, value }) => {
         if (key.trim()) metadata[key.trim()] = value;
       });
+      const parsedTimeout = Number.parseInt(form.timeout, 10);
       return sandboxApi.create({
         templateID: form.templateID,
+        timeout: Number.isFinite(parsedTimeout) && parsedTimeout >= 0 ? parsedTimeout : undefined,
         metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       });
     },
@@ -187,6 +226,8 @@ export default function SandboxNewPage() {
     },
   });
 
+  const selectedCompat = compat?.templates.find((row) => row.templateID === form.templateID);
+  const selectedTemplateUnpinned = selectedCompat?.overall === 'UNKNOWN';
   const canSubmit = !!form.templateID && !create.isPending;
 
   return (
@@ -210,9 +251,35 @@ export default function SandboxNewPage() {
         {!form.templateID && (
           <p className="text-xs text-muted-foreground">{t('form.templateRequired')}</p>
         )}
+        {selectedTemplateUnpinned && (
+          <p className="text-xs text-cube-err">
+            {t('compat.unpinnedHelp')}{' '}
+            <Link
+              to={`/templates/${form.templateID}`}
+              className="underline underline-offset-2 hover:text-cube-err/80"
+            >
+              {t('compat.openTemplate')}
+            </Link>
+          </p>
+        )}
       </Section>
 
-
+      {/* Timeout */}
+      <Section title={t('section.config')} description={t('section.configDesc')}>
+        <div className="space-y-1.5">
+          <label className="text-sm font-medium text-foreground">{t('form.timeout')}</label>
+          <Input
+            type="number"
+            min={0}
+            step={60}
+            placeholder={t('form.timeoutPlaceholder')}
+            value={form.timeout}
+            onChange={(e) => set('timeout', e.target.value)}
+            className="font-mono text-sm"
+          />
+          <p className="text-xs text-muted-foreground">{t('form.timeoutHint')}</p>
+        </div>
+      </Section>
 
       {/* Metadata */}
       <Section title={t('section.metadata')} description={t('section.metadataDesc')}>
@@ -221,7 +288,7 @@ export default function SandboxNewPage() {
 
       {/* Error */}
       {error && (
-        <div className="rounded-md border border-cube-rose/40 bg-cube-rose/10 px-4 py-3 text-sm text-cube-rose">
+        <div className="rounded-md border border-cube-err/40 bg-cube-err/10 px-4 py-3 text-sm text-cube-err">
           {error}
         </div>
       )}

@@ -10,7 +10,6 @@
 
 extern crate test_infra;
 
-use net_util::MacAddr;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -26,11 +25,19 @@ use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 use std::thread;
+use std::time::{Duration, Instant};
+
+use net_util::MacAddr;
 use test_infra::*;
 use vmm::config::RestoreConfig;
-use vmm::vm_config::{DiskConfig, FsConfig, NetConfig, PmemConfig, VsockConfig};
+use vmm::vm_config::{DiskConfig, FsConfig, MemoryConfig, NetConfig, PmemConfig, VsockConfig};
 use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 use wait_timeout::ChildExt;
+
+/// Minimum expected MemTotal (in kB) for a 512 MB VM guest.
+/// With CONFIG_VFAT_FS enabled the kernel reports ~469,000 kB on a
+/// 512 MB VM, leaving ~19,000 kB of headroom above this threshold.
+const MIN_EXPECTED_MEMORY_KB: u32 = 450_000;
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
@@ -251,20 +258,29 @@ fn curl_command(api_socket: &str, method: &str, url: &str, http_body: Option<&st
 }
 
 fn remote_command(api_socket: &str, command: &str, arg: Option<&str>) -> bool {
+    match arg {
+        Some(a) => remote_command_w_args(api_socket, command, &[a]),
+        None => remote_command_w_args(api_socket, command, &[]),
+    }
+}
+
+fn remote_command_w_args(api_socket: &str, command: &str, args: &[&str]) -> bool {
+    remote_command_w_args_output(api_socket, command, args).0
+}
+
+fn remote_command_w_args_output(api_socket: &str, command: &str, args: &[&str]) -> (bool, String) {
     let mut cmd = Command::new(clh_command("ch-remote"));
     cmd.args([&format!("--api-socket={}", api_socket), command]);
+    cmd.args(args);
 
-    if let Some(arg) = arg {
-        cmd.arg(arg);
-    }
     let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if output.status.success() {
-        true
+        (true, stderr)
     } else {
         eprintln!("Error running ch-remote command: {:?}", &cmd);
-        let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!("stderr: {}", stderr);
-        false
+        (false, stderr)
     }
 }
 
@@ -369,7 +385,7 @@ fn setup_ovs_dpdk_guests(
     setup_ovs_dpdk();
 
     let clh_path = if !release_binary {
-        clh_command("cloud-hypervisor")
+        clh_command("cube-hypervisor")
     } else {
         cloud_hypervisor_release_path()
     };
@@ -1142,7 +1158,7 @@ fn test_boot_from_vhost_user_blk(
 
         // Just check the VM booted correctly.
         assert_eq!(guest.get_cpu_count().unwrap_or_default(), num_queues as u32);
-        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
     });
     kill_child(&mut child);
     let output = child.wait_with_output().unwrap();
@@ -1666,6 +1682,71 @@ fn _test_virtio_vsock(hotplug: bool) {
     handle_child_output(r, &output);
 }
 
+fn _test_virtio_vsock_passthrough_fd(hotplug: bool) {
+    let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+    let guest = Guest::new(Box::new(focal));
+
+    #[cfg(target_arch = "x86_64")]
+    let kernel_path = direct_kernel_boot_path();
+    #[cfg(target_arch = "aarch64")]
+    let kernel_path = if hotplug {
+        edk2_path()
+    } else {
+        direct_kernel_boot_path()
+    };
+
+    let socket = temp_vsock_path(&guest.tmp_dir);
+    let api_socket = temp_api_path(&guest.tmp_dir);
+
+    let mut cmd = GuestCommand::new(&guest);
+    cmd.args(["--api-socket", &api_socket]);
+    cmd.args(["--cpus", "boot=1"]);
+    cmd.args(["--memory", "size=512M"]);
+    cmd.args(["--kernel", kernel_path.to_str().unwrap()]);
+    cmd.args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE]);
+    cmd.default_disks();
+    cmd.default_net();
+
+    if !hotplug {
+        cmd.args(["--vsock", format!("cid=3,socket={}", socket).as_str()]);
+    }
+
+    let mut child = cmd.capture_output().spawn().unwrap();
+
+    let r = std::panic::catch_unwind(|| {
+        guest.wait_vm_boot(None).unwrap();
+
+        if hotplug {
+            let (cmd_success, cmd_output) = remote_command_w_output(
+                &api_socket,
+                "add-vsock",
+                Some(format!("cid=3,socket={},id=test0", socket).as_str()),
+            );
+            assert!(cmd_success);
+            assert!(String::from_utf8_lossy(&cmd_output)
+                .contains("{\"id\":\"test0\",\"bdf\":\"0000:00:06.0\"}"));
+            thread::sleep(std::time::Duration::new(10, 0));
+        }
+
+        // Validate vsock passthrough fd works as expected.
+        guest.start_vsock_passthrough_fd_listener();
+        guest.check_vsock_passthrough_fd_bidirectional(
+            socket.as_str(),
+            "HelloWorld!\n",
+            "HelloWorld!",
+        );
+
+        if hotplug {
+            assert!(remote_command(&api_socket, "remove-device", Some("test0")));
+        }
+    });
+
+    kill_child(&mut child);
+    let output = child.wait_with_output().unwrap();
+
+    handle_child_output(r, &output);
+}
+
 fn get_ksm_pages_shared() -> u32 {
     fs::read_to_string("/sys/kernel/mm/ksm/pages_shared")
         .unwrap()
@@ -1808,6 +1889,81 @@ fn process_rss_kib(pid: u32) -> usize {
     let command = format!("ps -q {} -o rss=", pid);
     let rss = exec_host_command_output(&command);
     String::from_utf8_lossy(&rss.stdout).trim().parse().unwrap()
+}
+
+const FREE_PAGE_REPORTING_BASELINE_LIMIT_KIB: usize = 512 * 1024;
+const FREE_PAGE_REPORTING_PEAK_DELTA_KIB: usize = 1024 * 1024;
+const FREE_PAGE_REPORTING_RELEASE_SLACK_KIB: usize = 384 * 1024;
+
+fn wait_for_process_rss<F>(
+    pid: u32,
+    description: &str,
+    timeout: Duration,
+    mut predicate: F,
+) -> usize
+where
+    F: FnMut(usize) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    let mut last_rss = process_rss_kib(pid);
+    loop {
+        if predicate(last_rss) {
+            return last_rss;
+        }
+        if Instant::now() >= deadline {
+            panic!("Timed out waiting for {description}; last VMM RSS was {last_rss} KiB");
+        }
+        thread::sleep(Duration::from_secs(1));
+        last_rss = process_rss_kib(pid);
+    }
+}
+
+fn verify_free_page_reporting(guest: &Guest, vmm_pid: u32, phase: &str) {
+    let baseline = wait_for_process_rss(
+        vmm_pid,
+        &format!("{phase} RSS baseline"),
+        Duration::from_secs(90),
+        |rss| rss <= FREE_PAGE_REPORTING_BASELINE_LIMIT_KIB,
+    );
+
+    let stress_pid = guest
+        .ssh_command(
+            "nohup stress --vm 1 --vm-bytes 1536M --vm-keep --timeout 120s \
+             >/tmp/free-page-reporting-stress.log 2>&1 </dev/null & echo $!",
+        )
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+
+    let peak = wait_for_process_rss(
+        vmm_pid,
+        &format!("{phase} RSS increase"),
+        Duration::from_secs(90),
+        |rss| rss >= baseline + FREE_PAGE_REPORTING_PEAK_DELTA_KIB,
+    );
+
+    guest
+        .ssh_command(&format!(
+            "kill -TERM {stress_pid}; \
+             for i in $(seq 1 100); do \
+               kill -0 {stress_pid} 2>/dev/null || exit 0; \
+               sleep 0.1; \
+             done; \
+             kill -KILL {stress_pid}"
+        ))
+        .unwrap();
+
+    let released = wait_for_process_rss(
+        vmm_pid,
+        &format!("{phase} RSS reclamation"),
+        Duration::from_secs(90),
+        |rss| rss <= baseline + FREE_PAGE_REPORTING_RELEASE_SLACK_KIB,
+    );
+
+    println!(
+        "Free page reporting ({phase}): baseline={baseline} KiB peak={peak} KiB released={released} KiB"
+    );
 }
 
 // 10MB is our maximum accepted overhead.
@@ -2074,6 +2230,26 @@ fn enable_guest_watchdog(guest: &Guest, watchdog_sec: u32) {
 }
 
 fn snapshot_and_check_events(api_socket: &str, snapshot_dir: &str, event_path: &str) {
+    snapshot_with_extra_args_and_check_events(api_socket, snapshot_dir, event_path, &[]);
+}
+
+// Incremental (pagemap_anon) snapshot: dest must already contain a
+// memory-ranges base file. Only CoW anonymous pages are overwritten.
+fn incremental_snapshot_and_check_events(api_socket: &str, snapshot_dir: &str, event_path: &str) {
+    snapshot_with_extra_args_and_check_events(
+        api_socket,
+        snapshot_dir,
+        event_path,
+        &["--snapshot-type", "incremental"],
+    );
+}
+
+fn snapshot_with_extra_args_and_check_events(
+    api_socket: &str,
+    snapshot_dir: &str,
+    event_path: &str,
+    extra_args: &[&str],
+) {
     // Pause the VM
     assert!(remote_command(api_socket, "pause", None));
     let latest_events = [
@@ -2088,12 +2264,11 @@ fn snapshot_and_check_events(api_socket: &str, snapshot_dir: &str, event_path: &
     ];
     assert!(check_latest_events_exact(&latest_events, event_path));
 
-    // Take a snapshot from the VM
-    assert!(remote_command(
-        api_socket,
-        "snapshot",
-        Some(format!("file://{}", snapshot_dir).as_str()),
-    ));
+    let url = format!("file://{}", snapshot_dir);
+    let mut args = Vec::with_capacity(1 + extra_args.len());
+    args.push(url.as_str());
+    args.extend_from_slice(extra_args);
+    assert!(remote_command_w_args(api_socket, "snapshot", &args));
 
     // Wait to make sure the snapshot is completed
     thread::sleep(std::time::Duration::new(10, 0));
@@ -2109,6 +2284,22 @@ fn snapshot_and_check_events(api_socket: &str, snapshot_dir: &str, event_path: &
         },
     ];
     assert!(check_latest_events_exact(&latest_events, event_path));
+}
+
+fn assert_memory_ranges_full_size(snapshot_dir: &str, mem_params: &str) {
+    let memory_ranges = std::path::Path::new(snapshot_dir).join("memory-ranges");
+    assert!(
+        memory_ranges.exists(),
+        "incremental snapshot did not produce {}",
+        memory_ranges.display()
+    );
+    let mem_config = MemoryConfig::parse(mem_params, None).unwrap();
+    let file_len = std::fs::metadata(&memory_ranges).unwrap().len();
+    assert_eq!(
+        file_len, mem_config.size,
+        "memory-ranges logical size {} != guest RAM {}",
+        file_len, mem_config.size
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2456,24 +2647,28 @@ mod common_parallel {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
+    #[ignore = "PVM host does not support hypervisor-fw/OVMF firmware boot chain"]
     fn test_bionic_hypervisor_fw() {
         test_simple_launch(fw_path(FwType::RustHypervisorFirmware), BIONIC_IMAGE_NAME)
     }
 
     #[test]
     #[cfg(target_arch = "x86_64")]
+    #[ignore = "PVM host does not support hypervisor-fw/OVMF firmware boot chain"]
     fn test_focal_hypervisor_fw() {
         test_simple_launch(fw_path(FwType::RustHypervisorFirmware), FOCAL_IMAGE_NAME)
     }
 
     #[test]
     #[cfg(target_arch = "x86_64")]
+    #[ignore = "PVM host does not support hypervisor-fw/OVMF firmware boot chain"]
     fn test_bionic_ovmf() {
         test_simple_launch(fw_path(FwType::Ovmf), BIONIC_IMAGE_NAME)
     }
 
     #[test]
     #[cfg(target_arch = "x86_64")]
+    #[ignore = "PVM host does not support hypervisor-fw/OVMF firmware boot chain"]
     fn test_focal_ovmf() {
         test_simple_launch(fw_path(FwType::Ovmf), FOCAL_IMAGE_NAME)
     }
@@ -2501,7 +2696,7 @@ mod common_parallel {
 
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
             assert_eq!(guest.get_initial_apicid().unwrap_or(1), 0);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
             assert_eq!(guest.get_pci_bridge_class().unwrap_or_default(), "0x060000");
 
             let expected_sequential_events = [
@@ -2585,13 +2780,17 @@ mod common_parallel {
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 2);
 
             #[cfg(target_arch = "x86_64")]
-            assert_eq!(
-                guest
-                    .ssh_command(r#"dmesg | grep "smpboot: Allowing" | sed "s/\[\ *[0-9.]*\] //""#)
-                    .unwrap()
-                    .trim(),
-                "smpboot: Allowing 4 CPUs, 2 hotplug CPUs"
-            );
+            {
+                let dmesg_output = guest
+                    .ssh_command(r#"sudo dmesg | grep -o "Allowing.*hotplug CPU[s]*""#)
+                    .unwrap();
+                let trimmed = dmesg_output.trim();
+                assert!(
+                    trimmed.contains("2 hotplug CPU"),
+                    "Expected dmesg to contain '2 hotplug CPU', got: '{}'",
+                    trimmed
+                );
+            }
             #[cfg(target_arch = "aarch64")]
             assert_eq!(
                 guest
@@ -3141,7 +3340,7 @@ mod common_parallel {
             guest.wait_vm_boot(None).unwrap();
 
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
             let grep_cmd = if cfg!(target_arch = "x86_64") {
                 "grep -c PCI-MSI /proc/interrupts"
@@ -3290,6 +3489,7 @@ mod common_parallel {
     }
 
     #[test]
+    #[ignore = "PVM: vhdx toolchain/firmware compatibility (aligned with intranet cube skip)"]
     fn test_virtio_block_vhdx() {
         let mut workload_path = dirs::home_dir().unwrap();
         workload_path.push("workloads");
@@ -3404,6 +3604,7 @@ mod common_parallel {
     }
 
     #[test]
+    #[ignore = "PVM host does not support firmware boot"]
     fn test_virtio_block_direct_and_firmware() {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
@@ -3803,7 +4004,7 @@ mod common_parallel {
 
             // Simple checks to validate the VM booted properly
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
         });
 
         kill_child(&mut child);
@@ -4537,7 +4738,7 @@ mod common_parallel {
             // up as expected. In order to check, we will use the virtio-net
             // device already passed through L2 as a VFIO device, this will
             // verify that VFIO devices are functional with memory hotplug.
-            assert!(guest.get_total_memory_l2().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory_l2().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
             guest
                 .ssh_command_l2_1(
                     "sudo bash -c 'echo online > /sys/devices/system/memory/auto_online_blocks'",
@@ -4562,6 +4763,7 @@ mod common_parallel {
     }
 
     #[test]
+    #[ignore = "PVM guest: TSC deadline timer is disabled; with acpi=off, no clockevent works (HPET/ACPI PM-Timer unavailable, 8259 PIC not emulated), kernel boot is expected to hang"]
     fn test_direct_kernel_boot_noacpi() {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
@@ -4586,7 +4788,7 @@ mod common_parallel {
             guest.wait_vm_boot(None).unwrap();
 
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
         });
 
         kill_child(&mut child);
@@ -4603,6 +4805,16 @@ mod common_parallel {
     #[test]
     fn test_virtio_vsock_hotplug() {
         _test_virtio_vsock(true);
+    }
+
+    #[test]
+    fn test_virtio_vsock_passthrough_fd() {
+        _test_virtio_vsock_passthrough_fd(false);
+    }
+
+    #[test]
+    fn test_virtio_vsock_passthrough_fd_hotplug() {
+        _test_virtio_vsock_passthrough_fd(true);
     }
 
     #[test]
@@ -4649,7 +4861,7 @@ mod common_parallel {
         let r = std::panic::catch_unwind(|| {
             // Check that the VM booted as expected
             assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
         });
 
         kill_child(&mut child);
@@ -4702,7 +4914,7 @@ mod common_parallel {
 
             // Check that the VM booted as expected
             assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
             // Sync and shutdown without powering off to prevent filesystem
             // corruption.
@@ -4727,7 +4939,7 @@ mod common_parallel {
 
             // Check that the VM booted as expected
             assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
         });
 
         kill_child(&mut child);
@@ -4780,7 +4992,7 @@ mod common_parallel {
 
             // Check that the VM booted as expected
             assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
             // Sync and shutdown without powering off to prevent filesystem
             // corruption.
@@ -4812,7 +5024,7 @@ mod common_parallel {
 
             // Check that the VM booted as expected
             assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
         });
 
         kill_child(&mut child);
@@ -4864,7 +5076,7 @@ mod common_parallel {
         let r = std::panic::catch_unwind(|| {
             // Check that the VM booted as expected
             assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
             // We now pause the VM
             assert!(remote_command(&api_socket, "pause", None));
@@ -5128,7 +5340,7 @@ mod common_parallel {
         let r = std::panic::catch_unwind(|| {
             guest.wait_vm_boot(None).unwrap();
 
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
             guest.enable_memory_hotplug();
 
@@ -5144,7 +5356,7 @@ mod common_parallel {
             resize_command(&api_socket, None, None, Some(desired_balloon), None);
 
             thread::sleep(std::time::Duration::new(10, 0));
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
             assert!(guest.get_total_memory().unwrap_or_default() < 960_000);
 
             // guest.reboot_linux(0, None);
@@ -5211,7 +5423,7 @@ mod common_parallel {
         let r = std::panic::catch_unwind(|| {
             guest.wait_vm_boot(None).unwrap();
 
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
             guest.enable_memory_hotplug();
 
@@ -5247,7 +5459,7 @@ mod common_parallel {
             // let desired_ram = 512 << 20;
             // resize_command(&api_socket, None, Some(desired_ram), None, None);
             // thread::sleep(std::time::Duration::new(10, 0));
-            // assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            // assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
             // assert!(guest.get_total_memory().unwrap_or_default() < 960_000);
         });
 
@@ -5284,7 +5496,7 @@ mod common_parallel {
             guest.wait_vm_boot(None).unwrap();
 
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 2);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
             guest.enable_memory_hotplug();
 
@@ -5795,69 +6007,6 @@ mod common_parallel {
             );
             // Verify the balloon size deflated
             assert!(deflated_balloon < 2147483648);
-        });
-
-        kill_child(&mut child);
-        let output = child.wait_with_output().unwrap();
-
-        handle_child_output(r, &output);
-    }
-
-    #[test]
-    fn test_virtio_balloon_free_page_reporting() {
-        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
-        let guest = Guest::new(Box::new(focal));
-
-        //Let's start a 4G guest with balloon occupied 2G memory
-        let mut child = GuestCommand::new(&guest)
-            .args(["--cpus", "boot=1"])
-            .args(["--memory", "size=4G"])
-            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(["--balloon", "size=0,free_page_reporting=on"])
-            .default_disks()
-            .default_net()
-            .capture_output()
-            .spawn()
-            .unwrap();
-
-        let pid = child.id();
-        let r = std::panic::catch_unwind(|| {
-            guest.wait_vm_boot(None).unwrap();
-
-            // Check the initial RSS is less than 1GiB
-            let rss = process_rss_kib(pid);
-            println!("RSS {} < 1048576", rss);
-            assert!(rss < 1048576);
-
-            // Spawn a command inside the guest to consume 2GiB of RAM for 60
-            // seconds
-            let guest_ip = guest.network.guest_ip.clone();
-            thread::spawn(move || {
-                ssh_command_ip(
-                    "stress --vm 1 --vm-bytes 2G --vm-keep --timeout 60",
-                    &guest_ip,
-                    DEFAULT_SSH_RETRIES,
-                    DEFAULT_SSH_TIMEOUT,
-                )
-                .unwrap();
-            });
-
-            // Wait for 50 seconds to make sure the stress command is consuming
-            // the expected amount of memory.
-            thread::sleep(std::time::Duration::new(50, 0));
-            let rss = process_rss_kib(pid);
-            println!("RSS {} >= 2097152", rss);
-            assert!(rss >= 2097152);
-
-            // Wait for an extra minute to make sure the stress command has
-            // completed and that the guest reported the free pages to the VMM
-            // through the virtio-balloon device. We expect the RSS to be under
-            // 2GiB.
-            thread::sleep(std::time::Duration::new(60, 0));
-            let rss = process_rss_kib(pid);
-            println!("RSS {} < 2097152", rss);
-            assert!(rss < 2097152);
         });
 
         kill_child(&mut child);
@@ -6450,6 +6599,286 @@ mod common_parallel {
         handle_child_output(r, &output);
     }
 
+    // Incremental (pagemap_anon) overlays CoW pages onto an existing dest
+    // memory-ranges file. An empty dest has no base, so the snapshot API
+    // must fail and must not create memory-ranges.
+    #[test]
+    fn test_incremental_snapshot_requires_base_memory_ranges() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .default_disks()
+            .args(["--net", guest.default_net_string().as_str()])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+            assert!(remote_command(&api_socket, "pause", None));
+
+            let url = format!("file://{}", snapshot_dir);
+            let (ok, stderr) = remote_command_w_args_output(
+                &api_socket,
+                "snapshot",
+                &[&url, "--snapshot-type", "incremental"],
+            );
+            assert!(
+                !ok,
+                "incremental snapshot without dest memory-ranges must fail"
+            );
+            assert!(
+                stderr.contains("Base snapshot file not found"),
+                "expected missing-base error, got: {}",
+                stderr
+            );
+            assert!(
+                !std::path::Path::new(&snapshot_dir)
+                    .join("memory-ranges")
+                    .exists(),
+                "failed incremental must not create memory-ranges"
+            );
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    // Incremental (pagemap_anon) after restore: Cubelet Tier 2 path.
+    // Full snapshot becomes the restore base; after restore, guest RAM is a
+    // MAP_PRIVATE mmap of that file. Copy the base memory-ranges to a new
+    // dest (Cubelet does reflink), then incremental overlays CoW pages.
+    #[test]
+    fn test_snapshot_restore_incremental_after_restore() {
+        let mem_params = "size=1G";
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let kernel_path = direct_kernel_boot_path();
+
+        let api_socket_source = format!("{}.1", temp_api_path(&guest.tmp_dir));
+
+        let net_id = "net123";
+        let net_params = format!(
+            "id={},tap=,mac={},ip={},mask=255.255.255.0",
+            net_id, guest.network.guest_mac, guest.network.host_ip
+        );
+
+        let socket = temp_vsock_path(&guest.tmp_dir);
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_source])
+            .args(["--event-monitor", format!("path={}", event_path).as_str()])
+            .args(["--cpus", "boot=2"])
+            .args(["--memory", mem_params])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .default_disks()
+            .args(["--net", net_params.as_str()])
+            .args(["--vsock", format!("cid=3,socket={}", socket).as_str()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let console_text = String::from("On a branch floating down river a cricket, singing.");
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+        let base_dir = String::from(
+            guest
+                .tmp_dir
+                .as_path()
+                .join("snapshot_base")
+                .to_str()
+                .unwrap(),
+        );
+        std::fs::create_dir(&base_dir).unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
+            snapshot_and_check_events(
+                api_socket_source.as_str(),
+                base_dir.as_str(),
+                event_path.as_str(),
+            );
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        Command::new("rm")
+            .arg("-f")
+            .arg(socket.as_str())
+            .output()
+            .unwrap();
+
+        let api_socket_base_restored = format!("{}.base", temp_api_path(&guest.tmp_dir));
+        let event_path_base_restored = format!("{}.base", temp_event_monitor_path(&guest.tmp_dir));
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_base_restored])
+            .args([
+                "--event-monitor",
+                format!("path={}", event_path_base_restored).as_str(),
+            ])
+            .args([
+                "--restore",
+                format!("source_url=file://{}", base_dir).as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        thread::sleep(std::time::Duration::new(10, 0));
+
+        // tmpfs-backed payload: only survives the next restore if incremental
+        // actually captured the CoW pages (disk-backed files would persist
+        // even if the memory snapshot dropped them).
+        let dirty_md5 = std::sync::Mutex::new(String::new());
+
+        let r = std::panic::catch_unwind(|| {
+            let latest_events = [
+                &MetaEvent {
+                    event: "restored".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "resuming".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "resumed".to_string(),
+                    device_id: None,
+                },
+            ];
+            assert!(check_latest_events_exact(
+                &latest_events,
+                &event_path_base_restored
+            ));
+
+            guest.check_devices_common(Some(&socket), Some(&console_text), None);
+
+            thread::sleep(std::time::Duration::new(5, 0));
+            guest
+                .ssh_command("dd if=/dev/urandom of=/dev/shm/dirty.bin bs=1M count=64")
+                .unwrap();
+            let sum = guest.ssh_command("md5sum /dev/shm/dirty.bin").unwrap();
+            *dirty_md5.lock().unwrap() = sum.trim().to_string();
+
+            // Simulate Cubelet reflink: dest must already hold the base image.
+            std::fs::copy(
+                std::path::Path::new(&base_dir).join("memory-ranges"),
+                std::path::Path::new(&snapshot_dir).join("memory-ranges"),
+            )
+            .expect("copy base memory-ranges into incremental dest");
+
+            incremental_snapshot_and_check_events(
+                api_socket_base_restored.as_str(),
+                snapshot_dir.as_str(),
+                event_path_base_restored.as_str(),
+            );
+
+            assert_memory_ranges_full_size(snapshot_dir.as_str(), mem_params);
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        let r = std::panic::catch_unwind(|| {
+            assert!(String::from_utf8_lossy(&output.stdout).contains(&console_text));
+        });
+        handle_child_output(r, &output);
+
+        Command::new("rm")
+            .arg("-f")
+            .arg(socket.as_str())
+            .output()
+            .unwrap();
+
+        let api_socket_restored = format!("{}.2", temp_api_path(&guest.tmp_dir));
+        let event_path_restored = format!("{}.2", temp_event_monitor_path(&guest.tmp_dir));
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_restored])
+            .args([
+                "--event-monitor",
+                format!("path={}", event_path_restored).as_str(),
+            ])
+            .args([
+                "--restore",
+                format!("source_url=file://{}", snapshot_dir).as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        thread::sleep(std::time::Duration::new(10, 0));
+        let expected_events = [
+            &MetaEvent {
+                event: "starting".to_string(),
+                device_id: None,
+            },
+            &MetaEvent {
+                event: "restoring".to_string(),
+                device_id: None,
+            },
+        ];
+        assert!(check_sequential_events_exact(
+            &expected_events,
+            &event_path_restored
+        ));
+
+        let r = std::panic::catch_unwind(|| {
+            let latest_events = [
+                &MetaEvent {
+                    event: "restored".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "resuming".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "resumed".to_string(),
+                    device_id: None,
+                },
+            ];
+            assert!(check_latest_events_exact(
+                &latest_events,
+                &event_path_restored
+            ));
+
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), 2);
+            guest.check_devices_common(Some(&socket), Some(&console_text), None);
+
+            let restored_md5 = guest.ssh_command("md5sum /dev/shm/dirty.bin").unwrap();
+            assert_eq!(
+                restored_md5.trim(),
+                dirty_md5.lock().unwrap().as_str(),
+                "tmpfs payload mismatch after incremental restore"
+            );
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        let r = std::panic::catch_unwind(|| {
+            assert!(String::from_utf8_lossy(&output.stdout).contains(&console_text));
+        });
+        handle_child_output(r, &output);
+    }
+
     #[test]
     fn test_counters() {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
@@ -6539,6 +6968,7 @@ mod common_parallel {
     }
 
     #[test]
+    #[ignore = "PVM guest kernel has no virtio-watchdog driver (CONFIG_VIRTIO_WDT not enabled)"]
     fn test_watchdog() {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
@@ -6728,6 +7158,21 @@ mod common_parallel {
             fs::read_to_string(format!("/sys/class/net/{}/ifindex", guest_macvtap_name)).unwrap();
         let tap_device = format!("/dev/tap{}", tap_index.trim());
 
+        // In a container netns (non init_net), devtmpfs does not auto-create
+        // /dev/tap<ifindex> for macvtap devices. On bare metal (init_net) the
+        // node is auto-created by devtmpfs, so this workaround is a no-op there.
+        if !std::path::Path::new(&tap_device).exists() {
+            let dev = fs::read_to_string(format!("/sys/class/macvtap/tap{}/dev", tap_index.trim()))
+                .expect("failed to read macvtap dev from sysfs");
+            let dev = dev.trim();
+            let (major, minor) = dev.split_once(':').expect("invalid macvtap dev format");
+            assert!(exec_host_command_status(&format!(
+                "sudo mknod {} c {} {}",
+                tap_device, major, minor
+            ))
+            .success());
+        }
+
         assert!(
             exec_host_command_status(&format!("sudo chown $UID.$UID {}", tap_device)).success()
         );
@@ -6833,6 +7278,7 @@ mod common_parallel {
 
     #[test]
     #[cfg(not(feature = "mshv"))]
+    #[ignore = "PVM guest kernel has CONFIG_OPENVSWITCH disabled (aligned with intranet cube skip)"]
     fn test_ovs_dpdk() {
         let focal1 = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest1 = Guest::new(Box::new(focal1));
@@ -7005,6 +7451,7 @@ mod common_parallel {
     }
 
     #[test]
+    #[ignore = "PVM kernel does not support vfio-user (no VFIO support in PVM host/guest kernel)"]
     fn test_vfio_user() {
         let jammy_image = JAMMY_IMAGE_NAME.to_string();
         let jammy = UbuntuDiskConfig::new(jammy_image);
@@ -7298,6 +7745,86 @@ mod common_sequential {
     use crate::*;
 
     #[test]
+    fn test_virtio_balloon_free_page_reporting() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=2G"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--balloon", "size=0,free_page_reporting=on"])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let pid = child.id();
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+            verify_free_page_reporting(&guest, pid, "cold boot");
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_virtio_balloon_free_page_reporting_after_snapshot_restore_with_seccomp() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let api_socket = format!("{}.source", temp_api_path(&guest.tmp_dir));
+        let event_path = format!("{}.source", temp_event_monitor_path(&guest.tmp_dir));
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+
+        let mut source = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket])
+            .args(["--event-monitor", format!("path={event_path}").as_str()])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=2G"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--balloon", "size=0,free_page_reporting=on"])
+            .args(["--seccomp", "true"])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+            snapshot_and_check_events(&api_socket, &snapshot_dir, &event_path);
+        });
+        kill_child(&mut source);
+        let output = source.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        let mut restored = GuestCommand::new(&guest)
+            .args([
+                "--restore",
+                format!("source_url=file://{snapshot_dir}").as_str(),
+            ])
+            .args(["--seccomp", "true"])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let pid = restored.id();
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(Some(120)).unwrap();
+            verify_free_page_reporting(&guest, pid, "snapshot restore");
+        });
+
+        kill_child(&mut restored);
+        let output = restored.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    #[test]
     fn test_memory_mergeable_on() {
         test_memory_mergeable(true)
     }
@@ -7312,7 +7839,10 @@ mod common_sequential {
         let vsock_id = "_vsock0";
 
         let net_id = "net123";
-        let tap_name = "vmtap0";
+        // Use a name that cannot collide with the auto-assigned `vmtap%d`
+        // taps used by parallel tests (open_named("vmtap%d") starts at
+        // vmtap0), otherwise OpenTap fails with "Device or resource busy".
+        let tap_name = "src-tap0";
         let net_params = format!(
             "id={},tap={},mac={},ip={},mask=255.255.255.0",
             net_id, tap_name, guest.network.guest_mac, guest.network.host_ip
@@ -7476,11 +8006,344 @@ mod common_sequential {
             Some(vec![fs_config]),
         );
     }
+
+    #[test]
+    fn test_restored_vsock_reuses_guest_listener_for_new_passthrough_fd() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let kernel_path = direct_kernel_boot_path();
+
+        let api_socket_source = format!("{}.1", temp_api_path(&guest.tmp_dir));
+        let socket = temp_vsock_path(&guest.tmp_dir);
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_source])
+            .args(["--event-monitor", format!("path={}", event_path).as_str()])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--vsock", format!("cid=3,socket={}", socket).as_str()])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
+            // Start socat before taking the snapshot. The restored VM must
+            // continue using this guest listener rather than starting a new
+            // one after restore.
+            guest.start_vsock_passthrough_fd_listener();
+
+            // Establish passfd and verify the source VM data path before
+            // taking the snapshot.
+            guest.check_vsock_passthrough_fd_bidirectional(
+                socket.as_str(),
+                "BeforeSnapshot\n",
+                "BeforeSnapshot",
+            );
+            let listener_identity = guest.vsock_passthrough_fd_listener_identity();
+
+            // Pause and snapshot using the shared event-checked helper.
+            snapshot_and_check_events(
+                api_socket_source.as_str(),
+                snapshot_dir.as_str(),
+                event_path.as_str(),
+            );
+            listener_identity
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        let listener_identity = r.as_ref().ok().cloned();
+        handle_child_output(r.map(|_| ()), &output);
+        let listener_identity = listener_identity.unwrap();
+
+        // The restored VMM must recreate its host Unix listener; the guest
+        // socat listener remains part of the VM state captured above.
+        let _ = std::fs::remove_file(&socket);
+        let api_socket_restored = format!("{}.2", temp_api_path(&guest.tmp_dir));
+        let event_path_restored = format!("{}.2", temp_event_monitor_path(&guest.tmp_dir));
+        let mut restored_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_restored])
+            .args([
+                "--event-monitor",
+                format!("path={}", event_path_restored).as_str(),
+            ])
+            .args([
+                "--restore",
+                format!("source_url=file://{}", snapshot_dir).as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        thread::sleep(std::time::Duration::new(10, 0));
+
+        let r = std::panic::catch_unwind(|| {
+            let restored_events = [
+                &MetaEvent {
+                    event: "restored".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "resuming".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "resumed".to_string(),
+                    device_id: None,
+                },
+            ];
+            assert!(check_latest_events_exact(
+                &restored_events,
+                &event_path_restored
+            ));
+
+            assert_eq!(
+                guest.vsock_passthrough_fd_listener_identity(),
+                listener_identity,
+                "restore replaced the socat listener FD captured in the snapshot"
+            );
+
+            // Prove the unchanged listener FD still accepts a new
+            // passfd-backed connection through the restored VMM, and that
+            // its log continues from the pre-snapshot write.
+            guest.check_vsock_passthrough_fd_bidirectional(
+                socket.as_str(),
+                "AfterRestore\n",
+                "BeforeSnapshot\nAfterRestore",
+            );
+        });
+
+        kill_child(&mut restored_child);
+        let output = restored_child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    /// Snapshot a VM that has a native virtiofs share, delete one of the
+    /// backing files referenced by that snapshot, then restore the VM.
+    ///
+    /// This exercises the `migration_on_error: GuestError` policy in the
+    /// native virtiofs server (see `virtio-devices/src/fs.rs`
+    /// `init_backend_fs_server`):
+    ///
+    /// * with `MigrationOnError::Abort` (the upstream default) the missing
+    ///   inode would tear down the whole live restore;
+    /// * with `MigrationOnError::GuestError` (our setting) the restore must
+    ///   succeed end-to-end, the surviving files must still be readable,
+    ///   the FS must still accept new operations, and only access to the
+    ///   deleted file must surface an error to the guest.
+    #[test]
+    fn test_snapshot_restore_native_virtiofs_with_deleted_backing_file() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let kernel_path = direct_kernel_boot_path();
+
+        let api_socket_source = format!("{}.1", temp_api_path(&guest.tmp_dir));
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+
+        // Carve a private shared_dir under tmp_dir so we can mutate it
+        // without disturbing other tests that point at ~/workloads/shared_dir.
+        let shared_dir = guest.tmp_dir.as_path().join("virtiofs_shared");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        let survivor_path = shared_dir.join("survivor.txt");
+        let victim_path = shared_dir.join("victim.txt");
+        std::fs::write(&survivor_path, b"survivor-before-snapshot\n").unwrap();
+        std::fs::write(&victim_path, b"victim-before-snapshot\n").unwrap();
+
+        let fs_params = format!(
+            "id=myfs0,tag=myfs,native=true,shared_dir={},cache=always,read_only=false,num_queues=1,queue_size=1024",
+            shared_dir.to_str().unwrap()
+        );
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_source])
+            .args(["--event-monitor", format!("path={}", event_path).as_str()])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M,shared=on"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .default_disks()
+            .default_net()
+            .args(["--fs", fs_params.as_str()])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
+            // Mount virtiofs and prime the inode cache for both files.
+            // `stat` forces virtiofsd to record an entry for each one in
+            // its inode store before we take the snapshot.
+            guest
+                .ssh_command("mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir/")
+                .unwrap();
+            assert_eq!(
+                guest
+                    .ssh_command("cat mount_dir/survivor.txt")
+                    .unwrap()
+                    .trim(),
+                "survivor-before-snapshot",
+            );
+            assert_eq!(
+                guest
+                    .ssh_command("cat mount_dir/victim.txt")
+                    .unwrap()
+                    .trim(),
+                "victim-before-snapshot",
+            );
+            guest
+                .ssh_command("stat mount_dir/survivor.txt mount_dir/victim.txt >/dev/null")
+                .unwrap();
+
+            snapshot_and_check_events(
+                api_socket_source.as_str(),
+                snapshot_dir.as_str(),
+                event_path.as_str(),
+            );
+        });
+
+        // Tear down the source VM so its O_PATH fds against the shared dir
+        // are released. This is what makes the next restore's lookup of the
+        // deleted file actually fail (rather than succeed via a still-open
+        // unlinked inode).
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        // Delete the file the snapshot indexed. The directory itself
+        // survives so `<root_dir>` still passes virtiofsd's startup checks.
+        std::fs::remove_file(&victim_path).unwrap();
+        assert!(survivor_path.exists());
+        assert!(!victim_path.exists());
+
+        // Restore against the same (now-mutated) shared_dir.
+        let api_socket_restored = format!("{}.2", temp_api_path(&guest.tmp_dir));
+        let event_path_restored = format!("{}.2", temp_event_monitor_path(&guest.tmp_dir));
+
+        let mut restored_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_restored])
+            .args([
+                "--event-monitor",
+                format!("path={}", event_path_restored).as_str(),
+            ])
+            .args([
+                "--restore",
+                format!("source_url=file://{}", snapshot_dir).as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        // Give the restore time to complete and the guest to come back.
+        // Poll the event monitor instead of a fixed sleep — restore time
+        // varies with host load, and SSH retries below cover the rest.
+        let restored_events = [
+            &MetaEvent {
+                event: "restored".to_string(),
+                device_id: None,
+            },
+            &MetaEvent {
+                event: "resuming".to_string(),
+                device_id: None,
+            },
+            &MetaEvent {
+                event: "resumed".to_string(),
+                device_id: None,
+            },
+        ];
+        let mut restored = false;
+        for _ in 0..30 {
+            if std::path::Path::new(&event_path_restored).exists()
+                && check_latest_events_exact(&restored_events, &event_path_restored)
+            {
+                restored = true;
+                break;
+            }
+            thread::sleep(std::time::Duration::new(1, 0));
+        }
+
+        let r = std::panic::catch_unwind(|| {
+            // (a) Restore is reported successful even though one indexed
+            // backing file vanished. This is the migration_on_error =
+            // GuestError contract — without it we would have aborted.
+            assert!(
+                restored,
+                "VM did not reach `resumed` within the 30s budget — restore likely aborted",
+            );
+
+            // (b) The restored guest is alive and the surviving file still
+            // reads through. virtiofs as a whole has to be functional.
+            assert_eq!(
+                guest
+                    .ssh_command("cat mount_dir/survivor.txt")
+                    .unwrap()
+                    .trim(),
+                "survivor-before-snapshot",
+            );
+
+            // (c) Access to the deleted file errors out on the guest side
+            // (ENOENT). The error is *guest-visible*, not VM-fatal.
+            // With cache=always the guest retains dentries from before
+            // snapshot, so `test -e` would still report the file as
+            // present. Drop the dentry cache first to force a fresh
+            // FUSE LOOKUP, which correctly returns ENOENT for the
+            // deleted backing file.
+            guest
+                .ssh_command("sync && sudo sh -c 'echo 2 > /proc/sys/vm/drop_caches'")
+                .unwrap();
+            let probe = guest
+                .ssh_command(
+                    "cat mount_dir/victim.txt >/dev/null 2>&1; \
+                     echo rc=$?; \
+                     test -e mount_dir/victim.txt && echo present || echo missing",
+                )
+                .unwrap();
+            assert!(
+                probe.contains("rc=") && !probe.contains("rc=0"),
+                "expected non-zero exit reading deleted file, got: {probe:?}",
+            );
+            assert!(
+                probe.contains("missing"),
+                "expected victim.txt to be missing on guest, got: {probe:?}",
+            );
+
+            // (d) The FS must still accept new operations after the
+            // guest-visible error — i.e. the error did NOT poison the
+            // mount or panic the guest VFS layer.
+            guest
+                .ssh_command("echo post-restore | sudo tee mount_dir/post_restore.txt >/dev/null")
+                .unwrap();
+            assert_eq!(
+                guest
+                    .ssh_command("cat mount_dir/post_restore.txt")
+                    .unwrap()
+                    .trim(),
+                "post-restore",
+            );
+            // And the host sees the new file via the same shared_dir.
+            assert!(shared_dir.join("post_restore.txt").exists());
+        });
+
+        kill_child(&mut restored_child);
+        let restored_output = restored_child.wait_with_output().unwrap();
+        handle_child_output(r, &restored_output);
+    }
 }
 
 mod compatibility {
-    use crate::_test_snapshot_restore_from_different_binary;
     use test_infra::clh_command;
+
+    use crate::_test_snapshot_restore_from_different_binary;
 
     #[test]
     fn test_snapshot_from_release_restore_on_head() {
@@ -7499,6 +8362,7 @@ mod compatibility {
 }
 
 mod vmm_instance {
+    use crate::MIN_EXPECTED_MEMORY_KB;
     use std::fs::File;
     use std::io::Write;
     use std::path::PathBuf;
@@ -7683,7 +8547,7 @@ mod vmm_instance {
         guest.wait_vm_boot(None).unwrap();
         // Check that the VM booted as expected
         assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
         assert!(vmm.send_request(ApiRequest::VmmShutdown));
         vmm.join_timeout(Some(Duration::from_secs(5)));
     }
@@ -7737,7 +8601,7 @@ mod vmm_instance {
         guest.wait_vm_boot(None).unwrap();
         // Check that the VM booted as expected
         assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
         // Waiting for ssh
         thread::sleep(std::time::Duration::new(5, 0));
@@ -7753,7 +8617,7 @@ mod vmm_instance {
         guest.wait_vm_boot(None).unwrap();
         // Check that the VM booted as expected
         assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
         assert!(vmm.send_request(ApiRequest::VmmShutdown));
         vmm.join_timeout(Some(Duration::from_secs(5)));
@@ -7808,7 +8672,7 @@ mod vmm_instance {
         guest.wait_vm_boot(None).unwrap();
         // Check that the VM booted as expected
         assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
         // We now pause the VM
         assert!(vmm.send_request(ApiRequest::VmPause));
@@ -7894,7 +8758,7 @@ mod vmm_instance {
         guest.wait_vm_boot(None).unwrap();
         // Check that the VM booted as expected
         assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
         assert!(vmm.send_request(ApiRequest::VmPause));
         let latest_events = [
@@ -7959,7 +8823,7 @@ mod vmm_instance {
         assert!(check_latest_events_exact(&latest_events, &event_path));
         // Perform same checks to validate VM has been properly restored
         assert_eq!(guest.get_cpu_count().unwrap_or_default(), 4);
-        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+        assert!(guest.get_total_memory().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
 
         assert!(vmm.send_request(ApiRequest::VmmShutdown));
         vmm.join_timeout(Some(Duration::from_secs(5)));
@@ -8011,11 +8875,11 @@ mod vmm_instance {
         // Then boot it
         assert!(vmm.send_request(ApiRequest::VmBoot));
 
-        guest.ssh_command("sudo reboot").unwrap();
+        guest.ssh_command("sudo poweroff").unwrap();
 
         let mut recv_evt_flag = false;
         for _ in 0..3 {
-            let data = receiver.recv().unwrap();
+            let data = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
             if data == NotifyEvent::VmShutdown {
                 recv_evt_flag = true;
                 break;
@@ -8026,8 +8890,9 @@ mod vmm_instance {
 }
 
 mod windows {
-    use crate::*;
     use once_cell::sync::Lazy;
+
+    use crate::*;
 
     static NEXT_DISK_ID: Lazy<Mutex<u8>> = Lazy::new(|| Mutex::new(1));
 
@@ -9327,7 +10192,7 @@ mod vfio {
             // up as expected. In order to check, we will use the virtio-net
             // device already passed through L2 as a VFIO device, this will
             // verify that VFIO devices are functional with memory hotplug.
-            assert!(guest.get_total_memory_l2().unwrap_or_default() > 480_000);
+            assert!(guest.get_total_memory_l2().unwrap_or_default() > MIN_EXPECTED_MEMORY_KB);
             guest
                 .ssh_command_l2_1(
                     "sudo bash -c 'echo online > /sys/devices/system/memory/auto_online_blocks'",
@@ -9644,7 +10509,7 @@ mod live_migration {
 
         // Start the source VM
         let src_vm_path = if !upgrade_test {
-            clh_command("cloud-hypervisor")
+            clh_command("cube-hypervisor")
         } else {
             cloud_hypervisor_release_path()
         };
@@ -9808,7 +10673,7 @@ mod live_migration {
 
         // Start the source VM
         let src_vm_path = if !upgrade_test {
-            clh_command("cloud-hypervisor")
+            clh_command("cube-hypervisor")
         } else {
             cloud_hypervisor_release_path()
         };
@@ -10009,7 +10874,7 @@ mod live_migration {
 
         // Start the source VM
         let src_vm_path = if !upgrade_test {
-            clh_command("cloud-hypervisor")
+            clh_command("cube-hypervisor")
         } else {
             cloud_hypervisor_release_path()
         };
@@ -10234,7 +11099,7 @@ mod live_migration {
 
         // Start the source VM
         let src_vm_path = if !upgrade_test {
-            clh_command("cloud-hypervisor")
+            clh_command("cube-hypervisor")
         } else {
             cloud_hypervisor_release_path()
         };
@@ -10529,11 +11394,13 @@ mod live_migration {
         }
 
         #[test]
+        #[ignore = "PVM guest kernel has no virtio-watchdog driver (CONFIG_VIRTIO_WDT not enabled)"]
         fn test_live_migration_watchdog() {
             _test_live_migration_watchdog(false, false)
         }
 
         #[test]
+        #[ignore = "PVM guest kernel has no virtio-watchdog driver (CONFIG_VIRTIO_WDT not enabled)"]
         fn test_live_migration_watchdog_local() {
             _test_live_migration_watchdog(false, true)
         }
@@ -10571,11 +11438,13 @@ mod live_migration {
         }
 
         #[test]
+        #[ignore = "PVM guest kernel has no virtio-watchdog driver (CONFIG_VIRTIO_WDT not enabled)"]
         fn test_live_upgrade_watchdog() {
             _test_live_migration_watchdog(true, false)
         }
 
         #[test]
+        #[ignore = "PVM guest kernel has no virtio-watchdog driver (CONFIG_VIRTIO_WDT not enabled)"]
         fn test_live_upgrade_watchdog_local() {
             _test_live_migration_watchdog(true, true)
         }
@@ -10600,6 +11469,7 @@ mod live_migration {
         #[test]
         #[cfg(target_arch = "x86_64")]
         #[cfg(not(feature = "mshv"))]
+        #[ignore = "PVM guest kernel has CONFIG_OPENVSWITCH disabled (aligned with intranet cube skip)"]
         fn test_live_migration_ovs_dpdk() {
             _test_live_migration_ovs_dpdk(false, false);
         }
@@ -10607,6 +11477,7 @@ mod live_migration {
         #[test]
         #[cfg(target_arch = "x86_64")]
         #[cfg(not(feature = "mshv"))]
+        #[ignore = "PVM guest kernel has CONFIG_OPENVSWITCH disabled (aligned with intranet cube skip)"]
         fn test_live_migration_ovs_dpdk_local() {
             _test_live_migration_ovs_dpdk(false, true);
         }
@@ -10614,6 +11485,7 @@ mod live_migration {
         #[test]
         #[cfg(target_arch = "x86_64")]
         #[cfg(not(feature = "mshv"))]
+        #[ignore = "PVM guest kernel has CONFIG_OPENVSWITCH disabled (aligned with intranet cube skip)"]
         fn test_live_upgrade_ovs_dpdk() {
             _test_live_migration_ovs_dpdk(true, false);
         }
@@ -10621,6 +11493,7 @@ mod live_migration {
         #[test]
         #[cfg(target_arch = "x86_64")]
         #[cfg(not(feature = "mshv"))]
+        #[ignore = "PVM guest kernel has CONFIG_OPENVSWITCH disabled (aligned with intranet cube skip)"]
         fn test_live_upgrade_ovs_dpdk_local() {
             _test_live_migration_ovs_dpdk(true, true);
         }

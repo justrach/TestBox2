@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Tencent. All rights reserved.
 
-import { Search, Command as CmdIcon, Bell, Sparkles, FlaskConical, ExternalLink, Github, BookOpen } from 'lucide-react';
+import {
+  Search,
+  Command as CmdIcon,
+  Bell,
+  Sparkles,
+  FlaskConical,
+  ExternalLink,
+  Github,
+  BookOpen,
+} from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from './ui/button';
 import { LanguageSwitcher } from './LanguageSwitcher';
@@ -18,7 +27,7 @@ export function TopBar() {
     <header className="sticky top-0 z-10 -mx-6 mb-6 flex items-center justify-between gap-4 border-b border-border/60 bg-background/70 px-6 py-3 backdrop-blur-xl">
       <div className="flex items-center gap-3">
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Sparkles size={14} className="text-cube-violet" />
+          <Sparkles size={14} className="text-cube-accent" />
           <span className="font-medium text-foreground/90">CubeSandbox</span>
           <span className="text-muted-foreground/60">/</span>
           <span className="text-foreground/70">{t('breadcrumb')}</span>
@@ -71,7 +80,7 @@ export function TopBar() {
         <Button variant="ghost" size="icon" aria-label={t('notifications')}>
           <Bell size={16} />
         </Button>
-        <div className="ml-1 flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-cube-violet/60 to-primary/80 text-xs font-semibold text-primary-foreground">
+        <div className="ml-1 flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-cube-accent/60 to-primary/80 text-xs font-semibold text-primary-foreground">
           C
         </div>
       </div>

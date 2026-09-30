@@ -19,8 +19,8 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubelet"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/masterclient"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/networkagentclient"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/version"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/services/cubebox"
 )
 
 func init() {
@@ -71,16 +71,6 @@ func registerCubelet() {
 				client = masterclient.New("http://"+metaCfg.MetaServerEndpoint, tomlext.ToStdTime(cfg.NodeStatusUpdateFrequency))
 			}
 
-			var networkAgentClient networkagentclient.Client = networkagentclient.NewNoopClient()
-			commonCfg := config.GetConfig().Common
-			if commonCfg != nil && commonCfg.EnableNetworkAgent {
-				var naErr error
-				networkAgentClient, naErr = networkagentclient.NewClient(commonCfg.NetworkAgentEndpoint)
-				if naErr != nil {
-					log.G(ic.Context).WithError(naErr).Warn("failed to create network-agent client for cubelet")
-				}
-			}
-
 			var controllerMap = make(map[string]controller.CubeMetaController)
 			controllerObjMap, err := ic.GetByType(constants.ControllerPlugin)
 			if err != nil {
@@ -107,11 +97,11 @@ func registerCubelet() {
 				controllerMap,
 				cri,
 				runtemplateManager,
-				networkAgentClient,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create cubelet: %w", err)
 			}
+			cubebox.StartWarehouseSync(cl.StopChannel(), cfg.CubeOpsAddr, tomlext.ToStdTime(cfg.CubeOpsTimeout))
 
 			readyHook := ic.RegisterReadiness()
 			go func() {

@@ -10,11 +10,11 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 type Config struct {
@@ -45,6 +45,14 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) error 
 	if opts == nil {
 		return ret.Err(errorcode.ErrorCode_InvalidParamFormat, "opts nil")
 	}
+
+	// Resume-from-pause (and other same-ID recreate paths) pass an explicit
+	// sandbox ID via annotation so the new shim/task reuses the caller's ID.
+	if desired := desiredSandboxID(opts); desired != "" {
+		opts.SandboxID = desired
+		return nil
+	}
+
 	opts.SandboxID = utils.GenerateID()
 
 	if opts.IsCreateSnapshot() {
@@ -57,6 +65,17 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) error 
 		opts.SandboxID = templateID + "_" + "0"
 	}
 	return nil
+}
+
+func desiredSandboxID(opts *workflow.CreateContext) string {
+	if opts == nil || opts.ReqInfo == nil {
+		return ""
+	}
+	annos := opts.ReqInfo.GetAnnotations()
+	if len(annos) == 0 {
+		return ""
+	}
+	return annos[constants.MasterAnnotationDesiredSandboxID]
 }
 
 func (l *local) Destroy(ctx context.Context, opts *workflow.DestroyContext) error {

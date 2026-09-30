@@ -202,10 +202,23 @@ impl MsixConfig {
     }
 
     pub fn read_table(&self, offset: u64, data: &mut [u8]) {
-        assert!((data.len() == 4 || data.len() == 8));
+        if data.len() != 4 && data.len() != 8 {
+            error!(
+                "invalid MSI-X table read size: {} (allowed: 4 or 8)",
+                data.len()
+            );
+            data.fill(0xff);
+            return;
+        }
 
         let index: usize = (offset / MSIX_TABLE_ENTRIES_MODULO) as usize;
         let modulo_offset = offset % MSIX_TABLE_ENTRIES_MODULO;
+
+        if index >= self.table_entries.len() {
+            debug!("Invalid MSI-X table entry index {index}");
+            data.copy_from_slice(&[0xff; 8][..data.len()]);
+            return;
+        }
 
         match data.len() {
             4 => {
@@ -249,10 +262,21 @@ impl MsixConfig {
     }
 
     pub fn write_table(&mut self, offset: u64, data: &[u8]) {
-        assert!((data.len() == 4 || data.len() == 8));
+        if data.len() != 4 && data.len() != 8 {
+            error!(
+                "invalid MSI-X table write size: {} (allowed: 4 or 8)",
+                data.len()
+            );
+            return;
+        }
 
         let index: usize = (offset / MSIX_TABLE_ENTRIES_MODULO) as usize;
         let modulo_offset = offset % MSIX_TABLE_ENTRIES_MODULO;
+
+        if index >= self.table_entries.len() {
+            debug!("Invalid MSI-X table entry index {index}");
+            return;
+        }
 
         // Store the value of the entry before modification
         let old_entry = self.table_entries[index].clone();
@@ -339,10 +363,23 @@ impl MsixConfig {
     }
 
     pub fn read_pba(&mut self, offset: u64, data: &mut [u8]) {
-        assert!((data.len() == 4 || data.len() == 8));
+        if data.len() != 4 && data.len() != 8 {
+            error!(
+                "invalid MSI-X PBA read size: {} (allowed: 4 or 8)",
+                data.len()
+            );
+            data.fill(0xff);
+            return;
+        }
 
         let index: usize = (offset / MSIX_PBA_ENTRIES_MODULO) as usize;
         let modulo_offset = offset % MSIX_PBA_ENTRIES_MODULO;
+
+        if index >= self.pba_entries.len() {
+            debug!("Invalid MSI-X PBA entry index {index}");
+            data.copy_from_slice(&[0xff; 8][..data.len()]);
+            return;
+        }
 
         match data.len() {
             4 => {

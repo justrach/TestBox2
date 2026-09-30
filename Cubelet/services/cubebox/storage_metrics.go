@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/pathutil"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 func (s *service) ListSandboxSnapshots(ctx context.Context, req *cubebox.ListSandboxSnapshotsRequest) (*cubebox.ListSandboxSnapshotsResponse, error) {
@@ -43,7 +43,13 @@ func (s *service) ListSandboxSnapshots(ctx context.Context, req *cubebox.ListSan
 		rsp.Ret.RetMsg = "ListSandboxSnapshots requires storage_backend=cubecow"
 		return rsp, nil
 	}
-	statuses, err := storage.InspectCowObjects(ctx, refs)
+	backend, err := resolveRequestStorageBackend(req.GetBackend())
+	if err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	statuses, err := storage.InspectObjectsFor(ctx, backend, refs)
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to inspect cubecow objects: %v", err)
@@ -84,13 +90,19 @@ func (s *service) GetStorageMetrics(ctx context.Context, req *cubebox.GetStorage
 		rsp.Ret.RetMsg = "GetStorageMetrics requires storage_backend=cubecow"
 		return rsp, nil
 	}
+	backend, err := resolveRequestStorageBackend(req.GetBackend())
+	if err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
 	nodeID, err := utils.GetInstanceID()
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to resolve node id: %v", err)
 		return rsp, nil
 	}
-	metrics, err := storage.GetCowMetrics(ctx)
+	metrics, err := storage.ObjectMetricsFor(ctx, backend)
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to collect storage metrics: %v", err)

@@ -1,7 +1,7 @@
 oom_score = 0
 root = "/data/cubelet/root"
-#独立空间 存放元数据
-#mount -t tmpfs -o size=500m none /data/cubelet/state/
+# Dedicated space for metadata.
+#mount -t tmpfs -o size=1024m none /data/cubelet/state/
 state = "/data/cubelet/state"
 version = 3
 pid_file = "/run/cube-let.pid"
@@ -34,19 +34,25 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
   disable = true
 [debug]
   address = ":9966"
+[cubelog]
+  path = "/data/log/Cubelet"
+  file_num = 10      # retained files (current + numbered backups)
+  file_size = "500m" # per-file roll size: 500m, 1g, 2g (binary MiB/GiB); unitless integer is MiB
 [plugins]
   [plugins."io.cubelet.controller.config.v1.cubelet"]
     # Static-only cadence for node status and resource reporting.
     # Do not configure this in dynamicconf/conf.yaml.
-    node_status_update_frequency = "10s"
+    node_status_update_frequency = "1s"
+    cubeops_addr = ""
+    cubeops_timeout = "10m"
 
   [plugins."io.cubelet.internal.v1.volume"]
   [plugins."io.cubelet.internal.v1.shimlog"]
-    #独立空间
+    # Dedicated space.
     #mount -t tmpfs -o size=100m none /data/cubelet/shimlog
     root_path = "/data/cubelet/shimlog"
   [plugins."io.cubelet.internal.v1.cleanup"]
-    #独立空间
+    # Dedicated space.
     #mount -t tmpfs -o size=100m none /data/cubelet/cleanup
     root_path = "/data/cubelet/cleanup"
   [plugins."io.cubelet.internal.v1.cgroup"]
@@ -61,6 +67,14 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
     vm_snapshot_specs_config = "/usr/local/services/cubetoolbox/cube-snapshot/spec.json"
     snapshot_disk_dir = "/data/snapshot_pack/disks"
 
+  [plugins."io.cubelet.internal.v1.resource-metrics"]
+    enabled = true
+    collection_interval = "5s"
+    request_timeout = "2s"
+    max_concurrent_requests = 8
+    stale_after = "15s"
+    export_scopes = ["host_sandbox"]
+
   [plugins."io.cubelet.internal.v1.network"]
     object_dir = "/usr/local/services/cubetoolbox/cube-vs/network"
     eth_name = "eth0"
@@ -70,7 +84,12 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
     mvm_mac_addr = "20:90:6f:fc:fc:fc"
     mvm_gw_mac_addr = "20:90:6f:cf:cf:cf"
     mvm_gw_dest_ip = "169.254.68.5"
-    mvm_mtu = 1300
+    mvm_mtu = 1500
+    cube_egress_admin_url = "http://127.0.0.1:9091"
+    cube_egress_push_timeout = "2s"
+    cube_router_enable = false
+    cube_router_cidr = ""
+    cube_router_mac_addr = "22:90:6f:cf:cf:cf"
     # metric
     check_interval_in_sec = "5s"
     report_stat_interval_in_sec = "60s"
@@ -80,22 +99,27 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
     stream_name_prefix = "gw_route:update:"
     stream_key = "gw_key"
     stream_block_time = "30s"
-    # network-agent
-    enable_network_agent = true
-    network_agent_endpoint = "grpc+unix:///tmp/cube/network-agent-grpc.sock"
-    network_agent_tap_socket = "/tmp/cube/network-agent-tap.sock"
-    network_agent_init_timeout = "120s"
-    network_agent_retry_interval = "1s"
-    network_agent_tap_fd_timeout = "2s"
-
   [plugins."io.cubelet.internal.v1.storage"]
     # Default storage backend: cubecow (reflink-only copy-on-write).
     storage_backend = "cubecow"
 
     # Working directory for the cubelet storage plugin. cubecow reflink volumes land at
-    # <data_path>/cubecow-reflink, so the filesystem backing data_path must support
+    # <data_path>/xfs/objects, so the filesystem backing data_path must support
     # FICLONE (e.g. xfs with `-m reflink=1` or btrfs).
     data_path = "/data/cubelet/storage"
+
+    # Parent directory for volume plugin host_path mounts (Attach --volume-base-dir).
+    volume_plugin_base_dir = "/data/cube-shared/volume"
+
+    [[plugins."io.cubelet.internal.v1.storage".volume_plugins]]
+      name        = "s3"
+      type        = "binary"
+      binary_path = "/usr/local/services/cubetoolbox/Cubelet/plugin/cube-volume-s3"
+
+    [[plugins."io.cubelet.internal.v1.storage".volume_plugins]]
+      name        = "cos"
+      type        = "binary"
+      binary_path = "/usr/local/services/cubetoolbox/Cubelet/plugin/cube-volume-cos"
 
 
     [plugins."io.cubelet.internal.v1.storage".cow.log]
@@ -103,6 +127,12 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
     format = "compact"
     file = "/data/log/cubecow/cubecow.log"
     rotation = "daily"
+
+    [plugins."io.cubelet.internal.v1.storage".cow.s3]
+    # CubeS3lvol opt-in. Default false: cubelet does not probe s3lvol.
+    # One-click flips this from ONE_CLICK_ENABLE_S3LVOL.
+    enable = false
+    socket_path = "/var/run/s3lvol.sock"
 
     # Only needed when switching back to the legacy ext4 / raw / reflink-pool
     # backend: change storage_backend to the corresponding value (e.g. "ext4")
@@ -126,7 +156,6 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
       [plugins."io.cubelet.internal.v1.cubebox".runtimes.runc]
         runtime_type = "io.containerd.runc.v2"
     #cube_host_shared_dir = "/run/cube-containers/shared/sandboxes/"
-    cubetool_base_dir = "/usr/local/services/cubetoolbox"
   [plugins."io.cubelet.cubebox-service.v1.cubebox-service"]
     destroy_dead_line = "60s"
     dead_container_ttl = "1h"
@@ -160,14 +189,14 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
     startup_delay = "5s"
 
   [plugins."io.containerd.snapshotter.v1.overlayfs"]
-    #独立空间 存放metada
+    # Dedicated space for metadata.
     #mount -t tmpfs -o size=300m none /data/cubelet/state/
     root_path = "/data/cubelet/state"
-    #独立空间 存放镜像unpack数据和snashot数据
+    # Dedicated space for unpacked image and snapshot data.
     data_path = "/data/cubelet/root"
 
   [plugins."io.containerd.metadata.v1.bolt"]
-    #独立空间
+    # Dedicated space.
     #mount -t tmpfs -o size=300m none /data/cubelet/state/
     root_path = "/data/cubelet/state"
     content_sharing_policy = "shared"
@@ -176,8 +205,9 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
   [plugins."io.containerd.monitor.v1.cgroups"]
     no_prometheus = false
   [plugins."io.containerd.runtime.v2.task"]
-    platforms = ["linux/amd64"]
-    sched_core = false
+    # Declare both platforms so the same config runs on amd64 and arm64 hosts;
+    # containerd matches image manifests against the host's native platform.
+    platforms = ["linux/amd64", "linux/arm64"]
   [plugins."io.cubelet.chi.v1.vsocket-manager"]
     proxyPort = 1032
   [plugins."io.containerd.cri.v1.images"]
@@ -186,5 +216,3 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
     [plugins."io.containerd.cri.v1.images".registry.mirrors]
       [plugins."io.containerd.cri.v1.images".registry.mirrors."docker.io"]
         endpoint = ["https://mirror.ccs.tencentyun.com"]
-
-

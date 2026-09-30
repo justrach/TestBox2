@@ -1,83 +1,45 @@
 # Creating Templates from OCI Images
 
-This guide walks you through how to create, monitor, and delete a Cube-Sandbox
-template starting from any standard OCI container image, using the
-`cubemastercli` command-line tool.
+This guide explains how to create, monitor, and delete a template from a standard OCI container image.
 
-## Overview
-
-A **template** is a pre-built, immutable rootfs snapshot that the sandbox
-runtime uses to cold-boot (or hot-start) a new sandbox instance.  Creating a
-template from an OCI image is a three-phase pipeline that runs asynchronously
-on the cluster:
-
-```
-OCI Image  ──pull──►  ext4 rootfs  ──boot──►  Snapshot  ──register──►  Template READY
-```
-
-Once the template reaches `READY` status it can be referenced by its
-`template_id` to create sandboxes.
-
----
+Before you begin, consider reading [Templates Overview](../templates.md) to understand the related concepts, including OCI images, template snapshots, ports, probes, and `envd`.
 
 ## Prerequisites
 
-- `cubemastercli` installed and on `$PATH`
-- `CUBEMASTER_ADDR` environment variable set, **or** pass `--server <host>` to
-  every command
+- `cubemastercli` installed and able to connect to CubeMaster
 - The OCI image must be accessible from the CubeMaster nodes (public registry
   or authenticated private registry)
 
-### ⚠️ Your image must expose an HTTP server
+> Plain HTTP registries (without TLS) must use an `http://` prefix, for example `http://harbor.internal:5000/ns/app:tag`. Without the prefix, CubeMaster uses HTTPS by default, except for localhost and RFC1918 addresses.
 
-During template creation, Cube platform boots the container and **probes it
-over HTTP** to determine when it is ready.  This means:
+## Step 1 — Select an OCI Image
 
-1. Your container image **must** run an HTTP server on a known port.
-2. You **must** pass the following flags when creating the template:
-   - `--expose-port <port>` — declare the port your HTTP server listens on
-   - `--probe <port>` — tell Cube which port to probe
-   - `--probe-path <path>` — the HTTP path Cube will `GET` (e.g. `/` or `/health`)
-3. Your entrypoint should start the HTTP server **only after** the application
-   is fully ready to serve traffic — Cube marks the template ready as soon as
-   the probe returns HTTP 2xx, and sandboxes launched from that template will
-   immediately receive requests.
+`create-from-image` accepts an OCI image that has already been built and published. This guide uses the CubeSandbox base image, which includes `envd`:
 
-Failing to expose an HTTP server or passing wrong probe parameters will cause
-the template creation to time out.
+```text
+ghcr.io/tencentcloud/cubesandbox-base:latest
+```
 
----
+The image runs `envd` on port `49983` by default, so `GET /health` can be used directly as the template probe.
 
-## Step 1 — Create the Template
+For custom template images and guidance on integrating other existing images with CubeSandbox, see [Custom Template Images](./bring-your-own-image.md).
+
+## Step 2 — Create the Template from the Image
 
 Use the `tpl create-from-image` sub-command to kick off the build job:
 
 ```bash
 cubemastercli tpl create-from-image \
-  --image     cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-browser:latest \
+  --image     ghcr.io/tencentcloud/cubesandbox-base:latest \
   --writable-layer-size 1G \
-  --expose-port 9000 \
-  --probe 9000 \
-  --probe-path /
+  --expose-port 49983 \
+  --probe 49983 \
+  --probe-path /health
 ```
 
-> **Image registry:** Use `cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-browser:latest` (recommended for international access). If you are in mainland China, use `cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-browser:latest` instead.
+> Pass `--backend s3` to store the template (and every sandbox / snapshot derived from it) on the cluster-shared S3 CoW backend. That is required for [cross-node Pause / Resume / FromSnap](../cross-node-snapshot.md). Omit the flag to keep the historical `xfs` path.
 
-On success the CLI immediately prints a `job_id` and a generated
-`template_id` and exits — the build continues **asynchronously** on the
-cluster.
-
-```
-job_id:      0042cd3a-c1d6-45fd-8757-2595ba0027e8
-template_id: tpl-4ff5adc5eea44c14b1c8dbb3
-attempt_no:  1
-artifact_id:
-status:      PENDING
-phase:       PULLING
-progress:    0%
-```
-
-#### Example — multiple ports, custom probe path, env var
+Template creation can expose multiple ports, use a custom probe path, and pass environment variables:
 
 ```bash
 cubemastercli tpl create-from-image \
@@ -90,11 +52,7 @@ cubemastercli tpl create-from-image \
   --env        MY_ENV=production
 ```
 
-> **Image registry:** Use `cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-code:latest` (recommended for international access). If you are in mainland China, use `cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-code:latest` instead.
-
----
-
-## Step 2 — Monitor Progress
+## Step 3 — Monitor Progress
 
 There are two ways to follow the build job.
 
@@ -144,9 +102,8 @@ If you only want a one-shot status check without blocking:
 cubemastercli tpl status --job-id <job_id>
 ```
 
----
 
-## Step 3 — Use the Template
+## Step 4 — Use the Template
 
 Once `template_status: READY`, reference the `template_id` when creating
 sandboxes via the E2B SDK:
@@ -156,7 +113,6 @@ export CUBE_TEMPLATE_ID=tpl-748094d2f2374b0a8a37e6ec
 python CubeAPI/examples/create.py
 ```
 
----
 
 ## Querying Templates
 
@@ -193,19 +149,21 @@ cubemastercli tpl list --json | jq '.data[].template_id'
 ### Inspect a single template
 
 ```bash
-cubemastercli tpl info --template-id tpl-748094d2f2374b0a8a37e6ec
+cubemastercli tpl info tpl-748094d2f2374b0a8a37e6ec
 ```
+
+The template ID can be passed as a positional argument (docker/kubectl style) or with `--template-id`; both forms are equivalent.
 
 Add `--json` for machine-readable output:
 
 ```bash
-cubemastercli tpl info --template-id tpl-748094d2f2374b0a8a37e6ec --json
+cubemastercli tpl info tpl-748094d2f2374b0a8a37e6ec --json
 ```
 
 Add `--include-request` when you want to inspect the stored template request body:
 
 ```bash
-cubemastercli tpl info --template-id tpl-748094d2f2374b0a8a37e6ec --json --include-request
+cubemastercli tpl info tpl-748094d2f2374b0a8a37e6ec --json --include-request
 ```
 
 If you want to preview the effective sandbox payload after template resolution, use:
@@ -216,13 +174,29 @@ cubemastercli tpl render --template-id tpl-748094d2f2374b0a8a37e6ec --json
 
 For a user-oriented walkthrough of what each output means and how to preview the effective request, see [Template Inspection and Request Preview](../template-inspection-and-preview.md).
 
----
+## Step 5 — (Optional) Migrate Legacy Local Artifacts
 
-## Deleting a Template
+Most newly created `from-image` templates already build through the current TC data plane, so you usually do **not** need to run `tpl merge` for them. The typical migration case is older templates whose rootfs artifacts still live on CubeMaster local disk, and the cluster later enables `s3Backed=true` so those historical artifacts need to be moved into S3-backed storage.
+
+Keep the wording consistent in operations docs: **`tpl merge` solves historical artifact storage convergence, while `tpl redo` solves node-side redistribution / rebuild when needed.** If the same maintenance window needs both storage migration and node repopulation, run them in this order:
 
 ```bash
-cubemastercli tpl delete --template-id tpl-748094d2f2374b0a8a37e6ec
+cubemastercli tpl merge tpl-748094d2f2374b0a8a37e6ec
+cubemastercli tpl redo --template-id tpl-748094d2f2374b0a8a37e6ec
 ```
+
+> ⚠️ In default co-located / shared-PVC deployments, skipping `tpl merge` does not usually break downloads for existing `READY` templates immediately. The real issue is that those historical artifacts have not yet converged from local disk into S3-backed storage. If the local ext4 is already gone, rerunning `tpl merge` cannot recover it; for rebuildable `from-image` templates, `tpl redo` must fall back to rebuild.
+
+## Step 6 — Deleting a Template
+
+```bash
+cubemastercli tpl delete tpl-748094d2f2374b0a8a37e6ec
+
+# Delete multiple templates in one command
+cubemastercli tpl delete tpl-first tpl-second tpl-third
+```
+
+When multiple template IDs are provided, the CLI attempts every deletion even if one fails, then returns a combined error for the failed templates.
 
 On success:
 
@@ -234,13 +208,13 @@ template deleted: tpl-748094d2f2374b0a8a37e6ec
 > replicas.  Any sandboxes already running from this template are **not**
 > affected, but new sandboxes can no longer be created from it.
 
----
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | `phase: PULLING` stuck for a long time | Image pull slow or registry unreachable from cluster nodes | Check network/firewall; for private registries add `--registry-username` / `--registry-password` |
+| Plain HTTP registry pull fails (`server gave HTTP response to HTTPS client`) | Image ref is missing the `http://` prefix | Use `http://harbor.internal:5000/ns/app:tag` |
 | `status: FAILED` after BUILDING | Build error (disk full, Dockerfile issue, etc.) | Re-run `tpl status --job-id <id> --json` and inspect `last_error` |
 | `distribution: 0/N ready` after READY | Artifact distribution still in progress (normal briefly) | Wait and re-run `tpl info`; if stuck check Cubelet logs on target nodes |
-| Sandbox fails readiness probe | Service not listening on the expected port/path at startup | Verify your container starts the HTTP server before signalling ready; adjust `--probe-path` if needed |
+| Sandbox readiness probe keeps failing after startup | The service is not listening on the expected port/path, or the HTTP server started before the service was fully ready | Ensure the HTTP server starts only after the application is fully ready, and verify that `--probe-path` is correct |

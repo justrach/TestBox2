@@ -24,20 +24,51 @@ type ResourceSnapshot struct {
 	MemoryMB int64 `json:"memory_mb,omitempty"`
 }
 
+// ComponentVersion describes the version of a single component installed on
+// this node. Reported to CubeMaster on register and heartbeat. Source is one
+// of "manifest" | "binary" | "file" | "component-json".
+type ComponentVersion struct {
+	Component string `json:"component"`
+	Version   string `json:"version,omitempty"`
+	Commit    string `json:"commit,omitempty"`
+	BuildTime string `json:"build_time,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Variant   string `json:"variant,omitempty"` // kernel: bm|pvm
+}
+
+// HostFacts describes the static host-level identity (CPU feature set, running
+// host kernel, KVM ABI version) used by the control plane to judge whether a
+// snapshot created on one node can be restored on another. Distinct from the
+// guest-environment component Versions.
+type HostFacts struct {
+	CPUVendor             string `json:"cpu_vendor,omitempty"`
+	CPUModel              string `json:"cpu_model,omitempty"`
+	CPUIDHash             string `json:"cpuid_hash,omitempty"`
+	HostKernelRelease     string `json:"host_kernel_release,omitempty"`
+	HostKernelFingerprint string `json:"host_kernel_fingerprint,omitempty"`
+	KVMAPIVersion         int    `json:"kvm_api_version,omitempty"`
+	KVMModuleFingerprint  string `json:"kvm_module_fingerprint,omitempty"`
+	KVMModuleTaint        string `json:"kvm_module_taint,omitempty"`
+	KVMModuleScanned      bool   `json:"kvm_module_scanned,omitempty"`
+}
+
 type RegisterNodeRequest struct {
-	RequestID           string            `json:"requestID,omitempty"`
-	NodeID              string            `json:"node_id,omitempty"`
-	HostIP              string            `json:"host_ip,omitempty"`
-	GRPCPort            int               `json:"grpc_port,omitempty"`
-	Labels              map[string]string `json:"labels,omitempty"`
-	Capacity            ResourceSnapshot  `json:"capacity,omitempty"`
-	Allocatable         ResourceSnapshot  `json:"allocatable,omitempty"`
-	InstanceType        string            `json:"instance_type,omitempty"`
-	ClusterLabel        string            `json:"cluster_label,omitempty"`
-	QuotaCPU            int64             `json:"quota_cpu,omitempty"`
-	QuotaMemMB          int64             `json:"quota_mem_mb,omitempty"`
-	CreateConcurrentNum int64             `json:"create_concurrent_num,omitempty"`
-	MaxMvmNum           int64             `json:"max_mvm_num,omitempty"`
+	RequestID           string             `json:"requestID,omitempty"`
+	NodeID              string             `json:"node_id,omitempty"`
+	HostIP              string             `json:"host_ip,omitempty"`
+	GRPCPort            int                `json:"grpc_port,omitempty"`
+	Labels              map[string]string  `json:"labels,omitempty"`
+	Capacity            ResourceSnapshot   `json:"capacity,omitempty"`
+	Allocatable         ResourceSnapshot   `json:"allocatable,omitempty"`
+	InstanceType        string             `json:"instance_type,omitempty"`
+	ClusterLabel        string             `json:"cluster_label,omitempty"`
+	QuotaCPU            int64              `json:"quota_cpu,omitempty"`
+	QuotaMemMB          int64              `json:"quota_mem_mb,omitempty"`
+	CreateConcurrentNum int64              `json:"create_concurrent_num,omitempty"`
+	MaxMvmNum           int64              `json:"max_mvm_num,omitempty"`
+	Versions            []ComponentVersion `json:"versions,omitempty"`
+	InventoryIncomplete bool               `json:"inventory_incomplete,omitempty"`
+	HostFacts           *HostFacts         `json:"host_facts,omitempty"`
 }
 
 type UpdateNodeStatusRequest struct {
@@ -50,6 +81,10 @@ type UpdateNodeStatusRequest struct {
 	Allocated  *AllocatedResources `json:"allocated,omitempty"`
 	DiskUsage  *DiskUsage          `json:"disk_usage,omitempty"`
 	MetricTime time.Time           `json:"metric_time,omitempty"`
+
+	Versions            []ComponentVersion `json:"versions,omitempty"`
+	InventoryIncomplete bool               `json:"inventory_incomplete,omitempty"`
+	HostFacts           *HostFacts         `json:"host_facts,omitempty"`
 }
 
 // AllocatedResources represents sandbox-quota resources already committed by
@@ -117,15 +152,15 @@ func parseEndpoints(raw string) []string {
 }
 
 func (c *Client) Readyz(ctx context.Context) error {
-	return c.get(ctx, "/internal/meta/readyz")
+	return c.get(ctx, "/internal/v1/node-agent/readyz")
 }
 
 func (c *Client) RegisterNode(ctx context.Context, req *RegisterNodeRequest) error {
-	return c.post(ctx, "/internal/meta/nodes/register", req)
+	return c.post(ctx, "/internal/v1/node-agent/nodes/register", req)
 }
 
 func (c *Client) UpdateNodeStatus(ctx context.Context, nodeID string, req *UpdateNodeStatusRequest) error {
-	return c.post(ctx, "/internal/meta/nodes/"+nodeID+"/status", req)
+	return c.post(ctx, "/internal/v1/node-agent/nodes/"+nodeID+"/status", req)
 }
 
 func (c *Client) get(ctx context.Context, path string) error {

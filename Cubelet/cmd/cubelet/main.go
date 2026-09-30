@@ -43,8 +43,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/version"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/services/server"
 	srvconfig "github.com/tencentcloud/CubeSandbox/Cubelet/services/server/config"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
-	cubelog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	"github.com/urfave/cli/v2"
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/net/context"
@@ -58,13 +57,7 @@ const (
 	CubeMntNsDirPath      = "/usr/local/services/cubetoolbox/cubeletmnt"
 	CubeMntNsFilePath     = "/usr/local/services/cubetoolbox/cubeletmnt/mnt"
 	CubeMainProcMutexLock = "/run/cubelock.db"
-	networkPluginKey      = "io.cubelet.internal.v1.network"
 )
-
-type networkPluginBootstrapConfig struct {
-	EnableNetworkAgent   bool   `toml:"enable_network_agent"`
-	NetworkAgentEndpoint string `toml:"network_agent_endpoint"`
-}
 
 func main() {
 	if len(os.Args) > 1 {
@@ -231,7 +224,7 @@ func init() {
 	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, io.Discard))
 
 	cli.VersionPrinter = func(c *cli.Context) {
-		fmt.Println(c.App.Name, c.App.Version)
+		fmt.Println(version.VersionString("cubelet"))
 	}
 }
 
@@ -269,22 +262,22 @@ func App() *cli.App {
 		},
 		&cli.StringFlag{
 			Name:  "logpath",
-			Value: "/data/log/Cubelet",
+			Value: srvconfig.DefaultCubeLogPath,
 			Usage: "cubelog log directory",
 		},
 		&cli.IntFlag{
 			Name:  "log-roll-num",
-			Value: 10,
+			Value: srvconfig.DefaultCubeLogFileNum,
 			Usage: "cubelog files roll number",
 		},
-		&cli.IntFlag{
+		&cli.StringFlag{
 			Name:  "log-roll-size",
-			Value: 500,
-			Usage: "cubelog files roll size(MB)",
+			Value: string(srvconfig.DefaultCubeLogFileSize),
+			Usage: "cubelog files roll size (500m, 1g; unitless integer is MiB)",
 		},
 		&cli.IntFlag{
 			Name:  "state-tmpfs-size",
-			Value: 500,
+			Value: 1024,
 			Usage: "state-tmpfs-size(MB)",
 		},
 		&cli.IntFlag{
@@ -331,20 +324,17 @@ func App() *cli.App {
 		if err := applyFlags(context, config); err != nil {
 			return err
 		}
-		ensureRequiredPlugins(config)
-
-		if networkCfg, ok, err := loadNetworkPluginBootstrapConfig(config); err != nil {
+		if err := config.CubeLog.ApplyDefaults(); err != nil {
 			return err
-		} else if ok {
-			dynamConf.SetNetworkAgentOverride(networkCfg.EnableNetworkAgent, networkCfg.NetworkAgentEndpoint)
 		}
+		ensureRequiredPlugins(config)
 
 		_, err = dynamConf.Init(config.DynamicConfigPath, context.Bool("no-dynamic-path"))
 		if err != nil {
 			return err
 		}
 
-		initCubeLog(context, "Cubelet", context.String("logpath"))
+		initCubeLog("Cubelet", config.CubeLog)
 
 		if err := server.CreateTopLevelDirectories(config); err != nil {
 			return err
@@ -516,7 +506,7 @@ func App() *cli.App {
 		if logLevel == "" {
 			logLevel = context.String("log-level")
 		}
-		cubelog.SetLevel(cubelog.StringToLevel(strings.ToUpper(logLevel)))
+		CubeLog.SetLevel(CubeLog.StringToLevel(strings.ToUpper(logLevel)))
 		containerdlog.SetLevel(strings.ToLower(logLevel))
 		<-done
 		return nil
@@ -548,21 +538,6 @@ func criticalCubeletPluginURIs() []string {
 		string(constants.WorkflowPlugin) + "." + constants.WorkflowID.ID(),
 		string(constants.CubeboxServicePlugin) + "." + constants.CubeboxServiceID.ID(),
 	}
-}
-
-func loadNetworkPluginBootstrapConfig(cfg *srvconfig.Config) (*networkPluginBootstrapConfig, bool, error) {
-	if cfg == nil || cfg.Plugins == nil {
-		return nil, false, nil
-	}
-	_, ok := cfg.Plugins[networkPluginKey]
-	if !ok {
-		return nil, false, nil
-	}
-	var networkCfg networkPluginBootstrapConfig
-	if _, err := cfg.Decode(gocontext.Background(), networkPluginKey, &networkCfg); err != nil {
-		return nil, false, fmt.Errorf("decode %s plugin config: %w", networkPluginKey, err)
-	}
-	return &networkCfg, true, nil
 }
 
 func serve(ctx gocontext.Context, l net.Listener, serveFunc func(net.Listener) error) {
@@ -606,6 +581,16 @@ func applyFlags(context *cli.Context, config *srvconfig.Config) error {
 		if s := context.String(v.name); s != "" {
 			*v.d = s
 		}
+	}
+
+	if context.IsSet("logpath") {
+		config.CubeLog.Path = context.String("logpath")
+	}
+	if context.IsSet("log-roll-num") {
+		config.CubeLog.FileNum = context.Int("log-roll-num")
+	}
+	if context.IsSet("log-roll-size") {
+		config.CubeLog.FileSize = srvconfig.CubeLogFileSize(context.String("log-roll-size"))
 	}
 	return nil
 }
@@ -665,27 +650,6 @@ func ensureRootSharedMount(rootDir string) error {
 	return nil
 }
 
-func mountTmpfsDir(stateDir string, context *cli.Context) error {
-	exist, _ := mountinfo.Mounted(stateDir)
-	if exist {
-		return nil
-	}
-	size := context.Int("state-tmpfs-size")
-	_ = mount.UnmountAll(stateDir, 0)
-	m := &mount.Mount{
-		Type:    "tmpfs",
-		Source:  "none",
-		Options: []string{fmt.Sprintf("size=%dm", size)},
-	}
-	if err := m.Mount(stateDir); err != nil {
-		return err
-	}
-	exist, _ = mountinfo.Mounted(stateDir)
-	if !exist {
-		return fmt.Errorf("mount tmpfs:%v fail", stateDir)
-	}
-	return nil
-}
 func setPidFile(pidFile string) error {
 	if pidFile == "" {
 		return nil

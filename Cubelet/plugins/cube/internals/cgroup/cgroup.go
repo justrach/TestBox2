@@ -15,13 +15,13 @@ import (
 	"github.com/shopspring/decimal"
 	"k8s.io/apimachinery/pkg/api/resource"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/cgroup/handle"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 const pageTableCoeff = 64
@@ -224,6 +224,9 @@ func SetCubeboxCgroupLimit(ctx context.Context, group string, cpuQ resource.Quan
 }
 
 func AddProc(path string, pid uint64) error {
+	if l.poolV1Handle == nil {
+		return fmt.Errorf("cgroup plugin not initialized")
+	}
 	var err error
 
 	delay := 10 * time.Millisecond

@@ -1,5 +1,7 @@
 local utils = require "utils"
 local sb = require "sandbox_backend"
+local state = require "sandbox_state"
+local request_host = require "request_host"
 
 -- Parse Host: <container_port>-<sandbox_id>.<domain> e.g. 49983-7c8fbcd45ffe450fb8f7fb223ad45507.cube.app
 -- Returns container_port, ins_id (sandbox / instance id), or nil, nil on failure.
@@ -23,12 +25,18 @@ if not container_port or not ins_id then
     ngx.log(ngx.ERR, "LEVEL_WARN||",
         string.format("request %s invalid Host for port/instance parse: %s",
             ngx.var.http_x_cube_request_id, ngx.var.http_host))
-    ngx.var.cube_retcode = "310400"
-    ngx.exit(400)
+    utils:respond_bad_request()
 end
 
-local host_ip, host_port = sb.resolve_backend(ins_id, container_port)
+-- log_phase reads ngx.var.ins_id to record activity. The host-based location
+-- doesn't otherwise set it (only the path-based one does, for proxy_redirect
+-- purposes), so populate it here to make activity tracking work uniformly.
+ngx.var.ins_id = ins_id
+
+-- Auto-pause gate. See sandbox_state.lua for failure-mode semantics.
+state.gate(ins_id)
+
+local host_ip, host_port, mask_request_host = sb.resolve_backend(ins_id, container_port)
 ngx.var.backend_ip = host_ip
 ngx.var.backend_port = host_port
-
-sb.assert_backend_healthy(host_ip, ins_id)
+request_host.apply(mask_request_host, container_port)

@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
@@ -18,7 +17,8 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 var (
@@ -29,8 +29,7 @@ var (
 	createSandboxRegisterRuntimeRefWithReplicaFn    = templatecenter.RegisterSnapshotRuntimeRefForCreatedSandboxWithReplica
 )
 
-func createSandbox(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	_ = w
+func createSandbox(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 	rt.RetCode = -1
 	rsp := &types.Res{
 		Ret: &types.Ret{
@@ -68,11 +67,27 @@ func createSandbox(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestTr
 		return rsp
 	}
 
-	ctx = runInsReq2Affinity(ctx, req)
+	ctx, err = runInsReq2Affinity(ctx, req)
+	if err != nil {
+		rsp.Ret.RetCode = int(errorcode.ErrorCode_MasterParamsError)
+		rsp.Ret.RetMsg = err.Error()
+		rt.RetCode = int64(errorcode.ErrorCode_MasterParamsError)
+		log.G(ctx).Error(err)
+		return rsp
+	}
 	ret := createSandboxRunFn(ctx, req)
 	if ret != nil && ret.Ret != nil && ret.Ret.RetCode == int(errorcode.ErrorCode_Success) {
 		if err := registerCreatedSandboxRuntimeRef(ctx, req, ret); err != nil {
 			log.G(ctx).Warnf("register snapshot runtime ref after create failed: %v", err)
+		}
+		// Echo the envd version (propagated from the template annotation onto the
+		// create request) back to the caller via the existing ext_info map, so
+		// CubeAPI can surface it without an extra round-trip. Success branch only.
+		if v := strings.TrimSpace(req.Annotations[constants.CubeAnnotationComponentEnvdVersion]); v != "" {
+			if ret.ExtInfo == nil {
+				ret.ExtInfo = make(map[string]string)
+			}
+			ret.ExtInfo[constants.CubeAnnotationComponentEnvdVersion] = v
 		}
 	}
 	rt.RetCode = int64(ret.Ret.RetCode)
