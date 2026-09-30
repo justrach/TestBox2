@@ -22,7 +22,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/recov"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet/grpcconn"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	"gorm.io/gorm"
 )
 
@@ -38,9 +38,48 @@ type local struct {
 
 	sortedNodesByClusters map[string]node.NodeList
 	totalSelfNodes        int64
+
+	// emptySyncStreak counts consecutive empty CubeOps responses before eviction.
+	emptySyncStreak atomic.Int32
 }
 
-var l = &local{}
+// The node/image stores exist from package load so nodemeta query APIs
+// (GetNodeHostFacts / GetPersistedNodeHostFacts) are fail-closed before
+// localcache.Init, matching the pre-migration global.nodes empty map.
+var l = &local{
+	cache:                 cache.New(0, 0),
+	imageCache:            cache.New(0, 0),
+	templateNodeCache:     cache.New(0, 0),
+	sortedNodesByClusters: make(map[string]node.NodeList),
+}
+
+// OnGuestAgentVersionChanged is registered by template compatibility
+// management. It is called when a node's guest-image or cube-agent version
+// changes during a metadata sync. Kept in localcache to avoid a package
+// import cycle: localcache never imports templatecenter.
+var OnGuestAgentVersionChanged func(nodeID string)
+
+// compatVersionsChanged reports whether guest-image or cube-agent versions
+// changed between two heartbeats. Only these two components participate in
+// template compatibility; kernel/shim are stored but do not trigger a rescan.
+func compatVersionsChanged(prev, next []node.ComponentVersion) bool {
+	prevMap := versionsToMap(prev)
+	nextMap := versionsToMap(next)
+	for _, component := range []string{"guest-image", "cube-agent"} {
+		if prevMap[component] != nextMap[component] {
+			return true
+		}
+	}
+	return false
+}
+
+func versionsToMap(versions []node.ComponentVersion) map[string]string {
+	out := make(map[string]string, len(versions))
+	for _, v := range versions {
+		out[v.Component] = v.Version
+	}
+	return out
+}
 
 func (l *local) loopSelfNodes(ctx context.Context) {
 	loadNum := func() int64 {
@@ -97,13 +136,14 @@ func (l *local) loop(ctx context.Context) {
 					checkDeadline = time.Now().Add(config.GetConfig().Common.SyncMetaDataInterval)
 				}()
 
-				if err := l.syncAllFromDB(true); err != nil {
-					CubeLog.WithContext(context.Background()).Errorf("loop_all:%s", err)
+				if err := l.syncAllFromDB(ctx, true); err != nil {
+					CubeLog.WithContext(ctx).Errorf("loop_all:%s", err)
 				}
 				if log.IsDebug() {
-					CubeLog.WithContext(context.Background()).Debugf("loop_all:%s", GetNodes(-1).String())
+					nodes := GetNodes(-1)
+					CubeLog.WithContext(context.Background()).Debugf("loop_all,size:%d,nodes:%s",
+						nodes.Len(), nodes.String())
 				}
-				CubeLog.WithContext(context.Background()).Errorf("loop_all,size:%d", l.cache.ItemCount())
 			}, func(panicError interface{}) {
 				checkDeadline = time.Now().Add(config.GetConfig().Common.SyncMetaDataInterval)
 				CubeLog.WithContext(context.Background()).Fatalf("loop panic:%v", panicError)
@@ -122,9 +162,16 @@ func (l *local) dealEvent(ctx context.Context) {
 				if e == nil {
 					return
 				}
+				if externalNodeLoader != nil {
+					// CubeOps mode: node data is authoritative from cubeops_loader
+					// (full sync every SyncMetaDataInterval). Ignore local DB
+					// events to avoid dual-source conflict.
+					CubeLog.WithContext(ctx).Debugf("dealEvent: ignored in CubeOps mode: type=%v ids=%v", e.Type, e.InsIDs)
+					return
+				}
 				if DEL == e.Type {
 					for _, nodeID := range e.InsIDs {
-						l.delNodeCache(&node.Node{
+						l.delNodeCache(ctx, &node.Node{
 							InsID: nodeID,
 						})
 						CubeLog.WithContext(context.Background()).Warnf("Host delete:%v", nodeID)
@@ -159,18 +206,18 @@ func (l *local) dealEvent(ctx context.Context) {
 	}
 }
 
-func (l *local) checkDirty(allFromDb map[string]struct{}) {
-	if len(allFromDb) == 0 {
-		CubeLog.WithContext(context.Background()).Warnf("checkDirty allFromDb is empty")
-		return
-	}
+// checkDirty removes cached nodes absent from allFromDb. quiet skips the
+// per-node "is dirty" ERROR for expected bulk evictions.
+func (l *local) checkDirty(ctx context.Context, allFromDb map[string]struct{}, quiet bool) {
 	elems := l.cache.Items()
 	for _, v := range elems {
 		h, ok := v.Object.(*node.Node)
 		if ok {
 			if _, ok := allFromDb[h.InsID]; !ok {
-				CubeLog.WithContext(context.Background()).Errorf("node %s is dirty", h.InsID)
-				l.delNodeCache(h)
+				if !quiet {
+					CubeLog.WithContext(context.Background()).Errorf("node %s is dirty", h.InsID)
+				}
+				l.delNodeCache(ctx, h)
 			}
 		}
 	}
@@ -185,10 +232,15 @@ func (l *local) addNodeCache(n *node.Node) {
 	l.appendSortedNodes(n)
 }
 
-func (l *local) delNodeCache(n *node.Node) {
+func (l *local) delNodeCache(ctx context.Context, n *node.Node) {
 	if n == nil {
 		CubeLog.WithContext(context.Background()).Warnf("node is nil")
 		return
+	}
+	// Clean template locality: empty list deregisters all replicas.
+	SyncNodeTemplates(ctx, n.ID(), nil)
+	if l.templateNodeCache != nil {
+		l.templateNodeCache.Delete(n.ID())
 	}
 	l.cache.Delete(n.ID())
 	l.delSortedNodes(n)
@@ -311,9 +363,33 @@ func (l *local) updateNodeFromMetaData(n *node.Node) error {
 		old.CPUType = n.CPUType
 		old.InstanceType = n.InstanceType
 		old.OssClusterLabel = n.OssClusterLabel
+		// Host facts must be refreshed on every metadata sync: KVM module state
+		// is re-read on each heartbeat (kvm.ko reload / out-of-tree sibling), and
+		// a node that first reported facts after being cached would otherwise
+		// render them as "-" forever in cubemastercli node list.
+		old.HostFacts = n.HostFacts
+		var labels map[string]string
+		if n.NodeLabels != nil {
+			labels = make(map[string]string, len(n.NodeLabels))
+			for k, v := range n.NodeLabels {
+				labels[k] = v
+			}
+		}
+		old.NodeLabels = labels
+		old.InvalidateLabelsCache()
+		old.SetSchedulingDisabled(n.SchedulingDisabled())
+		prevVersions := old.Versions
+		old.Versions = n.Versions
 		l.lockMetaData.Unlock()
 
 		l.updateSortedNodes(old)
+
+		// Notify template compatibility management when guest-image or
+		// cube-agent versions change. Runs outside the metadata lock so the
+		// callback can schedule a compat scan without deadlocking.
+		if OnGuestAgentVersionChanged != nil && compatVersionsChanged(prevVersions, n.Versions) {
+			go OnGuestAgentVersionChanged(n.ID())
+		}
 		return nil
 	} else {
 		return fmt.Errorf("item [%s:%s] doesn't exist", n.ID(), n.IP)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Tencent. All rights reserved.
 
-import { api } from '@/lib/api';
+import { api, ops, setTokens, clearTokens } from '@/lib/api';
 import type { components } from './generated/schema';
 
 export type ClusterOverviewDto = components['schemas']['ClusterOverview'];
@@ -14,6 +14,8 @@ export type SandboxResumeRequest = components['schemas']['ResumedSandbox'];
 export type TemplateSummaryDto = components['schemas']['TemplateSummary'];
 export type TemplateDetailDto = components['schemas']['TemplateDetail'];
 export type ApiNodeView = components['schemas']['NodeView'];
+export type VersionMatrixDto = components['schemas']['VersionMatrixView'];
+export type ComponentVersionDto = components['schemas']['ComponentVersionView'];
 
 export interface RunningSandbox extends ListedSandboxDto {}
 
@@ -27,6 +29,9 @@ export interface TemplateSummary {
   lastError?: string | null;
   createdAt?: string | null;
   imageInfo?: string | null;
+  jobID?: string | null;
+  networkType?: string | null;
+  allowInternetAccess?: boolean | null;
 }
 
 export interface TemplateDetail extends TemplateSummary {
@@ -34,6 +39,40 @@ export interface TemplateDetail extends TemplateSummary {
   createRequest?: unknown;
   networkType?: string | null;
   allowInternetAccess?: boolean | null;
+  /** Maps from dto.aliases[0] — CubeMaster returns the template alias as `aliases: string[]`. */
+  displayName?: string | null;
+}
+
+export interface TemplateCompatSummary {
+  staleTemplates: number;
+  staleReplicas: number;
+  affectedNodes: number;
+  missingReplicas: number;
+  unknownReplicas: number;
+}
+
+export interface TemplateNodeCompat {
+  nodeID: string;
+  nodeIP?: string | null;
+  compatStatus: 'OK' | 'STALE' | 'UNKNOWN' | 'MISSING' | string;
+  boundGuestImageVersion?: string | null;
+  currentGuestImageVersion?: string | null;
+  boundAgentVersion?: string | null;
+  currentAgentVersion?: string | null;
+  boundKernelVersion?: string | null;
+  currentKernelVersion?: string | null;
+}
+
+export interface TemplateCompatRow {
+  templateID: string;
+  instanceType?: string | null;
+  overall: 'OK' | 'STALE' | 'UNKNOWN' | 'MISSING' | string;
+  nodes: TemplateNodeCompat[];
+}
+
+export interface TemplateCompatMatrix {
+  summary: TemplateCompatSummary;
+  templates: TemplateCompatRow[];
 }
 
 export interface ClusterNodeResourcesView {
@@ -67,10 +106,21 @@ export interface ClusterNodeView {
   memorySaturationPct: number;
   heartbeatTime?: string | null;
   healthy: boolean;
+  schedulingDisabled: boolean;
   localTemplates: string[];
+  versions: ComponentVersionDto[];
 }
 
 export interface ClusterOverview extends ClusterOverviewDto {}
+
+export interface NodeOperationDto {
+  id: number;
+  node_id: string;
+  type: string;
+  operator?: string;
+  detail?: string;
+  created_at: string;
+}
 
 function mapSandbox(dto: ListedSandboxDto): RunningSandbox {
   return dto;
@@ -89,6 +139,10 @@ function mapTemplateSummary(dto: TemplateSummaryDto): TemplateSummary {
     lastError: dto.lastError,
     createdAt: dto.createdAt,
     imageInfo: dto.imageInfo,
+    jobID: dto.jobID ?? null,
+    networkType: (dto as unknown as { networkType?: string }).networkType ?? null,
+    allowInternetAccess:
+      (dto as unknown as { allowInternetAccess?: boolean }).allowInternetAccess ?? null,
   };
 }
 
@@ -103,8 +157,14 @@ function mapTemplateDetail(dto: TemplateDetailDto): TemplateDetail {
     imageInfo: undefined,
     replicas: dto.replicas,
     createRequest: dto.createRequest,
+    jobID: (dto as unknown as { jobID?: string }).jobID ?? null,
     networkType: (dto as unknown as { networkType?: string }).networkType ?? null,
-    allowInternetAccess: (dto as unknown as { allowInternetAccess?: boolean }).allowInternetAccess ?? null,
+    allowInternetAccess:
+      (dto as unknown as { allowInternetAccess?: boolean }).allowInternetAccess ?? null,
+    displayName:
+      dto.aliases?.[0]?.trim() ||
+      (dto as unknown as { displayName?: string }).displayName?.trim() ||
+      null,
   };
 }
 
@@ -123,7 +183,8 @@ function mapNode(dto: ApiNodeView): ClusterNodeView {
       maxMvmSlots: dto.maxMvmSlots,
       quotaCpu: (dto as unknown as { quotaCpu?: number }).quotaCpu ?? 0,
       quotaMemMB: (dto as unknown as { quotaMemMB?: number }).quotaMemMB ?? 0,
-      createConcurrentNum: (dto as unknown as { createConcurrentNum?: number }).createConcurrentNum ?? 0,
+      createConcurrentNum:
+        (dto as unknown as { createConcurrentNum?: number }).createConcurrentNum ?? 0,
     },
     conditions: dto.conditions?.map((condition) => ({
       type: condition.type,
@@ -136,7 +197,10 @@ function mapNode(dto: ApiNodeView): ClusterNodeView {
     memorySaturationPct: Math.round(dto.memorySaturation),
     heartbeatTime: dto.heartbeatTime,
     healthy: dto.healthy,
+    schedulingDisabled:
+      (dto as unknown as { schedulingDisabled?: boolean }).schedulingDisabled ?? false,
     localTemplates: dto.localTemplates ?? [],
+    versions: dto.versions ?? [],
   };
 }
 
@@ -146,8 +210,12 @@ const DEFAULT_RESUME_BODY: SandboxResumeRequest = {
 };
 
 export const sandboxApi = {
-  list: (params?: { metadata?: string; state?: RunningSandbox['state']; nextToken?: string; limit?: number }) =>
-    api<ListedSandboxDto[]>('/v2/sandboxes', { params }).then((items) => items.map(mapSandbox)),
+  list: (params?: {
+    metadata?: string;
+    state?: RunningSandbox['state'];
+    nextToken?: string;
+    limit?: number;
+  }) => api<ListedSandboxDto[]>('/v2/sandboxes', { params }).then((items) => items.map(mapSandbox)),
   get: (id: string) => api<SandboxDetailDto>(`/sandboxes/${id}`).then(mapSandboxDetail),
   kill: (id: string) => api<void>(`/sandboxes/${id}`, { method: 'DELETE' }),
   pause: (id: string) => api<void>(`/sandboxes/${id}/pause`, { method: 'POST' }),
@@ -157,13 +225,13 @@ export const sandboxApi = {
       body: JSON.stringify(body),
     }).then(() => undefined),
   setTimeout: (id: string, seconds: number) =>
-    api<void>(`/sandboxes/${id}/timeout`, { method: 'POST', body: JSON.stringify({ timeout: seconds }) }),
+    api<void>(`/sandboxes/${id}/timeout`, {
+      method: 'POST',
+      body: JSON.stringify({ timeout: seconds }),
+    }),
   logs: (id: string, params?: { cursor?: number; limit?: number; direction?: string }) =>
     api<SandboxLogsDto>(`/v2/sandboxes/${id}/logs`, { params }),
-  create: (body: {
-    templateID: string;
-    metadata?: Record<string, string>;
-  }) =>
+  create: (body: { templateID: string; timeout?: number; metadata?: Record<string, string> }) =>
     api<SandboxSessionDto>('/sandboxes', {
       method: 'POST',
       body: JSON.stringify(body),
@@ -171,29 +239,169 @@ export const sandboxApi = {
 };
 
 export const templateApi = {
-  list: () => api<TemplateSummaryDto[]>('/templates').then((items) => items.map(mapTemplateSummary)),
+  list: () =>
+    api<TemplateSummaryDto[]>('/templates').then((items) => items.map(mapTemplateSummary)),
   get: (id: string) => api<TemplateDetailDto>(`/templates/${id}`).then(mapTemplateDetail),
-  create: (body: { templateID?: string; image: string; instanceType?: string; writableLayerSize?: string; exposedPorts?: number[]; probePort?: number; probePath?: string; cpu?: number; memory?: number; env?: string[]; allowInternetAccess?: boolean }) =>
-    api<unknown>('/templates', { method: 'POST', body: JSON.stringify(body) }),
-  rebuild: (id: string) => api<unknown>(`/templates/${id}`, { method: 'POST', body: JSON.stringify({}) }),
+  create: (body: {
+    templateID?: string;
+    image: string;
+    instanceType?: string;
+    writableLayerSize?: string;
+    exposedPorts?: number[];
+    probePort?: number;
+    probePath?: string;
+    cpu?: number;
+    memory?: number;
+    env?: string[];
+    allowInternetAccess?: boolean;
+    networkType?: string;
+    nodes?: string[];
+    registryUsername?: string;
+    registryPassword?: string;
+    command?: string[];
+    args?: string[];
+    dns?: string[];
+    allowOut?: string[];
+    denyOut?: string[];
+    with_cube_ca?: boolean;
+  }) => api<unknown>('/templates', { method: 'POST', body: JSON.stringify(body) }),
+  rebuild: (id: string) =>
+    api<unknown>(`/templates/${id}`, { method: 'POST', body: JSON.stringify({}) }),
   getBuildStatus: (id: string, buildID: string) =>
     api<unknown>(`/templates/${id}/builds/${buildID}/status`),
   getBuildLogs: (id: string, buildID: string) =>
-    api<{ lines?: string[]; status?: string; progress?: number }>(`/templates/${id}/builds/${buildID}/logs`),
-  remove: (id: string) => api<void>(`/templates/${id}`, { method: 'DELETE' }),
+    api<{ lines?: string[]; status?: string; progress?: number }>(
+      `/templates/${id}/builds/${buildID}/logs`,
+    ),
+  remove: (id: string) =>
+    api<void>(`/templates/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      params: { sync: true },
+    }),
+  compat: () => api<TemplateCompatMatrix>('/templates/compat'),
+  adoptCompatBaseline: (id: string) =>
+    api<{ updated: number }>(`/templates/compat/${id}/adopt-baseline`, { method: 'POST' }),
+};
+
+export const versionApi = {
+  matrix: () => ops<VersionMatrixDto>('/cluster/versions'),
+};
+
+export interface WarehouseComponentSummary {
+  name: string;
+  versionCount: number;
+  arches: string[];
+  sizeBytes: number;
+  nodesMissing?: number;
+}
+
+export interface WarehouseArtifact {
+  arch: string;
+  sizeBytes: number;
+  source: string;
+  sourceRef: string;
+  checksum: string;
+  createdAt: string;
+  nodesInstalled?: string[];
+  nodesMissing?: string[];
+}
+
+export interface WarehouseVersionGroup {
+  version: string;
+  artifacts: WarehouseArtifact[];
+}
+
+export interface WarehouseComponentDetail {
+  name: string;
+  versions: WarehouseVersionGroup[];
+}
+
+export interface WarehouseImportJob {
+  id: string;
+  source: string;
+  sourceRef: string;
+  tag: string;
+  arch: string;
+  status: string;
+  error?: string;
+  bytesTotal: number;
+}
+
+export interface WarehousePreinstallJob {
+  id: string;
+  nodeId: string;
+  arch: string;
+  component: string;
+  version: string;
+  status: string;
+  error?: string;
+}
+
+export const warehouseApi = {
+  listComponents: () => ops<{ components: WarehouseComponentSummary[] }>('/warehouse/components'),
+  getComponent: (name: string) =>
+    ops<WarehouseComponentDetail>(`/warehouse/components/${encodeURIComponent(name)}`),
+  preinstallJobs: (params?: {
+    node_id?: string;
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }) => ops<{ jobs: WarehousePreinstallJob[]; total: number }>('/warehouse/preinstall', { params }),
+  importStatus: (id: string) => ops<WarehouseImportJob>(`/warehouse/imports/${id}`),
+  listImports: (params?: { limit?: number; offset?: number }) =>
+    ops<{ jobs: WarehouseImportJob[]; total: number }>('/warehouse/imports', { params }),
+  createImport: (body: {
+    source: 'github' | 'cnb' | 'upload';
+    repo?: string;
+    tag?: string;
+    uploadId?: string;
+    arch: string[];
+  }) =>
+    ops<{ jobs: WarehouseImportJob[] }>('/warehouse/imports', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  preinstall: (body: { nodeIds: string[]; arch: string; component: string; version: string }) =>
+    ops<{ jobs: WarehousePreinstallJob[] }>('/warehouse/preinstall', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  deleteVersion: (component: string, version: string, arch: string) =>
+    ops<void>(
+      `/warehouse/components/${encodeURIComponent(component)}/versions/${encodeURIComponent(version)}`,
+      { method: 'DELETE', params: { arch } },
+    ),
+  upload: (file: File) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return ops<{ uploadId: string; filename: string }>('/warehouse/uploads', {
+      method: 'POST',
+      body: fd,
+    });
+  },
 };
 
 export const clusterApi = {
-  overview: () => api<ClusterOverviewDto>('/cluster/overview'),
-  nodes: () => api<ApiNodeView[]>('/nodes').then((items) => items.map(mapNode)),
-  node: (id: string) => api<ApiNodeView>(`/nodes/${id}`).then(mapNode),
-  config: () => api<{
-    apiEndpoint: string;
-    rateLimitPerSec: number;
-    authEnabled: boolean;
-    sandboxDomain: string;
-    instanceType: string;
-  }>('/config'),
+  overview: () => ops<ClusterOverviewDto>('/cluster/overview'),
+  nodes: () => ops<ApiNodeView[]>('/nodes').then((items) => items.map(mapNode)),
+  node: (id: string) => ops<ApiNodeView>(`/nodes/${id}`).then(mapNode),
+  isolate: (id: string, detail?: string) =>
+    ops<void>(`/nodes/${id}/isolation`, {
+      method: 'PUT',
+      body: detail ? JSON.stringify({ detail }) : undefined,
+    }),
+  unisolate: (id: string, detail?: string) =>
+    ops<void>(`/nodes/${id}/isolation`, {
+      method: 'DELETE',
+      body: detail ? JSON.stringify({ detail }) : undefined,
+    }),
+  nodeOperations: (id: string) => ops<NodeOperationDto[]>(`/nodes/${id}/operations`),
+  config: () =>
+    ops<{
+      apiEndpoint: string;
+      opsApiEndpoint: string;
+      sandboxDomain: string;
+    }>('/config'),
 };
 
 export interface ImageMeta {
@@ -209,8 +417,8 @@ export interface StoreMeta {
 }
 
 export const storeApi = {
-  meta: () => api<StoreMeta>('/store/meta'),
-  refresh: () => api<StoreMeta>('/store/refresh', { method: 'POST' }),
+  meta: () => ops<StoreMeta>('/store/meta'),
+  refresh: () => ops<StoreMeta>('/store/refresh', { method: 'POST' }),
 };
 
 export interface AgentInstanceDto {
@@ -229,6 +437,11 @@ export interface AgentInstanceDto {
   templateId: string;
   gatewayUrl: string;
   envUrl: string;
+  persistenceMode?: 'full_snapshot' | 'shared_files';
+  rootfsSourceType?: 'template' | 'snapshot';
+  rootfsSourceId?: string;
+  openclawPersistId?: string;
+  openclawStatePath?: string;
   wecomConfig?: {
     botId: string;
     botSecret: string;
@@ -259,8 +472,13 @@ export interface AgentSnapshotDto {
   snapshotID: string;
   names: string[];
   status?: string;
+  snapshotKind?: 'sandbox' | 'agenthub_state';
   originSandboxID?: string;
   publishedTemplateId?: string;
+  rootfsSourceType?: 'template' | 'snapshot';
+  rootfsSourceId?: string;
+  rootfsSnapshotId?: string;
+  openclawStateSnapshotPath?: string;
   templateReferenced: boolean;
   isHealthy: boolean;
   parentSnapshotID?: string;
@@ -295,6 +513,7 @@ export interface AgentTemplateDto {
   sourceSandboxId: string;
   model: string;
   version: string;
+  persistenceMode?: 'full_snapshot' | 'shared_files';
   recommended: boolean;
   createdAt?: string;
 }
@@ -316,99 +535,196 @@ export interface AgentSnapshotJobDto {
   status: string;
 }
 
+export interface SessionDto {
+  authRequired: boolean;
+  authenticated: boolean;
+  username?: string;
+}
+
+export interface LoginResponseDto {
+  accessToken: string;
+  refreshToken: string;
+  username: string;
+  expiresInSecs: number;
+}
+
+export const authApi = {
+  session: () => ops<SessionDto>('/auth/session'),
+  login: (body: { username: string; password: string }) =>
+    ops<LoginResponseDto>('/auth/login', { method: 'POST', body: JSON.stringify(body) }).then(
+      (resp) => {
+        setTokens(resp.accessToken, resp.refreshToken);
+        return resp;
+      },
+    ),
+  logout: () => {
+    clearTokens();
+    return ops<void>('/auth/logout', { method: 'POST' });
+  },
+  changePassword: (body: { username: string; oldPassword: string; newPassword: string }) =>
+    ops<void>('/auth/change-password', { method: 'POST', body: JSON.stringify(body) }),
+};
+
+export interface AgentSettingsDto {
+  /** Backward-compatible alias for the default LLM API key state. */
+  deepseekApiKeyConfigured: boolean;
+  /** Backward-compatible masked preview. Never the full key. */
+  deepseekApiKeyMasked?: string;
+  /** Backward-compatible key source. */
+  source: 'database' | 'none';
+  /** LLM provider id, e.g. "deepseek" or "custom". */
+  llmProvider: string;
+  /** OpenAI-compatible base URL. */
+  llmBaseUrl: string;
+  /** Default model id injected into OpenClaw. */
+  llmModel: string;
+  /** Whether a usable default LLM API key is available. */
+  llmApiKeyConfigured: boolean;
+  /** Masked preview of the default LLM API key. Never the full key. */
+  llmApiKeyMasked?: string;
+  /** Where the LLM API key comes from. */
+  llmApiKeySource: 'database' | 'none';
+  /** How the LLM credential is delivered to OpenClaw. */
+  llmCredentialMode: 'egress' | 'env';
+  /** Whether settings can be persisted (requires the AgentHub database). */
+  persistenceEnabled: boolean;
+  /**
+   * Configured gateway domain (e.g. "cube.app"), or undefined when not set.
+   * Assistants open their OpenClaw gateway via `<port>-<sandboxId>.<domain>`
+   * (subdomain origin) when this is present.
+   */
+  gatewayDomain?: string;
+}
+
 export const agentHubApi = {
-  list: () => api<AgentInstanceDto[]>('/agenthub/instances'),
-  listTemplates: () => api<AgentTemplateDto[]>('/agenthub/templates'),
+  list: () => ops<AgentInstanceDto[]>('/agenthub/instances'),
+  listTemplates: () => ops<AgentTemplateDto[]>('/agenthub/templates'),
+  registerMarketTemplate: (body: {
+    templateId: string;
+    name?: string;
+    model?: string;
+    version?: string;
+    recommended?: boolean;
+  }) =>
+    ops<AgentTemplateDto>('/agenthub/templates/market', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  getSettings: () => ops<AgentSettingsDto>('/agenthub/settings'),
+  updateSettings: (body: {
+    deepseekApiKey?: string;
+    llmProvider?: string;
+    llmBaseUrl?: string;
+    llmModel?: string;
+    llmApiKey?: string;
+    llmCredentialMode?: 'egress' | 'env';
+    gatewayDomain?: string;
+  }) =>
+    ops<AgentSettingsDto>('/agenthub/settings', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
   create: (body: {
     name: string;
     engine: 'openclaw';
-    model: string;
+    model?: string;
     templateId?: string;
+    snapshotId?: string;
+    persistenceMode?: 'full_snapshot' | 'shared_files';
     botId?: string;
     botSecret?: string;
   }) =>
-    api<AgentInstanceDto>('/agenthub/instances', {
+    ops<AgentInstanceDto>('/agenthub/instances', {
       method: 'POST',
       body: JSON.stringify(body),
     }),
   delete: (id: string) =>
-    api<void>(`/agenthub/instances/${encodeURIComponent(id)}`, {
+    ops<void>(`/agenthub/instances/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
   restart: (id: string) =>
-    api<AgentSetupResultDto>(`/agenthub/instances/${encodeURIComponent(id)}/restart`, {
+    ops<AgentSetupResultDto>(`/agenthub/instances/${encodeURIComponent(id)}/restart`, {
       method: 'POST',
     }),
   pause: (id: string) =>
-    api<AgentInstanceDto>(`/agenthub/instances/${encodeURIComponent(id)}/pause`, {
+    ops<AgentInstanceDto>(`/agenthub/instances/${encodeURIComponent(id)}/pause`, {
       method: 'POST',
     }),
   resume: (id: string) =>
-    api<AgentInstanceDto>(`/agenthub/instances/${encodeURIComponent(id)}/resume`, {
+    ops<AgentInstanceDto>(`/agenthub/instances/${encodeURIComponent(id)}/resume`, {
       method: 'POST',
     }),
   upgrade: (id: string) =>
-    api<AgentSetupResultDto>(`/agenthub/instances/${encodeURIComponent(id)}/upgrade`, {
+    ops<AgentSetupResultDto>(`/agenthub/instances/${encodeURIComponent(id)}/upgrade`, {
       method: 'POST',
     }),
   updateModel: (id: string, body: { model: string }) =>
-    api<AgentInstanceDto>(`/agenthub/instances/${encodeURIComponent(id)}/model`, {
+    ops<AgentInstanceDto>(`/agenthub/instances/${encodeURIComponent(id)}/model`, {
       method: 'PUT',
       body: JSON.stringify(body),
     }),
   updateWecomConfig: (id: string, body: { botId: string; botSecret: string }) =>
-    api<AgentInstanceDto>(`/agenthub/instances/${encodeURIComponent(id)}/wecom`, {
+    ops<AgentInstanceDto>(`/agenthub/instances/${encodeURIComponent(id)}/wecom`, {
       method: 'PUT',
       body: JSON.stringify(body),
     }),
   getWecomConfig: (id: string) =>
-    api<AgentWeComConfigDto | null>(`/agenthub/instances/${encodeURIComponent(id)}/wecom`),
+    ops<AgentWeComConfigDto | null>(`/agenthub/instances/${encodeURIComponent(id)}/wecom`),
   getGatewayHealth: (id: string) =>
-    api<AgentGatewayHealthDto>(`/agenthub/instances/${encodeURIComponent(id)}/gateway/health`),
+    ops<AgentGatewayHealthDto>(`/agenthub/instances/${encodeURIComponent(id)}/gateway/health`),
   listOperations: (id: string) =>
-    api<AgentOperationDto[]>(`/agenthub/instances/${encodeURIComponent(id)}/operations`),
+    ops<AgentOperationDto[]>(`/agenthub/instances/${encodeURIComponent(id)}/operations`),
   listSnapshots: (id: string) =>
-    api<AgentSnapshotDto[]>(`/agenthub/instances/${encodeURIComponent(id)}/snapshots`),
+    ops<AgentSnapshotDto[]>(`/agenthub/instances/${encodeURIComponent(id)}/snapshots`),
   createSnapshot: (id: string, body: { name?: string }) =>
-    api<AgentSnapshotJobDto>(`/agenthub/instances/${encodeURIComponent(id)}/snapshots`, {
+    ops<AgentSnapshotJobDto>(`/agenthub/instances/${encodeURIComponent(id)}/snapshots`, {
       method: 'POST',
       body: JSON.stringify(body),
     }),
   deleteSnapshot: (id: string, snapshotId: string) =>
-    api<void>(`/agenthub/instances/${encodeURIComponent(id)}/snapshots/${encodeURIComponent(snapshotId)}`, {
-      method: 'DELETE',
-    }),
+    ops<void>(
+      `/agenthub/instances/${encodeURIComponent(id)}/snapshots/${encodeURIComponent(snapshotId)}`,
+      {
+        method: 'DELETE',
+      },
+    ),
   updateSnapshot: (id: string, snapshotId: string, body: { name?: string; isHealthy?: boolean }) =>
-    api<void>(`/agenthub/instances/${encodeURIComponent(id)}/snapshots/${encodeURIComponent(snapshotId)}`, {
-      method: 'PATCH',
-      body: JSON.stringify(body),
-    }),
+    ops<void>(
+      `/agenthub/instances/${encodeURIComponent(id)}/snapshots/${encodeURIComponent(snapshotId)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(body),
+      },
+    ),
   recover: (id: string) =>
-    api<AgentRecoverResponseDto>(`/agenthub/instances/${encodeURIComponent(id)}/recover`, {
+    ops<AgentRecoverResponseDto>(`/agenthub/instances/${encodeURIComponent(id)}/recover`, {
       method: 'POST',
     }),
   rollback: (id: string, body: { snapshotId: string }) =>
-    api<AgentRollbackResponseDto>(`/agenthub/instances/${encodeURIComponent(id)}/rollback`, {
+    ops<AgentRollbackResponseDto>(`/agenthub/instances/${encodeURIComponent(id)}/rollback`, {
       method: 'POST',
       body: JSON.stringify(body),
     }),
   clone: (id: string, body: { name?: string; snapshotId?: string }) =>
-    api<AgentInstanceDto>(`/agenthub/instances/${encodeURIComponent(id)}/clone`, {
+    ops<AgentInstanceDto>(`/agenthub/instances/${encodeURIComponent(id)}/clone`, {
       method: 'POST',
       body: JSON.stringify(body),
     }),
   publishTemplate: (id: string, body: { name?: string; snapshotId?: string }) =>
-    api<AgentPublishTemplateResponseDto>(`/agenthub/instances/${encodeURIComponent(id)}/publish-template`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
+    ops<AgentPublishTemplateResponseDto>(
+      `/agenthub/instances/${encodeURIComponent(id)}/publish-template`,
+      {
+        method: 'POST',
+        body: JSON.stringify(body),
+      },
+    ),
   updateTemplate: (templateId: string, body: { name?: string; recommended?: boolean }) =>
-    api<void>(`/agenthub/templates/${encodeURIComponent(templateId)}`, {
+    ops<void>(`/agenthub/templates/${encodeURIComponent(templateId)}`, {
       method: 'PATCH',
       body: JSON.stringify(body),
     }),
   deleteTemplate: (templateId: string) =>
-    api<void>(`/agenthub/templates/${encodeURIComponent(templateId)}`, {
+    ops<void>(`/agenthub/templates/${encodeURIComponent(templateId)}`, {
       method: 'DELETE',
     }),
 };

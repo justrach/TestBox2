@@ -30,6 +30,7 @@ sudo tail -F /data/log/Cubelet/Cubelet-req.log
 sudo tail -F /data/log/CubeMaster/cubemaster-req.log
 sudo tail -F /data/log/CubeAPI/cube-api-$(date +%F).log
 sudo tail -F /data/log/CubeVmm/vmm.log              # 沙箱 VMM 创建过程
+sudo tail -F /data/log/cube-proxy/error.log         # 代理错误
 
 # 4. 看启动失败 / 进程异常退出 → journalctl
 sudo journalctl -u cube-sandbox-cube-api.service -n 200 --no-pager
@@ -65,10 +66,9 @@ Target 通过 `Wants=` 列出自己要拉起的 service；service 通过 `PartOf
 | `cube-sandbox-redis.service` | Docker 容器 | `6379` | control | docker |
 | `cube-sandbox-cubemaster.service` | 宿主机进程 | `8089` | control | mysql, redis |
 | `cube-sandbox-cube-api.service` | 宿主机进程 | `3000`（E2B 兼容 API） | control | cubemaster |
-| `cube-sandbox-network-agent.service` | 宿主机进程 | `19090`（health） | control / compute | network |
-| `cube-sandbox-cubelet.service` | 宿主机进程 | `9999`（gRPC） | control / compute | network-agent + `/data/cubelet`（XFS） |
+| `cube-sandbox-cubelet.service` | 宿主机进程 | `9999`（gRPC）、HTTP 诊断接口 | control / compute | 内置 network runtime + `/data/cubelet`（XFS） |
 | `cube-sandbox-coredns.service` | Docker 容器 | `127.0.0.54:53` 或 `169.254.254.53:53` | control | docker |
-| `cube-sandbox-cube-proxy.service` | Docker 容器 | `443`（TLS）/ `80` | control | docker, redis |
+| `cube-sandbox-cube-proxy.service` | Docker 容器 | `443`（TLS）/ `80` / `9090`（gRPC） | control | docker, redis |
 | `cube-sandbox-dns.service` | oneshot（无常驻进程） | — | control | coredns（`BindsTo`）|
 | `cube-sandbox-webui.service` | Docker 容器 | `12088` | control | docker, cube-api |
 
@@ -82,7 +82,7 @@ docker.service
    └─ coredns.service ─ dns.service (oneshot, BindsTo coredns)
 
 network-online.target
-   └─ network-agent.service ─ cubelet.service
+   └─ cubelet.service（内置 network runtime）
 ```
 
 依赖只通过 `After=` / `Wants=` 表达启动顺序；运行期某个上游挂了**不会**自动把下游也带翻 —— 所以 cubelet 不会因为 cube-api 挂了而被一起重启，反过来也是一样。
@@ -94,7 +94,7 @@ network-online.target
 最常见的两种配置入口：
 
 - 顶层环境：`/usr/local/services/cubetoolbox/.one-click.env`
-- 组件原生配置：`Cubelet/config/config.toml`、`Cubelet/dynamicconf/conf.yaml`、`CubeMaster/conf.yaml`、`network-agent/network-agent.yaml`、`cubeproxy/global.conf`、`coredns/Corefile`
+- 组件原生配置：`Cubelet/config/config.toml`、`Cubelet/dynamicconf/conf.yaml`、`CubeMaster/conf.yaml`、`cubeproxy/global.conf`、`coredns/Corefile`
 
 改完之后，重启**直接读这份配置的那个服务**：
 
@@ -125,6 +125,52 @@ sudo systemctl restart cube-sandbox-<service>.service
 
 但如果你只是改了 helper 脚本（`/usr/local/services/cubetoolbox/scripts/systemd/*.sh`），不需要 `daemon-reload`，下一次 `restart` 就会重新拉起脚本生效。
 :::
+
+## Cubelet 工件路径 {#cubelet-artifact-paths}
+
+Cubelet 会把由 Docker/OCI 镜像构建的模板根文件系统保存为只读 ext4 工件。可以在 `Cubelet/config/config.toml` 的 `[plugins."io.cubelet.internal.v1.images"]` 段中配置工件目录和模板运行时使用的内核源文件：
+
+```toml
+[plugins."io.cubelet.internal.v1.images"]
+image_base_path = "/usr/local/services/cubetoolbox/cubebox_os_image"
+shared_kernel_path = "/usr/local/services/cubetoolbox/cube-kernel-scf/vmlinux"
+```
+
+`image_base_path` 是 cubebox 模板工件的最终缓存目录，每个工件位于 `<image_base_path>/<artifact-id>/<artifact-id>.ext4`，并包含对应的 `.vm` 文件。`shared_kernel_path` 是模板工件以及无模板沙箱使用的 `vmlinux` 源文件。两个路径都必须是绝对路径。省略时，Cubelet 保留历史 toolbox 路径；`cubetool_base_dir` 仍作为旧配置的兼容 fallback。设置任一新路径后，该路径以新配置为准，旧配置不会覆盖它。如果旧 cbri 配置自定义了 `base_path`，应显式将 `shared_kernel_path` 设为该安装目录下匹配的内核路径；`base_path` 仍控制无模板沙箱使用的 guest 和 agent 镜像，但不再选择 `vmlinux`。配置的内核路径必须与节点当前选中的 bm/pvm 内核变体和 digest 一致；修改这个路径不会为节点或模板上报选择另一套 kernel identity。
+
+工件目录和内核路径相互独立。修改任一路径后都需要重启 Cubelet。Cubelet 不会自动搬迁已有工件；切换到新路径前，需要先让受影响的缓存或内核文件在新路径可用。已有 snapshot 还必须继续让历史工件路径可访问（例如通过部署层软链），或者重建相关 snapshot，因为 snapshot 元数据保存了 kernel 和 ext4 工件的绝对路径。旧 cbri 插件中的 `image_base_path` 和 `kernel_base_path` 不再作为工件路径来源，请改在 images 插件段配置工件路径。如果旧字段中有自定义值，应先把需要保留的值复制到 images 插件段，再删除或更新旧字段。
+
+`cubelet config dump` 和 `cubelet config migrate` 会把解析后的工件路径写成显式的 `image_base_path` 和 `shared_kernel_path`。使用导出的配置文件后，如需调整路径，应修改这两个显式字段；只修改 `cubetool_base_dir` 不会覆盖它们。
+
+## CubeMaster 配置项 {#cubemaster-settings}
+
+路径：`/usr/local/services/cubetoolbox/CubeMaster/conf.yaml`（one-click 包内来自 `configs/single-node/cubemaster.yaml`）。
+
+`cubelet_conf` 段中的主要超时字段：
+
+| 配置项 | 说明 |
+|--------|------|
+| `default_timeout_insec` | 客户端**不传** `timeout` 时，集群默认的**沙箱空闲 TTL**（秒）。**未配置或 `<= 0` 表示不设集群级空闲超时**（沙箱不会因空闲被自动回收，除非客户端显式传 `timeout`）。仓库默认为 `-1`，即“无集群默认”。生产环境若需自动回收未带 TTL 的沙箱，可改为正数（如 `300`）。 |
+| `create_timeout_insec` | 仅限制创建/调度 RPC 的截止时间，**不是**沙箱空闲 TTL。未配置时默认 `600`。 |
+| `common_timeout_insec` | CubeMaster 访问 Cubelet 的通用 RPC 超时（非 create 专用）。 |
+| `create_image_timeout_insec` | CubeMaster 调用单个计算节点**下载镜像**的超时时间。它包含下载、校验和保存 rootfs artifact 的时间。大镜像、低带宽或磁盘较慢时可适当调大。默认值 `300`（秒）。 |
+| `app_snapshot_timeout_insec` | CubeMaster 调用单个计算节点**创建模版**的超时时间。它包含制作模版时启动临时虚拟机、等待 readiness probe、保存内存和磁盘状态、清理临时虚拟机并返回结果的总时间。未配置或配置为非正数时，使用默认值 `300`（秒）。网络较差或模版较大时可适当调大。|
+
+下载镜像和创建模版的 timeout 相互独立，分别从对应 RPC 发起时开始计时。配置示例：
+
+```yaml
+cubelet_conf:
+  create_image_timeout_insec: 300
+  app_snapshot_timeout_insec: 600
+```
+
+修改上述任一 CubeMaster 配置后，需要重启 CubeMaster：
+
+```bash
+sudo systemctl restart cube-sandbox-cubemaster.service
+```
+
+相关说明见[沙箱生命周期 — 设计与运维要点](lifecycle.md#集群默认空闲超时default_timeout_insec)。
 
 ### 场景 B：服务挂了 / 反复重启
 
@@ -203,27 +249,25 @@ sudo systemctl stop cube-sandbox-compute.target   # 计算节点
 
 ## 查看日志
 
-CubeSandbox 的日志分三类，**不要混淆**：
+CubeSandbox 有多种日志来源，其中也包括各组件自己的容器内日志。宿主机侧主要有以下两个入口：
 
 | 来源 | 包含什么 | 在哪里看 |
 |---|---|---|
 | **业务行为日志（推荐入口）** | 请求、调度决策、stat、audit、VMM 启动过程 | **`/data/log/<Module>/`** |
 | 启动期日志 | systemd 拉起 / hook / ExecStartPost / 退出码 / 容器 build 输出 | `journalctl -u <unit>` |
-| 容器内业务日志 | 仅 `cube-proxy`：访问/错误日志写在容器内部 | `docker exec cube-proxy tail /data/log/cube-proxy/error.log` |
 
 ### `/data/log/` 业务日志（重点）
 
-> ⚠️ Cubelet / CubeMaster / CubeAPI / network-agent / CubeShim / VMM 的「业务请求 + 统计 + 审计 + VMM 创建过程」日志**全部都写到 `/data/log/`**，**不会**进 journalctl，请直接读文件。
+> ⚠️ Cubelet / CubeMaster / CubeAPI / CubeShim / VMM 的「业务请求 + 统计 + 审计 + VMM 创建过程」日志**全部都写到 `/data/log/`**，**不会**进 journalctl，请直接读文件。
 
 | 模块 | 目录 | 主要文件 |
 |---|---|---|
 | Cubelet | `/data/log/Cubelet/` | `Cubelet-req.log`（请求）<br>`Cubelet-stat.log`（指标/统计）|
 | CubeMaster | `/data/log/CubeMaster/` | `cubemaster-req.log` |
 | CubeAPI | `/data/log/CubeAPI/` | `cube-api-YYYY-MM-DD.log`（按天滚动） |
-| network-agent | `/data/log/network-agent/` | `network-agent-req.log` |
 | CubeShim | `/data/log/CubeShim/` | `cube-shim-req.log`、`cube-shim-stat.log` |
 | Hypervisor (VMM) | `/data/log/CubeVmm/` | `vmm.log`（每次创建沙箱都会写 VMM 日志）|
-| cube-proxy | 容器内 `/data/log/cube-proxy/` | `error.log`、`access.log`（见下文）|
+| cube-proxy | `/data/log/cube-proxy/` | `error.log`、`access.log`（见下文）|
 
 常用命令：
 
@@ -237,6 +281,30 @@ sudo tail -F /data/log/CubeAPI/cube-api-$(date +%F).log
 # 沙箱启动慢 / 启动失败：看 VMM 日志
 sudo tail -200 /data/log/CubeVmm/vmm.log
 ```
+
+### CubeShim 和 VMM 日志轮转
+
+CubeShim 和 VMM 运行期间会保持日志文件打开。CubeShim 通过内部每 30 分钟轮转事件 reopen。VMM 控制线程自己持有 monotonic `timerfd`，每小时发出已有的 `LOG_CTRL_REOPEN` 控制记录。reopen 由固定周期驱动：宿主机执行“`rename` + `create`”后，会在下一次计划中的 reopen 时切换到新文件，而不是在任意一次写入时立即检测。该定时器由 VMM 控制线程持有，不依赖延迟 logger 初始化，也不会由 vCPU/API 线程创建。因此宿主机侧仍应按小时执行轮转，并使用“`rename` + `create`”方式，不要使用 `copytruncate`。
+
+例如，将下面内容保存为 `/etc/logrotate.d/cubesandbox`，并确保宿主机每小时执行一次 `logrotate`：
+
+```text
+/data/log/CubeVmm/vmm.log
+/data/log/CubeShim/*.log {
+    hourly
+    rotate 24
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 root root
+}
+```
+
+`rotate 24` 表示保留 24 个小时文件，可按实际保留周期调整。`delaycompress` 会将最新的轮转文件延迟一个周期压缩，因为 writer 在下一次计划中的 reopen 之前可能仍使用旧 fd。CubeShim 每 30 分钟触发一次内部事件，VMM 控制线程每小时发送一次 reopen 控制事件。不需要 `postrotate` 信号或重启服务；该策略保证宿主机侧 retention 有界，但不承诺对任意手工轮转立即响应，也不支持 `copytruncate`。
+
+示例使用 `root root`，因为随附的一键部署 systemd 服务以 root 运行。如果 CubeShim 或 VMM 使用其他账号运行，请把 `create` 的 owner 和 group 改成对应账号；否则新建文件可能无法被 reopen。
+示例中的 `0640` 只适用于 `logrotate` 创建的文件；CubeShim 和 VMM writer 本身仍遵循进程的 umask。
 
 ### `journalctl` 启动期日志
 
@@ -262,16 +330,16 @@ sudo journalctl -u cube-sandbox-cube-api.service -b
 进程跑稳之后的 stdout/stderr 输出非常少，因为各组件都把业务日志直接写到 `/data/log/<Module>/`。如果你想看「最近一小时谁创建了沙箱」，**journalctl 是错的入口**，请去 `/data/log/CubeMaster/cubemaster-req.log` 或 `/data/log/Cubelet/Cubelet-req.log`。
 :::
 
-### cube-proxy 容器内日志
+### cube-proxy 宿主机日志
 
-`cube-proxy` 是基于 OpenResty 的 nginx 容器，访问/错误日志写在容器内的 `/data/log/cube-proxy/`，**不在宿主机文件系统上**，需要 `docker exec` 取：
+`cube-proxy` 是基于 OpenResty 的 nginx 容器。一键部署会将宿主机目录 `/data/log/cube-proxy/` bind mount 到容器内同一路径，容器重启后日志仍然保留，可以直接从宿主机读取：
 
 ```bash
-sudo docker exec cube-proxy tail -200 /data/log/cube-proxy/error.log
-sudo docker exec cube-proxy tail -200 /data/log/cube-proxy/access.log
+sudo tail -200 /data/log/cube-proxy/error.log
+sudo tail -200 /data/log/cube-proxy/access.log
 ```
 
-容器名固定为 `cube-proxy`（由 systemd 用 `docker create` 创建）。
+容器内仍使用同一个 `/data/log/cube-proxy/` 路径，不需要重新构建镜像。
 
 ### 一键打包诊断信息
 
@@ -283,8 +351,8 @@ sudo /usr/local/services/cubetoolbox/scripts/cube-diag/collect-logs.sh
 
 它会把以下内容统一收集到 `cube-diag-<时间戳>/` 目录下：
 
-- `/data/log/CubeMaster|Cubelet|CubeAPI|CubeShim|CubeVmm|network-agent/` 的 tail
-- `cube-proxy` 容器内 `error.log` / `access.log`
+- `/data/log/CubeMaster|Cubelet|CubeAPI|CubeShim|CubeVmm/` 的 tail
+- `/data/log/cube-proxy/` 下的 access/error 日志
 - `dmesg` / 进程列表 / 端口 / 挂载 / cgroup / cpuinfo 等环境快照
 - 主要配置文件（敏感信息已脱敏）
 
@@ -352,7 +420,7 @@ sudo /usr/local/services/cubetoolbox/scripts/cube-diag/collect-logs.sh \
 5. **节点（Cubelet）是否在线、是否收到调度**
 
    ```bash
-   curl http://127.0.0.1:8089/internal/meta/nodes
+   curl http://127.0.0.1:3010/internal/v1/nodes
    sudo tail -F /data/log/Cubelet/Cubelet-req.log
    ```
 
@@ -373,6 +441,7 @@ sudo journalctl -u cube-sandbox-<service>.service -n 200 --no-pager
 
 - 容器镜像构建依赖外网（如 `cube-proxy` 的 `apk update`）暂时不可达 → 检查网络，或参阅[部署相关排障](./troubleshooting/deployment.md)
 - `ExecStartPost` 健康端口超时（端口被占用 / 上游服务还没起来）
+- 对 `cube-sandbox-cube-proxy.service`，`CUBE_PROXY_HTTP_PORT` 与 `CUBE_PROXY_GRPC_PORT` 是 systemd 启动后 TCP 检查所关注的 nginx 监听端口。`CUBE_PROXY_HOST_PORT` 已废弃且会被忽略；如果需要改 HTTP 检查端口，请改 `CUBE_PROXY_HTTP_PORT`。
 - `/data/log` 或 `/data/cubelet` 目录不存在 / 权限不对 / XFS 挂载错位
 
 ### Dashboard / API 无法访问
@@ -411,12 +480,12 @@ sudo ss -lntp 'sport = :3000'
 | `cube-api` | ✅ | — |
 | `webui` | ✅ | — |
 | `cube-proxy` / `coredns` / `dns` | ✅ | — |
-| `network-agent` | ✅ | ✅ |
 | `cubelet` | ✅ | ✅ |
 
 ### 相关文档
 
 - [快速开始](./quickstart.md) — 安装入口
 - [多机集群部署](./multi-node-deploy.md) — 计算节点的服务子集
+- [CubeMaster 调度器配置参考](./cubemaster-scheduler-config.md) — 节点选择、quota、label、评分和 template redo
 - [部署相关排障](./troubleshooting/deployment.md) — XFS / 网段冲突等环境问题
 - [模板相关排障](./troubleshooting/templates.md) — 模板创建相关问题

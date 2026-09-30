@@ -8,8 +8,9 @@ from typing import Any, Dict
 
 import requests
 
-from ._config import Config
+from ._config import Config, _auth_headers
 from ._exceptions import ApiError, AuthenticationError, TemplateNotFoundError
+from ._policy import _validate_allow_out_domains_require_deny_all
 
 
 def _check_response(resp: requests.Response) -> None:
@@ -75,6 +76,7 @@ class TemplateInfo:
     last_error: str = ""
     created_at: str = ""
     image_info: str = ""
+    job_id: str = ""
     public: bool = False
     cpu_count: int = 0
     memory_mb: int = 0
@@ -87,15 +89,17 @@ class TemplateInfo:
     @classmethod
     def from_dict(cls, data: dict) -> "TemplateInfo":
         builds_raw = data.get("builds") or []
+        aliases = data.get("aliases") or []
         return cls(
             template_id=data.get("templateID") or data.get("template_id", ""),
-            name=data.get("name") or data.get("aliases", [None])[0] or "",
+            name=aliases[0] if aliases else "",
             instance_type=data.get("instanceType") or data.get("instance_type", ""),
             version=data.get("version") or "",
             status=data.get("status") or "",
             last_error=data.get("lastError") or data.get("last_error", ""),
             created_at=data.get("createdAt") or data.get("created_at", ""),
             image_info=data.get("imageInfo") or data.get("image_info", ""),
+            job_id=data.get("jobID") or data.get("job_id", ""),
             public=bool(data.get("public", False)),
             cpu_count=data.get("cpuCount") or data.get("cpu_count", 0),
             memory_mb=data.get("memoryMB") or data.get("memory_mb", 0),
@@ -156,7 +160,7 @@ class Template:
         """
         cfg = config or Config()
         s = requests.Session()
-        resp = s.get(f"{cfg.api_url}/templates")
+        resp = s.get(f"{cfg.api_url}/templates", headers=_auth_headers(cfg))
         _check_response(resp)
         data = resp.json() or []
         if isinstance(data, dict):
@@ -196,7 +200,8 @@ class Template:
         if next_token is not None:
             params["nextToken"] = next_token
         s = requests.Session()
-        resp = s.get(f"{cfg.api_url}/templates/{template_id}", params=params)
+        resp = s.get(f"{cfg.api_url}/templates/{template_id}", params=params,
+                     headers=_auth_headers(cfg))
         _check_response(resp)
         return TemplateInfo.from_dict(resp.json())
 
@@ -206,7 +211,7 @@ class Template:
         cls,
         *,
         template_id: str | None = None,  # Deprecated: server always auto-generates template IDs with "tpl-" prefix.
-        name: str | None = None,  # Deprecated alias for template_id.
+        name: str | None = None,  # E2B template name → forwarded as stable alias.
         image: str | None = None,
         dockerfile: str | None = None,
         start_cmd: str | None = None,
@@ -219,6 +224,16 @@ class Template:
         memory_mb: int | None = None,
         envs: Dict[str, str] | None = None,
         allow_internet_access: bool | None = None,
+        network_type: str | None = None,
+        nodes: list[str] | None = None,
+        registry_username: str | None = None,
+        registry_password: str | None = None,
+        command: list[str] | None = None,
+        args: list[str] | None = None,
+        dns: list[str] | None = None,
+        allow_out: list[str] | None = None,
+        deny_out: list[str] | None = None,
+        enable_ivshmem: bool | None = None,
         config: Config | None = None,
         **kwargs: Any,
     ) -> TemplateBuild:
@@ -232,7 +247,9 @@ class Template:
             template_id: Template ID. Deprecated: the server always auto-generates template IDs
                 with the "tpl-" prefix. This parameter is accepted for backward compatibility
                 but its value is ignored.
-            name: Deprecated alias for ``template_id``.
+            name: E2B-compatible template name. Forwarded as ``"name"`` in the request body;
+                CubeAPI derives a stable alias from it so sandboxes can reference the template
+                by this name instead of the auto-generated ``tpl-*`` ID.
             image: Base container image URI (e.g. ``"python:3.11-slim"``).
             dockerfile: Not supported by CubeAPI's current template endpoint.
             start_cmd: Not supported by CubeAPI's current template endpoint.
@@ -245,6 +262,16 @@ class Template:
             memory_mb: Memory limit in MiB for the sandbox.
             envs: Environment variables baked into the template.
             allow_internet_access: Whether sandboxes from this template may access internet.
+            network_type: Network mode for the generated template, e.g. ``"tap"``.
+            nodes: Limit template distribution to these node IDs or host IPs.
+            registry_username: Registry username for private source images.
+            registry_password: Registry password for private source images.
+            command: Override container ENTRYPOINT.
+            args: Override container CMD args.
+            dns: Container DNS nameservers.
+            allow_out: Allowed outbound CIDRs for CubeVS egress policy.
+            deny_out: Denied outbound CIDRs for CubeVS egress policy.
+            enable_ivshmem: Whether the template build sandbox should boot with ivshmem enabled.
             config: SDK config.  Uses default (env-based) config if omitted.
             **kwargs: Extra fields forwarded verbatim to the request body.
 
@@ -261,9 +288,17 @@ class Template:
             raise ValueError("start_cmd is not supported by CubeAPI /templates")
         if not image or not image.strip():
             raise ValueError("image is required")
+        _validate_allow_out_domains_require_deny_all(
+            allow_out,
+            deny_out,
+            default_deny_all=allow_internet_access is False,
+        )
 
         cfg = config or Config()
         payload: dict = {"image": image.strip()}
+        name = name.strip() if name else ""
+        if name:
+            payload["name"] = name
         if instance_type is not None:
             payload["instanceType"] = instance_type
         if writable_layer_size is not None:
@@ -282,13 +317,33 @@ class Template:
             payload["env"] = [f"{key}={value}" for key, value in envs.items()]
         if allow_internet_access is not None:
             payload["allowInternetAccess"] = allow_internet_access
+        if network_type is not None:
+            payload["networkType"] = network_type
+        if nodes is not None:
+            payload["nodes"] = nodes
+        if registry_username is not None:
+            payload["registryUsername"] = registry_username
+        if registry_password is not None:
+            payload["registryPassword"] = registry_password
+        if command is not None:
+            payload["command"] = command
+        if args is not None:
+            payload["args"] = args
+        if dns is not None:
+            payload["dns"] = dns
+        if allow_out is not None:
+            payload["allowOut"] = allow_out
+        if deny_out is not None:
+            payload["denyOut"] = deny_out
+        if enable_ivshmem is not None:
+            payload["enableIvshmem"] = enable_ivshmem
         payload.update(kwargs)
 
         s = requests.Session()
         resp = s.post(
             f"{cfg.api_url}/templates",
             json=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **_auth_headers(cfg)},
         )
         _check_response(resp)
         return TemplateBuild.from_dict(resp.json())
@@ -308,7 +363,7 @@ class Template:
         resp = s.post(
             f"{cfg.api_url}/templates/{template_id}",
             json=extra,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **_auth_headers(cfg)},
         )
         _check_response(resp)
         return TemplateBuild.from_dict(resp.json())
@@ -325,7 +380,8 @@ class Template:
         """GET /templates/:templateID/builds/:buildID/status."""
         cfg = config or Config()
         s = requests.Session()
-        resp = s.get(f"{cfg.api_url}/templates/{template_id}/builds/{build_id}/status")
+        resp = s.get(f"{cfg.api_url}/templates/{template_id}/builds/{build_id}/status",
+                     headers=_auth_headers(cfg))
         _check_response(resp)
         return TemplateBuild.from_dict(resp.json())
 
@@ -341,7 +397,8 @@ class Template:
         """GET /templates/:templateID/builds/:buildID/logs."""
         cfg = config or Config()
         s = requests.Session()
-        resp = s.get(f"{cfg.api_url}/templates/{template_id}/builds/{build_id}/logs")
+        resp = s.get(f"{cfg.api_url}/templates/{template_id}/builds/{build_id}/logs",
+                     headers=_auth_headers(cfg))
         _check_response(resp)
         return resp.json()
 
@@ -390,6 +447,41 @@ class Template:
         """
         cfg = config or Config()
         s = requests.Session()
-        resp = s.delete(f"{cfg.api_url}/templates/{template_id}")
+        resp = s.delete(f"{cfg.api_url}/templates/{template_id}", headers=_auth_headers(cfg))
         _check_response(resp)
 
+
+    @classmethod
+    def set_alias(
+        cls,
+        template_id: str,
+        alias: str | None = None,
+        *,
+        config: Config | None = None,
+    ) -> TemplateInfo:
+        """PUT /templates/:templateID/alias — Set, reassign, or clear the alias of an existing template.
+
+        Args:
+            template_id: Template identifier or current alias.
+            alias: New alias. ``None`` or empty string clears the alias.
+                Validated server-side against ``^[a-z0-9][a-z0-9-]{0,63}$`` with
+                ``tpl-``/``snap-`` prefixes rejected.
+            config: SDK config.  Uses default (env-based) config if omitted.
+
+        Returns:
+            :class:`TemplateInfo` reflecting the post-update state.
+
+        Raises:
+            ApiError: On invalid alias (HTTP 400), template not found (HTTP 404),
+                or concurrent alias conflict (HTTP 409).
+        """
+        cfg = config or Config()
+        payload = {"alias": alias or ""}
+        s = requests.Session()
+        resp = s.put(
+            f"{cfg.api_url}/templates/{template_id}/alias",
+            json=payload,
+            headers={"Content-Type": "application/json", **_auth_headers(cfg)},
+        )
+        _check_response(resp)
+        return TemplateInfo.from_dict(resp.json())

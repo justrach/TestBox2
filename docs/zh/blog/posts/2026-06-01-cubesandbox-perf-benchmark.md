@@ -95,7 +95,7 @@ cubemastercli tpl list
 ```bash
 pip install e2b-code-interpreter
 
-export CUBE_API_URL=http://<your-server-ip>:3000
+export E2B_API_URL=http://<your-server-ip>:3000
 export E2B_API_KEY=e2b_000000           # 本地部署填任意非空字符串
 export CUBE_TEMPLATE_ID=<your-template-id>  # 上一步 cubemastercli tpl list 查到的 ID
 export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem  # mkcert 证书路径
@@ -245,7 +245,7 @@ free -h
 
 **调大 tap 预建池的操作步骤：**
 
-tap 池目标数由 cubelet 配置中的 `tap_init_num` 指定（默认 **500**），但该参数实际由 **network-agent**（启动时带 `--cubelet-config` 读取同一份 cubelet 配置）消费、预建 tap 设备，因此修改后需重启 **network-agent**（而非 cubelet）使其生效。目标密度需在该值以内——例如要压测到 1000 个沙箱，需先将 `tap_init_num` 调到 1000（或更高）。
+tap 池目标数由 cubelet 配置中的 `tap_init_num` 指定（默认 **500**），该参数现在由 **cubelet 内置 network runtime** 消费并预建 tap 设备，因此修改后需重启 **cubelet** 使其生效。目标密度需在该值以内——例如要压测到 1000 个沙箱，需先将 `tap_init_num` 调到 1000（或更高）。
 
 ```bash
 # 1. 编辑 cubelet 配置，调大 [plugins."io.cubelet.internal.v1.network"] 段下的 tap_init_num
@@ -253,8 +253,8 @@ vi /usr/local/services/cubetoolbox/Cubelet/config/config.toml
 #   [plugins."io.cubelet.internal.v1.network"]
 #     tap_init_num = 1000        # 默认 500；压测 1000 需调到 1000 以上
 
-# 2. 重启 network-agent，使其按新目标重新预建 tap 池
-systemctl restart cube-sandbox-network-agent.service
+# 2. 重启 cubelet，使内置 network runtime 按新目标重新预建 tap 池
+systemctl restart cube-sandbox-cubelet.service
 ```
 
 **单机可运行实例数估算（BMI5，375 GiB 内存）：**
@@ -278,10 +278,10 @@ cd examples/snapshot-rollback-clone
 pip install -r requirements.txt   # 安装 cubesandbox SDK
 
 # 以下环境变量为所有 4.x 压测脚本的前置，每个新 shell 都需先 export（或写入 env.sh 后 source）
-export E2B_API_URL=http://<your-server-ip>:3000
-export CUBE_API_URL=http://<your-server-ip>:3000   # 与 E2B_API_URL 保持一致
-export E2B_API_KEY=e2b_000000                       # 本地部署填任意非空字符串
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>          # cubemastercli tpl list 查到的 ID
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>       # 在 CubeProxy 本机运行时可写 127.0.0.1
+export CUBE_PROXY_PORT_HTTP=80                      # CubeProxy 监听端口, 默认 80
 ```
 
 > 下文 4.1~4.5 各节命令块默认你已在当前 shell 完成上述 `export`（脚本通过 `env.py` 读取这些变量）。换新终端窗口请重新 export。
@@ -297,9 +297,10 @@ export CUBE_TEMPLATE_ID=<your-template-id>          # cubemastercli tpl list 查
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单档机制，并发档位在命令行控制；逐档串行调用：
 python bench_snapshot_concurrency.py -c 1  -n 5
@@ -328,9 +329,10 @@ python bench_snapshot_concurrency.py -c 10 -n 5 --no-header
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单档机制，脏页大小在命令行控制（-d 即写入量 MB）；按需逐档调用：
 python bench_snapshot_dirty.py -d 0    -n 3
@@ -371,9 +373,10 @@ python bench_snapshot_dirty.py -d 1024 -n 3 --no-header
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单档机制，档位在命令行控制；按需逐档调用：
 python bench_create_concurrency.py -c 1  -n 3
@@ -404,9 +407,10 @@ python bench_create_concurrency.py -c 50 -n 3 --no-header
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单档机制，档位在命令行控制；按需逐档调用：
 python bench_rollback_concurrency.py -c 1  -n 5
@@ -437,9 +441,10 @@ python bench_rollback_concurrency.py -c 10 -n 5 --no-header
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单场景机制，n/并发/轮数在命令行控制；按需逐场景调用：
 python bench_clone_concurrency.py -n 1   -c 1  --rounds 5
@@ -472,9 +477,10 @@ Clone（含完整内存 + 文件系统状态）单次约 **220 ms**；100 个沙
 ```bash
 cd examples/snapshot-rollback-clone
 # 若是新开的终端，先设置环境变量（同 4.0 安装依赖一节）：
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # 脚本只提供单档机制，档位在命令行控制；按需逐档调用：
 python bench_pause_resume_concurrency.py -c 1  -n 5

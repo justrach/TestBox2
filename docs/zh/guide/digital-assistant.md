@@ -10,7 +10,7 @@
 
 AgentHub 会基于 CubeSandbox 模板创建数字助手。部署前需要先制作数字助手模板（见下方命令），然后将自动生成的 `tpl-` 前缀模板 ID 写入 `.env`：
 
-```env
+```bash
 AGENTHUB_DS_OPENCLAW_TEMPLATE=<your-digital-assistant-template-id>
 ```
 
@@ -61,57 +61,36 @@ curl -fsS http://127.0.0.1:18789/ >/dev/null
 
 ### AgentHub 数据库
 
-CubeAPI 使用 MySQL 保存数字助手的元数据，包括助手实例、存档、模板和操作流水。配置方式如下：
+CubeOps 使用 MySQL 保存数字助手的元数据，包括助手实例、存档、模板和操作流水。配置方式如下：
 
 ```bash
 DATABASE_URL=mysql://cube:cube_pass@127.0.0.1:3306/cube_mvp
 ```
 
-如果 `DATABASE_URL` 未设置，CubeAPI 也会读取：
+在 one-click 部署中，如果没有显式设置 `DATABASE_URL`，启动脚本会直接导出 `CUBE_SANDBOX_MYSQL_*` 字段，由 CubeOps 直接映射为数据库配置。
 
-```bash
-CUBE_API_DATABASE_URL=mysql://cube:cube_pass@127.0.0.1:3306/cube_mvp
-```
+### LLM API Key
 
-在 one-click 部署中，如果没有显式设置 `DATABASE_URL`，启动脚本会根据 `CUBE_SANDBOX_MYSQL_HOST`、`CUBE_SANDBOX_MYSQL_PORT`、`CUBE_SANDBOX_MYSQL_USER`、`CUBE_SANDBOX_MYSQL_PASSWORD`、`CUBE_SANDBOX_MYSQL_DB` 自动拼接。
+创建数字助手前，请在 WebUI 的 **AgentHub 设置** 中填写 LLM API Key（以及 provider、Base URL、模型）。
 
-### DeepSeek API Key
+未配置时无法创建或重新配置助手，页面会提示先完成设置。
 
-创建或重新配置 OpenClaw 数字助手时，CubeAPI 需要 DeepSeek API Key。读取优先级为：
+配置完成后，CubeAPI 会自动把 key 注入 sandbox 内的 OpenClaw，并写入相关配置文件（如 `auth-profiles.json`），用于连接 LLM 服务。
 
-```bash
-AGENTHUB_DEEPSEEK_API_KEY=sk-...
-# fallback:
-OPENCLAW_DEEPSEEK_API_KEY=sk-...
-```
+### 凭证交付方式与模型命名空间
 
-CubeAPI 会把读取到的 key 通过 envd 命令注入 sandbox，环境变量名为：
+凭证交付支持两种方式：
 
-```bash
-OPENCLAW_DEEPSEEK_API_KEY
-```
+- **凭证托管（推荐）**：托管的只是 **API Key**。出站请求由 CubeEgress 仅对配置的 LLM Base URL 注入 `Authorization` 头，真实 Key 不进入沙箱，OpenClaw 配置里只保存一个占位 Key。
+- **环境变量注入（兼容旧版）**：把真实 API Key 直接写入 OpenClaw 环境与配置，仅建议在未启用 CubeEgress 的环境使用。
 
-sandbox 内的 OpenClaw 装配脚本会把该 key 写入：
-
-```text
-/root/.openclaw/agents/main/agent/auth-profiles.json
-```
-
-同时会更新：
-
-```text
-/root/.openclaw/openclaw.json
-/root/.openclaw/agents/main/agent/models.json
-```
-
-用于配置 DeepSeek provider 和默认模型。
+无论哪种方式，模型 ID 注入 OpenClaw 时都会归一化为 `{Provider}/{模型ID}` 的命名空间：`{Provider}` 取自 AgentHub 设置中的 Provider，斜杠后的部分作为真实模型名发往上游。使用**自定义上游**时，请确保 Provider 与模型 ID 与上游一致，否则 OpenClaw 可能报 `Unknown model`。例如 Provider 为 `openai-compatible`、模型为 `deepseek-v4-flash` 时，OpenClaw 内部解析为 `openai-compatible/deepseek-v4-flash`，上游收到的模型名为 `deepseek-v4-flash`。
 
 ## 模板快路径
 
-如果从已发布的助手模板创建新助手，并且不需要重新绑定企业微信，CubeAPI 会使用模板快路径：新 sandbox 直接沿用模板快照里已有的 OpenClaw 配置，不会重新注入 DeepSeek API Key。
+如果从已发布的助手模板创建新助手，并且不需要重新绑定企业微信，CubeAPI 会使用模板快路径：新 sandbox 直接沿用模板快照里已有的 OpenClaw 配置，不会重新注入 LLM API Key。
 
 ## 安全建议
 
-- 不要把真实 API Key 提交到 Git 仓库。
-- 在 one-click 部署中，将 key 写入目标机的 `.env`。
-- 在其他部署系统中，建议通过 Secret 或受控环境变量注入。
+- 请妥善保管 LLM API Key，不要提交到 Git 仓库。
+- 请妥善保护数据库备份与访问权限（Key 保存在数据库中）。

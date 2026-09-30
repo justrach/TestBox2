@@ -1,12 +1,13 @@
--- file name: path_rewrite_phase.lua
---
 -- Path-based sandbox routing. Accepts URIs shaped as:
 --     /sandbox/<sandbox-id>/<container-port>(/<rest>)?
 -- and rewrites the upstream URI to "/<rest>" (preserving the query string),
 -- then resolves the same Redis-backed backend metadata used by host-mode
 -- routing in rewrite_phase.lua.
 
+local utils = require "utils"
 local sb = require "sandbox_backend"
+local state = require "sandbox_state"
+local request_host = require "request_host"
 
 local uri = ngx.var.uri or ""
 local ins_id, container_port, rest = uri:match("^/sandbox/([%w_%-]+)/(%d+)(/?.*)$")
@@ -14,8 +15,7 @@ if not ins_id or not container_port then
     ngx.log(ngx.ERR, "LEVEL_WARN||",
         string.format("request %s invalid path for sandbox/<id>/<port> parse: %s",
             ngx.var.http_x_cube_request_id, uri))
-    ngx.var.cube_retcode = "310400"
-    ngx.exit(400)
+    utils:respond_bad_request()
 end
 
 if rest == nil or rest == "" then
@@ -34,8 +34,11 @@ ngx.var.container_port = container_port
 -- continue to run as configured.
 ngx.req.set_uri(rest, false)
 
-local host_ip, host_port = sb.resolve_backend(ins_id, container_port)
+-- Auto-pause gate: if the sandbox is currently paused, ask CLM to resume it
+-- before we attempt backend resolution. No-op when the sandbox isn't tracked.
+state.gate(ins_id)
+
+local host_ip, host_port, mask_request_host = sb.resolve_backend(ins_id, container_port)
 ngx.var.backend_ip = host_ip
 ngx.var.backend_port = host_port
-
-sb.assert_backend_healthy(host_ip, ins_id)
+request_host.apply(mask_request_host, container_port)

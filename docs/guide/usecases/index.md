@@ -49,3 +49,12 @@ lang: en-US
 | Title | Author     | Date | Tags |
 | --- |------------| --- | --- |
 | [trpc-agent-go: A Secure Code Execution Backend Powered by Cube Sandbox](./trpc-agent-go.md) | joeyczheng | 2026-06-03 | agent, code-execution, e2b, golang |
+| [Lexmount AI: Putting the Browser Runtime Inside the Agent Sandbox](./lexmount-browser-agent.md) | Xiong Xiuzhang | 2026-08-13 | agent, browser, browser-runtime, production |
+| [Hermes Agent: Running a Resident Agent Platform in CubeSandbox](./hermes-agent.md) | Chen Jinbo | 2026-08-20 | agent, persistence, skills, host-mount |
+| [Lenovo Cloud Agent: Sandbox Migration from Daytona to CubeSandbox](./lenovo-cloud-agent.md) | Li Jian | 2026-08-20 | agent, migration, daytona, e2b-compat |
+| [Horizon Insights: Sandboxing Financial Research Agents](./horizon-insights.md) | Wang Zhengkai | 2026-08-26 | agent, financial, host-mount, cubeegress |
+| [unisound: Stress-Testing Density Limits for RL Rollout](./unisound-rl-rollout.md) | Unisound Atlas Intelligent Computing Team | 2026-09-01 | agent, rl, rollout, density |
+| [Guangdong Rising: Building a Multi-Tenant Sandbox Platform](./guangdong-rising.md) | Feng Jiaqi | 2026-09-03 | agent, multi-tenant, sandbox-platform, lifecycle |
+| [WeKnora: A Persistent Agent Runtime on CubeSandbox](./weknora.md) | Chen Yang, Zhao Hailong | 2026-09-17 | agent, snapshot, session-persistence, e2b-compat |
+| [Huajiao: Sandbox as an Option, Not a Default — Agent Platform Practice](./huajiao.md) | Wang Chenglong, Feng Bingqing | 2026-09-17 | agent, host-mount, go-sdk, execution-environment |
+| [openFuyao: Running CubeSandbox on Kubernetes](./openfuyao.md) | Wang Wentao, Li Aihua | 2026-09-17 | kubernetes, deployment, ebpf, production |

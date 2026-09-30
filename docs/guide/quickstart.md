@@ -6,8 +6,12 @@ The steps below guide you through provisioning a cloud server, enabling KVM via 
 
 ⚠️ Follow this guide step by step — you can be up and running with Cube Sandbox in just a few minutes!
 
+::: warning Production Use
+If you plan to use Cube Sandbox in a production environment, please refer to the [Network Hardening](./network-hardening.md) guide to secure your deployment before exposing services to untrusted networks.
+:::
+
 ::: tip Already have a server with KVM enabled?
-If you already have an x86_64 Linux server with KVM enabled (bare-metal or physical machine), skip to [Bare-Metal Deployment](./bare-metal-deploy.md) to install directly without PVM.
+If you already have an x86_64 or aarch64 (ARM64) Linux server with KVM enabled (bare-metal or physical machine), skip to [Bare-Metal Deployment](./bare-metal-deploy.md) to install directly without PVM.
 :::
 
 ## Prerequisites
@@ -15,6 +19,12 @@ If you already have an x86_64 Linux server with KVM enabled (bare-metal or physi
 - **x86_64** cloud server (any standard cloud VM works — `/dev/kvm` not required)
 - **Root access**
 - Internet access (for downloading release packages and Docker images)
+
+::: warning ARM64 (aarch64) hosts
+This Quick Start uses **PVM** to enable KVM on standard cloud VMs, and the PVM host kernel is **x86_64-only** (release attachments are `*.x86_64.rpm` / `*_amd64.deb`). PVM does **not** support ARM64.
+
+On **aarch64 (ARM64)**, use a machine that already exposes native KVM (a physical/bare-metal ARM64 server) and follow [Bare-Metal Deployment](./bare-metal-deploy.md) or [Self-Build Deployment](./self-build-deploy.md) instead — both support aarch64.
+:::
 
 ### 🖥 Supported Systems
 
@@ -58,18 +68,22 @@ sudo su root
 
 ### Install the PVM Host Kernel
 
-Go to the [CubeSandbox GitHub Releases](https://github.com/TencentCloud/CubeSandbox/releases) page, open the latest release that includes PVM kernel attachments, **right-click the matching attachment → Copy Link Address**, then download with `wget`.
+#### Download the kernel package
 
-Choose the format for your Linux distribution:
+The PVM host kernel package is published on dedicated `kernel-release-*` Releases — download the latest main package from the release page:
+
+1. Open the [GitHub Releases page](https://github.com/TencentCloud/CubeSandbox/releases?q=kernel-release-&expanded=true) (or the [CNB mirror](https://cnb.cool/CubeSandbox/CubeSandbox/-/releases) for mainland China — filter by `kernel-release` there), and open the newest `kernel-release-*` release
+2. Download the **main package** for your distribution:
+   - RPM-based: `kernel-*opencloudos9.cubesandbox.pvm.host*.x86_64.rpm`
+   - DEB-based: `linux-image-*opencloudos9.cubesandbox.pvm.host*_amd64.deb`
+
+<small>Optional assets like `kernel-headers-*` and `-dbg` are not needed.</small>
 
 #### RPM-based (OpenCloudOS, RHEL, CentOS, TencentOS, Fedora)
 
-Go to the [Releases page](https://github.com/TencentCloud/CubeSandbox/releases), find `kernel-*cube.pvm.host*.x86_64.rpm`, right-click and copy the download link:
+Install the downloaded package:
 
 ```bash
-# Replace the URL below with the actual download link you copied from the Releases page
-wget "<kernel rpm download link>"
-
 # Use --oldpackage if the host already has a newer kernel version
 rpm -ivh --oldpackage kernel-*.rpm
 ```
@@ -95,13 +109,10 @@ curl -sL https://github.com/tencentcloud/CubeSandbox/raw/master/deploy/pvm/grub/
 
 #### DEB-based (Ubuntu, Debian)
 
-Go to the [Releases page](https://github.com/TencentCloud/CubeSandbox/releases), find `linux-image-*cube.pvm.host*_amd64.deb`, right-click and copy the download link:
+Install the downloaded package:
 
 ```bash
-# Replace the URL below with the actual download link you copied from the Releases page
-wget "<linux-image deb download link>"
-
-dpkg -i linux-image-*cube.pvm.host*.deb
+dpkg -i linux-image-*opencloudos9.cubesandbox.pvm.host*.deb
 ```
 
 Set the PVM kernel as the default boot entry:
@@ -111,7 +122,7 @@ Set the PVM kernel as the default boot entry:
 ls /boot/vmlinuz-*
 
 # Point GRUB default to the PVM kernel (replace with the actual version string from above)
-KVER="$(ls /boot/vmlinuz-*cube.pvm.host* | sed 's|/boot/vmlinuz-||' | tail -1)"
+KVER="$(ls /boot/vmlinuz-*opencloudos9.cubesandbox.pvm.host* | sed 's|/boot/vmlinuz-||' | tail -1)"
 sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"Advanced options for Ubuntu>Ubuntu, with Linux ${KVER}\"|" \
   /etc/default/grub
 ```
@@ -133,7 +144,7 @@ After rebooting, confirm you're running the PVM kernel and the KVM module is loa
 ```bash
 # Verify kernel version
 uname -r
-# Expected output contains: cube.pvm.host
+# Expected output contains: opencloudos9.cubesandbox.pvm.host
 
 # Load the PVM KVM module
 modprobe kvm_pvm
@@ -180,7 +191,7 @@ curl -sL https://github.com/tencentcloud/CubeSandbox/raw/master/deploy/one-click
 
 ::: details What gets installed
 - E2B-compatible REST API listening on port `3000`
-- CubeMaster, Cubelet, network-agent, CubeShim running as host processes
+- CubeMaster, Cubelet with embedded network runtime, and CubeShim running as host processes
 - MySQL and Redis managed via Docker Compose
 - CubeProxy providing TLS (mkcert) and CoreDNS domain routing (`cube.app`)
 :::
@@ -200,6 +211,10 @@ cubemastercli tpl create-from-image \
 
 > **Registry note:** Use `cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-code:latest` (recommended for international access). If you are in mainland China, use `cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-code:latest` instead.
 
+::: warning Multi-Arch image availability
+Currently only `sandbox-code:latest` is published as a **Multi-Arch** image (supporting both x86_64 and aarch64/ARM64). The other official Cube images hosted on `tencentcloudcr.com` are still being updated for Multi-Arch and may not yet run on your architecture. If you need an image for an architecture that isn't covered yet, build your own custom Multi-Arch image by combining [Creating Templates from OCI Images](./tutorials/template-from-image.md) with Docker's [Multi-platform builds](https://docs.docker.com/build/building/multi-platform/).
+:::
+
 Then monitor the build progress:
 
 ```bash
@@ -218,9 +233,16 @@ For the full template creation workflow and more options, see [Creating Template
 
 Install the Python SDK:
 
-```bash
+::: code-group
+```bash [yum (RPM)]
 yum install -y python3 python3-pip
+```
+```bash [apt (DEB)]
+apt update && apt install -y python3 python3-pip
+```
+:::
 
+```bash
 pip install e2b-code-interpreter
 ```
 

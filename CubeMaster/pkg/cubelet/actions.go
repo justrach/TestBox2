@@ -11,24 +11,35 @@ import (
 	"strings"
 	"time"
 
-	cubebox "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
-	imagesv1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/images/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/ret"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet/grpcconn"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
+	cubebox "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	imagesv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/images/v1"
+	snapshotv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/snapshot/v1"
 )
 
 func Destroy(ctx context.Context, calleeEp string,
 	req *cubebox.DestroyCubeSandboxRequest) (*cubebox.DestroyCubeSandboxResponse, error) {
+	return DestroyWithTimeout(ctx, calleeEp, req,
+		time.Duration(config.GetConfig().CubeletConf.CommonTimeoutInsec)*time.Second)
+}
+
+// DestroyWithTimeout is Destroy with an explicit RPC deadline. Pause post-
+// snapshot cleanup uses a longer budget under concurrent load.
+func DestroyWithTimeout(ctx context.Context, calleeEp string,
+	req *cubebox.DestroyCubeSandboxRequest, timeout time.Duration) (*cubebox.DestroyCubeSandboxResponse, error) {
 	conn, err := grpcconn.GetWorkerConn(ctx, calleeEp)
 	if err != nil {
 		return nil, ret.Err(errorcode.ErrorCode_ConnHostFailed, err.Error())
 	}
 	defer conn.Close()
 	c := cubebox.NewCubeboxMgrClient(conn.Value())
-	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(config.GetConfig().CubeletConf.CommonTimeoutInsec)*time.Second)
+	if timeout <= 0 {
+		timeout = time.Duration(config.GetConfig().CubeletConf.CommonTimeoutInsec) * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return c.Destroy(ctx, req)
 }
@@ -47,13 +58,22 @@ func Create(ctx context.Context, calleeEp string,
 
 func AppSnapshot(ctx context.Context, calleeEp string,
 	req *cubebox.AppSnapshotRequest) (*cubebox.AppSnapshotResponse, error) {
-	conn, err := grpcconn.GetWorkerConn(ctx, calleeEp)
+
+	rpcCtx, cancel := appSnapshotContext(ctx,
+		config.GetConfig().CubeletConf.AppSnapshotTimeoutInSec)
+	defer cancel()
+
+	conn, err := grpcconn.GetWorkerConn(rpcCtx, calleeEp)
 	if err != nil {
 		return nil, ret.Err(errorcode.ErrorCode_ConnHostFailed, err.Error())
 	}
 	defer conn.Close()
 	c := cubebox.NewCubeboxMgrClient(conn.Value())
-	return c.AppSnapshot(ctx, req)
+	return c.AppSnapshot(rpcCtx, req)
+}
+
+func appSnapshotContext(ctx context.Context, timeoutInSec int) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, time.Duration(timeoutInSec)*time.Second)
 }
 
 func CommitSandbox(ctx context.Context, calleeEp string,
@@ -122,6 +142,19 @@ func GetLocalSnapshot(ctx context.Context, calleeEp string,
 	return c.GetLocalSnapshot(ctx, req)
 }
 
+// SnapshotStatus is Cubelet's upload query. CubeMaster calls this from the
+// background inprogress reconciler, not on the Pause／Commit hot path.
+func SnapshotStatus(ctx context.Context, calleeEp string,
+	req *snapshotv1.StatusRequest) (*snapshotv1.StatusResponse, error) {
+	conn, err := grpcconn.GetWorkerConn(ctx, calleeEp)
+	if err != nil {
+		return nil, ret.Err(errorcode.ErrorCode_ConnHostFailed, err.Error())
+	}
+	defer conn.Close()
+	c := snapshotv1.NewSnapshotClient(conn.Value())
+	return c.Status(ctx, req)
+}
+
 func GetStorageMetrics(ctx context.Context, calleeEp string,
 	req *cubebox.GetStorageMetricsRequest) (*cubebox.GetStorageMetricsResponse, error) {
 	conn, err := grpcconn.GetWorkerConn(ctx, calleeEp)
@@ -183,14 +216,25 @@ func GetCubeletAddr(hostIP string) string {
 
 func Update(ctx context.Context, calleeEp string,
 	req *cubebox.UpdateCubeSandboxRequest) (*cubebox.UpdateCubeSandboxResponse, error) {
+	return UpdateWithTimeout(ctx, calleeEp, req,
+		time.Duration(config.GetConfig().CubeletConf.CommonTimeoutInsec)*time.Second)
+}
+
+// UpdateWithTimeout is Update with an explicit RPC deadline. Pause uses a longer
+// budget so Master waits for Cubelet; on expiry Master must not abort/cleanup
+// in-flight Cubelet work.
+func UpdateWithTimeout(ctx context.Context, calleeEp string,
+	req *cubebox.UpdateCubeSandboxRequest, timeout time.Duration) (*cubebox.UpdateCubeSandboxResponse, error) {
 	conn, err := grpcconn.GetWorkerConn(ctx, calleeEp)
 	if err != nil {
 		return nil, ret.Err(errorcode.ErrorCode_ConnHostFailed, err.Error())
 	}
 	defer conn.Close()
 	c := cubebox.NewCubeboxMgrClient(conn.Value())
-	ctx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(config.GetConfig().CubeletConf.CommonTimeoutInsec)*time.Second)
+	if timeout <= 0 {
+		timeout = time.Duration(config.GetConfig().CubeletConf.CommonTimeoutInsec) * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return c.Update(ctx, req)
 }

@@ -5,13 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_DIR}/common.sh"
 
-TOOLBOX_ROOT="${ONE_CLICK_TOOLBOX_ROOT:-/usr/local/services/cubetoolbox}"
-
-NETWORK_AGENT_BIN="${TOOLBOX_ROOT}/network-agent/bin/network-agent"
-NETWORK_AGENT_CFG="${TOOLBOX_ROOT}/network-agent/network-agent.yaml"
-NETWORK_AGENT_STATE_DIR="${TOOLBOX_ROOT}/network-agent/state"
-NETWORK_AGENT_HEALTH_ADDR="${NETWORK_AGENT_HEALTH_ADDR:-127.0.0.1:19090}"
-NETWORK_AGENT_READY_TIMEOUT="${NETWORK_AGENT_READY_TIMEOUT:-120}"
 CUBE_API_BIN="${TOOLBOX_ROOT}/CubeAPI/bin/cube-api"
 CUBE_API_LOG_DIR="${CUBE_API_LOG_DIR:-/data/log/CubeAPI}"
 CUBE_API_HEALTH_ADDR="${CUBE_API_HEALTH_ADDR:-127.0.0.1:3000}"
@@ -29,17 +22,15 @@ CUBELET_OPTIONAL_EXPORTS=""
 require_cmd bash
 require_cmd curl
 
-test -x "${NETWORK_AGENT_BIN}" || die "network-agent binary missing: ${NETWORK_AGENT_BIN}"
 test -x "${CUBE_API_BIN}" || die "cube-api binary missing: ${CUBE_API_BIN}"
 test -x "${CUBEMASTER_BIN}" || die "cubemaster binary missing: ${CUBEMASTER_BIN}"
 test -x "${CUBELET_BIN}" || die "cubelet binary missing: ${CUBELET_BIN}"
-test -f "${NETWORK_AGENT_CFG}" || die "network-agent config missing: ${NETWORK_AGENT_CFG}"
 test -f "${CUBEMASTER_CFG}" || die "cubemaster config missing: ${CUBEMASTER_CFG}"
 test -f "${CUBELET_CONFIG}" || die "cubelet config missing: ${CUBELET_CONFIG}"
 test -f "${CUBELET_DYNAMICCONF}" || die "cubelet dynamic config missing: ${CUBELET_DYNAMICCONF}"
 validate_cubelet_cow_startup_deps "${CUBELET_CONFIG}"
 
-mkdir -p "${NETWORK_AGENT_STATE_DIR}" "${CUBE_API_LOG_DIR}" /tmp/cube
+mkdir -p "${CUBE_API_LOG_DIR}" /tmp/cube
 
 CUBEMASTER_ARTIFACT_STORE_EXPORT=""
 if [[ -n "${CUBEMASTER_ROOTFS_ARTIFACT_STORE_DIR_CONFIGURED}" ]]; then
@@ -60,12 +51,15 @@ fi
 if [[ -n "${DATABASE_URL:-}" ]]; then
   CUBE_API_OPTIONAL_EXPORTS+="export DATABASE_URL=\"${DATABASE_URL}\"; "
 else
-  mysql_host="${CUBE_SANDBOX_MYSQL_HOST:-127.0.0.1}"
-  mysql_port="${CUBE_SANDBOX_MYSQL_PORT:-3306}"
-  mysql_user="${CUBE_SANDBOX_MYSQL_USER:-cube}"
-  mysql_password="${CUBE_SANDBOX_MYSQL_PASSWORD:-cube_pass}"
-  mysql_db="${CUBE_SANDBOX_MYSQL_DB:-cube_mvp}"
-  CUBE_API_OPTIONAL_EXPORTS+="export DATABASE_URL=\"mysql://${mysql_user}:${mysql_password}@${mysql_host}:${mysql_port}/${mysql_db}\"; "
+  # No URL: export the split fields instead of building one, so
+  # URL-reserved characters in the password survive intact. Defaults match
+  # the bundled one-click MySQL.
+  # CubeAPI currently ignores these; cubeops-start.sh is the consumer.
+  CUBE_API_OPTIONAL_EXPORTS+="export CUBE_SANDBOX_MYSQL_HOST=\"${CUBE_SANDBOX_MYSQL_HOST:-127.0.0.1}\"; "
+  CUBE_API_OPTIONAL_EXPORTS+="export CUBE_SANDBOX_MYSQL_PORT=\"${CUBE_SANDBOX_MYSQL_PORT:-3306}\"; "
+  CUBE_API_OPTIONAL_EXPORTS+="export CUBE_SANDBOX_MYSQL_USER=\"${CUBE_SANDBOX_MYSQL_USER:-cube}\"; "
+  CUBE_API_OPTIONAL_EXPORTS+="export CUBE_SANDBOX_MYSQL_PASSWORD=\"${CUBE_SANDBOX_MYSQL_PASSWORD:-cube_pass}\"; "
+  CUBE_API_OPTIONAL_EXPORTS+="export CUBE_SANDBOX_MYSQL_DB=\"${CUBE_SANDBOX_MYSQL_DB:-cube_mvp}\"; "
 fi
 if [[ -n "${CUBE_SANDBOX_NODE_IP:-}" ]]; then
   CUBELET_OPTIONAL_EXPORTS+="export CUBE_SANDBOX_NODE_IP=\"${CUBE_SANDBOX_NODE_IP}\"; "
@@ -73,11 +67,7 @@ fi
 
 "${SCRIPT_DIR}/down-local.sh" >/dev/null 2>&1 || true
 
-start_with_pidfile \
-  "network-agent" \
-  "mkdir -p /tmp/cube \"${NETWORK_AGENT_STATE_DIR}\" && \"${NETWORK_AGENT_BIN}\" --cubelet-config \"${CUBELET_CONFIG}\" --state-dir \"${NETWORK_AGENT_STATE_DIR}\""
 
-wait_for_http "http://${NETWORK_AGENT_HEALTH_ADDR}/readyz" "${NETWORK_AGENT_READY_TIMEOUT}" 1 || die "network-agent did not become ready, check logs under ${LOG_DIR}"
 
 start_with_pidfile \
   "cubemaster" \
@@ -92,15 +82,17 @@ start_with_pidfile \
   "${CUBELET_OPTIONAL_EXPORTS}\"${CUBELET_BIN}\" --config \"${CUBELET_CONFIG}\" --dynamic-conf-path \"${CUBELET_DYNAMICCONF}\""
 refresh_pidfile_from_pattern "cubelet" "^${CUBELET_BIN} --config" 10 1 || log "cubelet pidfile refresh skipped"
 
+"${SCRIPT_DIR}/up-cube-egress.sh"
+
 wait_for_http "http://${CUBE_API_HEALTH_ADDR}/health" 30 1 || die "cube-api did not become ready, check logs under ${LOG_DIR}"
 
-for _ in {1..30}; do
-  if "${SCRIPT_DIR}/quickcheck.sh" >/dev/null 2>&1; then
-    "${SCRIPT_DIR}/quickcheck.sh"
-    log "core services ready"
-    exit 0
-  fi
-  sleep 2
-done
+# quickcheck.sh now waits for each runtime signal to become ready within a single
+# shared budget (CUBE_QUICKCHECK_READY_TIMEOUT), so a single invocation is
+# already race-tolerant. Do NOT wrap it in an outer retry loop: that would
+# multiply quickcheck's budget on a genuinely broken node.
+if "${SCRIPT_DIR}/quickcheck.sh"; then
+  log "core services ready"
+  exit 0
+fi
 
 die "core services did not become ready, check logs under ${LOG_DIR}"

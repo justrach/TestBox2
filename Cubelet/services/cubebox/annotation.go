@@ -14,8 +14,6 @@ import (
 	"github.com/containerd/containerd/v2/pkg/oci"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	cubeconfig "github.com/tencentcloud/CubeSandbox/Cubelet/internal/cube/config"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/disk"
@@ -27,6 +25,8 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/cgroup"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 func (l *local) genRuntimeCfgAnnotationOpt(ctx context.Context, ociRuntime *cubeconfig.Runtime,
@@ -48,10 +48,10 @@ func (l *local) genRuntimeCfgAnnotationOpt(ctx context.Context, ociRuntime *cube
 	}
 	runtimeAnno[constants.AnnotationsRuntimeCfgPath] = cfgPath
 
-	if path, ok := realReq.GetAnnotations()[constants.AnnotationsVMImagePath]; ok {
+	if path, ok := realReq.GetAnnotations()[constants.AnnotationsVMOSImagePath]; ok {
 		ok, _ := utils.DenExist(path)
 		if ok {
-			runtimeAnno[constants.AnnotationsVMImagePath] = path
+			runtimeAnno[constants.AnnotationsVMOSImagePath] = path
 		}
 	}
 
@@ -59,6 +59,13 @@ func (l *local) genRuntimeCfgAnnotationOpt(ctx context.Context, ociRuntime *cube
 		ok, _ := utils.DenExist(path)
 		if ok {
 			runtimeAnno[constants.AnnotationsVMKernelPath] = path
+		}
+	}
+
+	if path, ok := realReq.GetAnnotations()[constants.AnnotationsVMAgentPath]; ok {
+		ok, _ := utils.DenExist(path)
+		if ok {
+			runtimeAnno[constants.AnnotationsVMAgentPath] = path
 		}
 	}
 	return append(tmpSpecs, oci.WithAnnotations(runtimeAnno))

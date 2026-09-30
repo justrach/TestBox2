@@ -12,14 +12,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/go-sql-driver/mysql"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/nodemeta"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/common"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 var (
@@ -31,6 +34,10 @@ var (
 	rollbackSnapshotFn     = templatecenter.RollbackSandboxToSnapshot
 	getSnapshotOperationFn = templatecenter.GetSnapshotOperation
 	resolveSnapshotHostFn  = resolveSandboxHost
+	restoreCompatFn        = templatecenter.EvaluateSnapshotRestoreCompat
+
+	listCompatibleNodesForSnapshotFn = templatecenter.ListCompatibleNodesForSnapshot
+	listCompatibleNodesForFactorsFn  = templatecenter.ListCompatibleNodesForFactors
 )
 
 const snapshotResponseWriteDeadlineBuffer = 30 * time.Second
@@ -44,6 +51,7 @@ type snapshotCreateRequest struct {
 	LegacyRequestID string `json:"requestID,omitempty"`
 	SandboxID       string `json:"sandbox_id,omitempty"`
 	DisplayName     string `json:"display_name,omitempty"`
+	Backend         string `json:"backend,omitempty"`
 }
 
 type snapshotRollbackRequest struct {
@@ -52,12 +60,14 @@ type snapshotRollbackRequest struct {
 	SandboxID       string `json:"sandbox_id,omitempty"`
 	SnapshotID      string `json:"snapshot_id,omitempty"`
 	InstanceType    string `json:"instance_type,omitempty"`
+	Backend         string `json:"backend,omitempty"`
 }
 
 type snapshotDeleteRequest struct {
 	RequestID       string `json:"request_id,omitempty"`
 	LegacyRequestID string `json:"requestID,omitempty"`
 	InstanceType    string `json:"instance_type,omitempty"`
+	Backend         string `json:"backend,omitempty"`
 }
 
 type snapshotResponse struct {
@@ -82,6 +92,25 @@ type operationResponse struct {
 	Operation *operationResource `json:"operation,omitempty"`
 }
 
+type restoreCompatResponse struct {
+	*types.Res
+	Compatible bool                                    `json:"compatible"`
+	SnapshotID string                                  `json:"snapshot_id,omitempty"`
+	OriginNode string                                  `json:"origin_node,omitempty"`
+	TargetNode string                                  `json:"target_node,omitempty"`
+	Reason     string                                  `json:"reason,omitempty"`
+	Dimensions []templatecenter.RestoreCompatDimension `json:"dimensions,omitempty"`
+}
+
+type compatibleNodesResponse struct {
+	*types.Res
+	SnapshotID string                          `json:"snapshot_id,omitempty"`
+	OriginNode string                          `json:"origin_node,omitempty"`
+	Reason     string                          `json:"reason,omitempty"`
+	Warning    string                          `json:"warning,omitempty"`
+	Nodes      []templatecenter.CompatibleNode `json:"nodes"`
+}
+
 type snapshotResource struct {
 	SnapshotID                string                         `json:"snapshot_id,omitempty"`
 	InstanceType              string                         `json:"instance_type,omitempty"`
@@ -90,8 +119,10 @@ type snapshotResource struct {
 	DisplayName               string                         `json:"display_name,omitempty"`
 	OriginSandboxID           string                         `json:"origin_sandbox_id,omitempty"`
 	OriginNodeID              string                         `json:"origin_node_id,omitempty"`
+	OriginNodeIP              string                         `json:"origin_node_ip,omitempty"`
 	StorageBackend            string                         `json:"storage_backend,omitempty"`
-	Retain                    bool                           `json:"retain,omitempty"`
+	Backend                   string                         `json:"backend,omitempty"`
+	RemoteStatus              string                         `json:"remote_status,omitempty"`
 	RootfsSizeBytesAtSnapshot uint64                         `json:"rootfs_size_bytes_at_snapshot,omitempty"`
 	LastError                 string                         `json:"last_error,omitempty"`
 	CreatedAt                 string                         `json:"created_at,omitempty"`
@@ -126,42 +157,192 @@ type snapshotStorageResource struct {
 	LastUpdatedAt int64  `json:"last_updated_at,omitempty"`
 }
 
-func handleSnapshotAction(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	switch r.Method {
-	case http.MethodPost:
-		extendSnapshotWriteDeadline(w)
-		return createSnapshot(r, rt)
-	case http.MethodGet:
-		return getSnapshot(r, rt)
-	case http.MethodDelete:
-		extendSnapshotWriteDeadline(w)
-		return deleteSnapshot(r, rt)
-	default:
-		return &types.Res{
-			Ret: &types.Ret{
+func createSnapshotGinHandler(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	extendSnapshotWriteDeadline(c.Writer)
+	common.WriteAPI(c, createSnapshot(c.Request, rt))
+}
+
+func getSnapshotGinHandler(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	common.WriteAPI(c, getSnapshot(c.Request, rt, c.Param("snapshot_id")))
+}
+
+func restoreCompatGinHandler(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	common.WriteAPI(c, restoreCompat(c.Request, rt, c.Param("snapshot_id")))
+}
+
+// restoreCompat fronts GET /cube/snapshot/{snapshot_id}/restore-compat?target_node=B
+// and judges whether the snapshot (created on its origin node A) can be restored
+// on target node B, requiring strict equality of CPU feature set and host
+// kernel + KVM ABI.
+func restoreCompat(r *http.Request, rt *CubeLog.RequestTrace, snapshotID string) interface{} {
+	requestID := requestIDFromQuery(r)
+	targetNode := strings.TrimSpace(r.URL.Query().Get("target_node"))
+	if strings.TrimSpace(snapshotID) == "" || targetNode == "" {
+		rt.RetCode = int64(errorcode.ErrorCode_MasterParamsError)
+		return &restoreCompatResponse{
+			Res: &types.Res{RequestID: requestID, Ret: &types.Ret{
 				RetCode: int(errorcode.ErrorCode_MasterParamsError),
-				RetMsg:  http.StatusText(http.StatusMethodNotAllowed),
-			},
+				RetMsg:  "snapshot_id and target_node are required",
+			}},
 		}
+	}
+	result, err := restoreCompatFn(r.Context(), snapshotID, targetNode)
+	if err != nil {
+		code := snapshotErrorCode(err)
+		rt.RetCode = int64(code)
+		return &restoreCompatResponse{
+			Res: &types.Res{RequestID: requestID, Ret: &types.Ret{RetCode: code, RetMsg: err.Error()}},
+		}
+	}
+	rt.RequestID = requestID
+	rt.RetCode = int64(errorcode.ErrorCode_Success)
+	return &restoreCompatResponse{
+		Res:        &types.Res{RequestID: requestID, Ret: &types.Ret{RetCode: int(errorcode.ErrorCode_Success), RetMsg: "success"}},
+		Compatible: result.Compatible,
+		SnapshotID: result.SnapshotID,
+		OriginNode: result.OriginNode,
+		TargetNode: result.TargetNode,
+		Reason:     result.Reason,
+		Dimensions: result.Dimensions,
 	}
 }
 
-func handleSnapshotStorageAction(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	_ = w
-	if r.Method != http.MethodGet {
-		return &types.Res{
-			Ret: &types.Ret{
+func compatibleNodesGinHandler(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	common.WriteAPI(c, compatibleNodes(c.Request, rt, c.Param("snapshot_id")))
+}
+
+func compatibleNodesByFactorsGinHandler(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	common.WriteAPI(c, compatibleNodesByFactors(c.Request, rt))
+}
+
+// compatibleNodesByFactors fronts GET /cube/snapshot/compatible-nodes-by-factors
+// — the snapshot-less form of the compatible-nodes lookup. The caller supplies
+// the required host facts (cpuid_hash + host_kernel_release) directly, so there
+// is no snapshot_id segment to pass. See compatibleNodes for the shared
+// by-factor judgment.
+func compatibleNodesByFactors(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
+	requestID := requestIDFromQuery(r)
+	query := r.URL.Query()
+	includeAll := strings.EqualFold(query.Get("include_all"), "true") || query.Get("include_all") == "1"
+	cpuidHash := strings.TrimSpace(query.Get("cpuid_hash"))
+	kernelRelease := strings.TrimSpace(query.Get("host_kernel_release"))
+	result, resp := listCompatibleNodesByFactors(r, rt, requestID, cpuidHash, kernelRelease, includeAll)
+	if resp != nil {
+		return resp
+	}
+	return compatibleNodesSuccess(rt, requestID, result)
+}
+
+// listCompatibleNodesByFactors runs the bare-factor judgment shared by both the
+// dedicated route and the legacy query-param mode on /compatible-nodes. It
+// returns either a result or a ready-to-send error response (exactly one is
+// non-nil). Both required dimensions must be supplied together: with only one,
+// the missing required dimension fails closed against every candidate and the
+// caller gets a silently-empty list, so the under-specified query is rejected.
+func listCompatibleNodesByFactors(r *http.Request, rt *CubeLog.RequestTrace, requestID, cpuidHash, kernelRelease string, includeAll bool) (*templatecenter.CompatibleNodesResult, *compatibleNodesResponse) {
+	if cpuidHash == "" || kernelRelease == "" {
+		rt.RetCode = int64(errorcode.ErrorCode_MasterParamsError)
+		return nil, &compatibleNodesResponse{
+			Res: &types.Res{RequestID: requestID, Ret: &types.Ret{
 				RetCode: int(errorcode.ErrorCode_MasterParamsError),
-				RetMsg:  http.StatusText(http.StatusMethodNotAllowed),
-			},
+				RetMsg:  "bare-factor mode requires both cpuid_hash and host_kernel_release",
+			}},
 		}
 	}
-	refresh := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("refresh")), "true") ||
-		strings.TrimSpace(r.URL.Query().Get("refresh")) == "1"
-	data, err := listSnapshotStorageFn(r.Context(), refresh)
+	factors := &nodemeta.HostFacts{
+		CPUIDHash:         cpuidHash,
+		HostKernelRelease: kernelRelease,
+	}
+	result, err := listCompatibleNodesForFactorsFn(r.Context(), factors, includeAll)
+	if err != nil {
+		return nil, compatibleNodesErrorResponse(rt, requestID, err)
+	}
+	return result, nil
+}
+
+// compatibleNodesErrorResponse maps a listing error to a response.
+func compatibleNodesErrorResponse(rt *CubeLog.RequestTrace, requestID string, err error) *compatibleNodesResponse {
+	code := snapshotErrorCode(err)
+	if errors.Is(err, templatecenter.ErrRestoreCompatNoFactors) {
+		code = int(errorcode.ErrorCode_MasterParamsError)
+	}
+	rt.RetCode = int64(code)
+	return &compatibleNodesResponse{
+		Res: &types.Res{RequestID: requestID, Ret: &types.Ret{RetCode: code, RetMsg: err.Error()}},
+	}
+}
+
+// compatibleNodesSuccess builds the success response from a result.
+func compatibleNodesSuccess(rt *CubeLog.RequestTrace, requestID string, result *templatecenter.CompatibleNodesResult) *compatibleNodesResponse {
+	rt.RequestID = requestID
+	rt.RetCode = int64(errorcode.ErrorCode_Success)
+	return &compatibleNodesResponse{
+		Res:        &types.Res{RequestID: requestID, Ret: &types.Ret{RetCode: int(errorcode.ErrorCode_Success), RetMsg: "success"}},
+		SnapshotID: result.SnapshotID,
+		OriginNode: result.OriginNode,
+		Reason:     result.Reason,
+		Warning:    result.Warning,
+		Nodes:      result.Nodes,
+	}
+}
+
+// compatibleNodes fronts GET /cube/snapshot/{snapshot_id}/compatible-nodes and
+// returns every healthy node whose required host facts match, in a single call.
+// Two modes share the route: by-snapshot (default) uses the snapshot's frozen
+// origin facts; bare-factor (when cpuid_hash query is present) judges against
+// caller-supplied facts for snapshot-less diagnosis. The bare-factor mode is
+// also served without a dummy snapshot_id segment by the dedicated
+// /compatible-nodes-by-factors route (compatibleNodesByFactors). ?include_all=true
+// returns every evaluated node with its dimensions instead of only the matching ones.
+func compatibleNodes(r *http.Request, rt *CubeLog.RequestTrace, snapshotID string) interface{} {
+	requestID := requestIDFromQuery(r)
+	query := r.URL.Query()
+	includeAll := strings.EqualFold(query.Get("include_all"), "true") || query.Get("include_all") == "1"
+
+	cpuidHash := strings.TrimSpace(query.Get("cpuid_hash"))
+	kernelRelease := strings.TrimSpace(query.Get("host_kernel_release"))
+	if cpuidHash != "" || kernelRelease != "" {
+		result, resp := listCompatibleNodesByFactors(r, rt, requestID, cpuidHash, kernelRelease, includeAll)
+		if resp != nil {
+			return resp
+		}
+		return compatibleNodesSuccess(rt, requestID, result)
+	}
+
+	if strings.TrimSpace(snapshotID) == "" {
+		rt.RetCode = int64(errorcode.ErrorCode_MasterParamsError)
+		return &compatibleNodesResponse{
+			Res: &types.Res{RequestID: requestID, Ret: &types.Ret{
+				RetCode: int(errorcode.ErrorCode_MasterParamsError),
+				RetMsg:  "snapshot_id or cpuid_hash is required",
+			}},
+		}
+	}
+	result, err := listCompatibleNodesForSnapshotFn(r.Context(), snapshotID, includeAll)
+	if err != nil {
+		return compatibleNodesErrorResponse(rt, requestID, err)
+	}
+	return compatibleNodesSuccess(rt, requestID, result)
+}
+
+func deleteSnapshotGinHandler(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	extendSnapshotWriteDeadline(c.Writer)
+	common.WriteAPI(c, deleteSnapshot(c.Request, rt, c.Param("snapshot_id")))
+}
+func handleSnapshotStorageAction(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	refreshParam := strings.TrimSpace(c.Query("refresh"))
+	refresh := strings.EqualFold(refreshParam, "true") || refreshParam == "1"
+	data, err := listSnapshotStorageFn(c.Request.Context(), refresh)
 	response := &snapshotStorageResponse{
 		Res: &types.Res{
-			RequestID: requestIDFromQuery(r),
+			RequestID: requestIDFromQuery(c.Request),
 			Ret:       &types.Ret{RetCode: int(errorcode.ErrorCode_Success), RetMsg: "success"},
 		},
 		Data: make([]*snapshotStorageResource, 0, len(data)),
@@ -174,65 +355,85 @@ func handleSnapshotStorageAction(w http.ResponseWriter, r *http.Request, rt *Cub
 	}
 	rt.RequestID = response.Res.RequestID
 	rt.RetCode = int64(errorcode.ErrorCode_Success)
-	return response
+	common.WriteAPI(c, response)
 }
 
-func handleSandboxRollbackAction(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	extendSnapshotWriteDeadline(w)
+func handleSandboxRollbackAction(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	extendSnapshotWriteDeadline(c.Writer)
 	req := &snapshotRollbackRequest{}
-	if err := common.GetBodyReq(r, req); err != nil {
-		return &operationResponse{
+	if err := common.GetBodyReq(c.Request, req); err != nil {
+		common.WriteAPI(c, &operationResponse{
 			Res: &types.Res{Ret: &types.Ret{RetCode: int(errorcode.ErrorCode_MasterParamsError), RetMsg: err.Error()}},
-		}
+		})
+		return
 	}
 	requestID := firstNonEmptyTrimmed(req.RequestID, req.LegacyRequestID)
-	pathSandboxID := sandboxIDFromRollbackPath(r.URL.Path)
+	pathSandboxID := c.Param("sandbox_id")
 	if req.SandboxID == "" {
 		req.SandboxID = pathSandboxID
 	}
-	if pathSandboxID != "" && strings.TrimSpace(req.SandboxID) != pathSandboxID {
-		return &operationResponse{
-			Res: &types.Res{Ret: &types.Ret{
-				RetCode: int(errorcode.ErrorCode_MasterParamsError),
-				RetMsg:  "sandbox_id in path does not match request body",
-			}},
-		}
-	}
 	if requestID == "" || strings.TrimSpace(req.SandboxID) == "" || strings.TrimSpace(req.SnapshotID) == "" {
-		return &operationResponse{
+		common.WriteAPI(c, &operationResponse{
 			Res: &types.Res{Ret: &types.Ret{
 				RetCode: int(errorcode.ErrorCode_MasterParamsError),
 				RetMsg:  "request_id, sandbox_id and snapshot_id are required",
 			}},
+		})
+		return
+	}
+	// Resolve short/full IDs before comparing path vs body so a short prefix
+	// and the matching full ID are not treated as a mismatch.
+	if resolved, ret := sandbox.NormalizeSandboxIDParam(c.Request.Context(), req.SandboxID); ret != nil {
+		common.WriteAPI(c, &operationResponse{Res: &types.Res{Ret: ret}})
+		return
+	} else {
+		req.SandboxID = resolved
+	}
+	if pathSandboxID != "" {
+		resolvedPath, pathRet := sandbox.NormalizeSandboxIDParam(c.Request.Context(), pathSandboxID)
+		if pathRet != nil {
+			common.WriteAPI(c, &operationResponse{Res: &types.Res{Ret: pathRet}})
+			return
+		}
+		if resolvedPath != req.SandboxID {
+			common.WriteAPI(c, &operationResponse{
+				Res: &types.Res{Ret: &types.Ret{
+					RetCode: int(errorcode.ErrorCode_MasterParamsError),
+					RetMsg:  "sandbox_id in path does not match request body",
+				}},
+			})
+			return
 		}
 	}
-	ctx, cancel := snapshotExecutionContext(r.Context(), map[string]any{
+	ctx, cancel := snapshotExecutionContext(c.Request.Context(), map[string]any{
 		"RequestId":  requestID,
 		"Action":     "RollbackSnapshot",
 		"SnapshotID": req.SnapshotID,
 		"SandboxID":  req.SandboxID,
 	})
 	defer cancel()
-	info, err := rollbackSnapshotFn(ctx, requestID, req.SandboxID, req.SnapshotID, req.InstanceType)
+	info, err := rollbackSnapshotFn(ctx, requestID, req.SandboxID, req.SnapshotID, req.InstanceType, req.Backend)
 	if err != nil {
 		code := snapshotErrorCode(err)
 		rt.RetCode = int64(code)
-		return &operationResponse{
+		common.WriteAPI(c, &operationResponse{
 			Res: &types.Res{
 				RequestID: requestID,
 				Ret:       &types.Ret{RetCode: code, RetMsg: err.Error()},
 			},
-		}
+		})
+		return
 	}
 	rt.RequestID = requestID
 	rt.RetCode = int64(errorcode.ErrorCode_Success)
-	return &operationResponse{
+	common.WriteAPI(c, &operationResponse{
 		Res: &types.Res{
 			RequestID: requestID,
 			Ret:       &types.Ret{RetCode: int(errorcode.ErrorCode_Success), RetMsg: "success"},
 		},
 		Operation: operationResourceFromInfo(snapshotOperationInfoFromJob(info)),
-	}
+	})
 }
 
 func extendSnapshotWriteDeadline(w http.ResponseWriter) {
@@ -250,40 +451,34 @@ func snapshotExecutionContext(parent context.Context, fields map[string]any) (co
 	return context.WithTimeout(log.WithLogger(base, log.G(parent).WithFields(fields)), templatecenter.SnapshotOperationTimeout())
 }
 
-func handleSnapshotOperationAction(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	_ = w
-	if r.Method != http.MethodGet {
-		return &types.Res{
-			Ret: &types.Ret{
-				RetCode: int(errorcode.ErrorCode_MasterParamsError),
-				RetMsg:  http.StatusText(http.StatusMethodNotAllowed),
-			},
-		}
-	}
-	operationID := resourceIDFromPath(r.URL.Path, actionURI(OperationAction))
-	requestID := requestIDFromQuery(r)
+func handleSnapshotOperationAction(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	operationID := c.Param("operation_id")
+	requestID := requestIDFromQuery(c.Request)
 	if operationID == "" {
-		return &operationResponse{
+		common.WriteAPI(c, &operationResponse{
 			Res: &types.Res{Ret: &types.Ret{
 				RetCode: int(errorcode.ErrorCode_MasterParamsError),
 				RetMsg:  "operation_id is required",
 			}},
-		}
+		})
+		return
 	}
-	info, err := getSnapshotOperationFn(r.Context(), operationID)
+	info, err := getSnapshotOperationFn(c.Request.Context(), operationID)
 	if err != nil {
 		code := snapshotErrorCode(err)
 		rt.RetCode = int64(code)
-		return &operationResponse{
+		common.WriteAPI(c, &operationResponse{
 			Res: &types.Res{RequestID: requestID, Ret: &types.Ret{RetCode: code, RetMsg: err.Error()}},
-		}
+		})
+		return
 	}
 	rt.RequestID = requestID
 	rt.RetCode = int64(errorcode.ErrorCode_Success)
-	return &operationResponse{
+	common.WriteAPI(c, &operationResponse{
 		Res:       &types.Res{RequestID: requestID, Ret: &types.Ret{RetCode: int(errorcode.ErrorCode_Success), RetMsg: "success"}},
 		Operation: operationResourceFromInfo(info),
-	}
+	})
 }
 
 func createSnapshot(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
@@ -300,6 +495,11 @@ func createSnapshot(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 				RetMsg:  "sandbox_id is required",
 			}},
 		}
+	}
+	if resolved, ret := sandbox.NormalizeSandboxIDParam(r.Context(), req.SandboxID); ret != nil {
+		return &snapshotResponse{Res: &types.Res{Ret: ret}}
+	} else {
+		req.SandboxID = resolved
 	}
 	requestID := firstNonEmptyTrimmed(req.RequestID, req.LegacyRequestID)
 	if requestID == "" {
@@ -331,7 +531,7 @@ func createSnapshot(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 		"RequestId":   requestID,
 		"SandboxHost": hostIP,
 	}))
-	info, err := createSnapshotFn(ctx, requestID, req.SandboxID, hostID, hostIP, req.DisplayName)
+	info, err := createSnapshotFn(ctx, requestID, req.SandboxID, hostID, hostIP, req.DisplayName, req.Backend)
 	if err != nil {
 		code := snapshotErrorCode(err)
 		rt.RetCode = int64(code)
@@ -365,8 +565,7 @@ func createSnapshot(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 	}
 }
 
-func getSnapshot(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	snapshotID := resourceIDFromPath(r.URL.Path, actionURI(SnapshotAction))
+func getSnapshot(r *http.Request, rt *CubeLog.RequestTrace, snapshotID string) interface{} {
 	requestID := requestIDFromQuery(r)
 	if snapshotID == "" {
 		infos, nextToken, err := listSnapshotsFn(r.Context(), &templatecenter.ListSnapshotsOptions{
@@ -374,6 +573,7 @@ func getSnapshot(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 			SandboxID:  strings.TrimSpace(r.URL.Query().Get("sandbox_id")),
 			Name:       strings.TrimSpace(r.URL.Query().Get("name")),
 			Status:     strings.TrimSpace(r.URL.Query().Get("status")),
+			Backend:    strings.TrimSpace(r.URL.Query().Get("backend")),
 			Limit:      parsePositiveIntQuery(r, "limit"),
 			NextToken:  strings.TrimSpace(r.URL.Query().Get("next_token")),
 		})
@@ -414,32 +614,14 @@ func getSnapshot(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 	}
 }
 
-// deleteSnapshot fronts `DELETE /cube/snapshot/{snapshot_id}` and is part of
-// the *synchronous* snapshot contract: the HTTP response is not produced
-// until the underlying snapshot-delete job has reached a terminal status
-// (READY on success, FAILED on error).  Specifically:
+// deleteSnapshot fronts `DELETE /cube/snapshot/{snapshot_id}`.
 //
-//   - Inputs are validated, then `templatecenter.DeleteSnapshot` runs the
-//     full delete pipeline (replica cleanup via cubelet, metadata removal,
-//     cache invalidation) inside a context capped at
-//     `templatecenter.SnapshotOperationTimeout()` (15 min).
-//   - `extendSnapshotWriteDeadline(w)` widens the HTTP write deadline to
-//     `SnapshotOperationTimeout + 30s` so the server-side write does not
-//     fire before the synchronous wait completes.
-//   - `executeSnapshotDeleteJob` -> `finalizeSynchronousSnapshotJob` only
-//     returns a non-error `info` when the job row is `Ready`; any other
-//     terminal state (`Failed`, missing) becomes an error and is mapped to
-//     a 4xx/5xx ret code.  Pending/Running can never escape this handler.
-//
-// Callers may therefore treat a successful response as "snapshot definitely
-// removed" and a non-success response as "the operation either ran to
-// failure or was rejected before starting" — there is no middle "still
-// running, please poll" outcome.  `GET /cube/operation/{operation_id}` is
-// kept around purely for human audit; programmatic clients have no reason
-// to poll.  The snapshot API is synchronous — CubeAPI waits for a
-	// terminal state and does not expose a polling interface to callers.
-func deleteSnapshot(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	snapshotID := resourceIDFromPath(r.URL.Path, actionURI(SnapshotAction))
+// Success means the snapshot is logically retired: List/Get hide it and it
+// can no longer create or roll back. With no runtime refs, physical cleanup
+// is also synchronous (15 min cap); otherwise the row is tombstoned and
+// bytes are reclaimed later. CREATING / DELETING / active job → conflict;
+// no polling path.
+func deleteSnapshot(r *http.Request, rt *CubeLog.RequestTrace, snapshotID string) interface{} {
 	if snapshotID == "" {
 		return &operationResponse{
 			Res: &types.Res{Ret: &types.Ret{
@@ -541,9 +723,26 @@ func snapshotErrorCode(err error) int {
 		return int(errorcode.ErrorCode_NotFound)
 	case errors.Is(err, templatecenter.ErrTemplateStoreNotInitialized):
 		return int(errorcode.ErrorCode_DBError)
+	case isMySQLLockError(err):
+		return int(errorcode.ErrorCode_DBError)
 	default:
 		return int(errorcode.ErrorCode_MasterParamsError)
 	}
+}
+
+func isMySQLLockError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		switch mysqlErr.Number {
+		case 1205, 1213:
+			return true
+		}
+	}
+	message := err.Error()
+	return strings.Contains(message, "Error 1213") ||
+		strings.Contains(message, "Error 1205") ||
+		strings.Contains(message, "Deadlock found when trying to get lock") ||
+		strings.Contains(message, "Lock wait timeout exceeded")
 }
 
 func snapshotOperationInfoFromJob(info *types.TemplateImageJobInfo) *templatecenter.SnapshotOperationInfo {
@@ -579,8 +778,10 @@ func snapshotResourceFromInfo(info *templatecenter.SnapshotInfo) *snapshotResour
 		DisplayName:               info.DisplayName,
 		OriginSandboxID:           info.OriginSandboxID,
 		OriginNodeID:              info.OriginNodeID,
-		StorageBackend:            info.StorageBackend,
-		Retain:                    info.Retain,
+		OriginNodeIP:              info.OriginNodeIP,
+		StorageBackend:            firstNonEmptyTrimmed(info.Backend, info.StorageBackend),
+		Backend:                   firstNonEmptyTrimmed(info.Backend, info.StorageBackend),
+		RemoteStatus:              info.RemoteStatus,
 		RootfsSizeBytesAtSnapshot: info.RootfsSizeBytesAtSnapshot,
 		LastError:                 info.LastError,
 		CreatedAt:                 info.CreatedAt,
@@ -621,26 +822,6 @@ func snapshotStorageResourceFromStatus(info templatecenter.SnapshotStorageStatus
 		LastError:     info.LastError,
 		LastUpdatedAt: info.LastUpdatedAt,
 	}
-}
-
-func resourceIDFromPath(path, prefix string) string {
-	path = strings.TrimSpace(path)
-	if !strings.HasPrefix(path, prefix+"/") {
-		return ""
-	}
-	return strings.Trim(strings.TrimPrefix(path, prefix+"/"), "/")
-}
-
-func sandboxIDFromRollbackPath(path string) string {
-	path = strings.Trim(strings.TrimSpace(path), "/")
-	parts := strings.Split(path, "/")
-	if len(parts) != 4 {
-		return ""
-	}
-	if parts[0] != strings.Trim(CubeURI(), "/") || parts[1] != strings.Trim(SandboxAction, "/") || parts[3] != "rollback" {
-		return ""
-	}
-	return strings.TrimSpace(parts[2])
 }
 
 func requestIDFromQuery(r *http.Request) string {

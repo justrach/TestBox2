@@ -25,11 +25,70 @@
 /* ARP hardware types */
 #define ARPHRD_ETHER			1	/* Ethernet */
 
+/* https://elixir.bootlin.com/linux/v5.4.217/source/include/linux/socket.h#L172 */
+#define AF_INET				2
+
 #define MAX_ENTRIES			8192
+#define MAX_IP_RULE_ENTRIES		8192
+#define MAX_DOMAIN_RULE_ENTRIES		1024
 #define MAX_PORTS			65536
 #define MAX_SESSIONS			1048576
 #define MAX_SNAT_IPS			4
 #define MAX_PORT_START			30000
+#define MAX_DNS_QUERY_TRACK_ENTRIES	65536
+#define MAX_DNS_NAME_LEN		256
+#define DNS_POLICY_FLAG_LEARNING_ENABLED	1
+#define NET_POLICY_FLAG_L7_REQUIRED	1
+/* Set alongside NET_POLICY_FLAG_L7_REQUIRED when a domain is present in BOTH
+ * a plain (L3) allow_out rule and an L7 rule. Tells dns_learn_response_ip to
+ * learn the plain /32 any-port entry in addition to the L7 (ip, port)/48
+ * entries, so non-rule ports keep plain SNAT access while the rule's ports are
+ * L7-intercepted. Without it an L7 rule silently narrows a same-domain plain
+ * allow_out to only the rule's ports.
+ */
+#define NET_POLICY_FLAG_L3_ALLOWED	2
+#define NSEC_PER_SEC			1000000000ULL
+
+/* L7 scheme values embedded in dns_allow_value / net_policy_value_v2 per-port
+ * entries. Used by the eBPF datapath to compute skb->mark so CubeEgress's
+ * iptables TPROXY rules can steer HTTP vs HTTPS traffic to distinct listeners
+ * without depending on the destination port number. Keep in sync with
+ * cubevs/cubevs.go (L7SchemeHTTP / L7SchemeHTTPS).
+ */
+#define L7_SCHEME_NONE	0
+#define L7_SCHEME_HTTP	1
+#define L7_SCHEME_HTTPS	2
+
+/* Maximum number of (port, scheme) tuples a single L7 rule host may declare.
+ * Bounded so the map value size stays small and BPF verifier can unroll the
+ * lookup loop. Users needing more should merge rules or reuse ports.
+ */
+#define MAX_L7_PORTS_PER_HOST	8
+
+/* skb->mark encoding for L7 redirect. The high 16 bits carry a cube-owned
+ * prefix (0xCE?? masked by cube_l7_mark_mask) so cube marks do not collide
+ * with unrelated mark bits users may set elsewhere. iptables uses
+ * `-m mark --mark VAL/MASK` to match on cube-owned bits only.
+ *
+ * These are const volatile globals (not macros) so a deployment can override
+ * them at load time from userspace (rewriteConstants, sourced from the same
+ * install-time config the iptables init script reads), keeping the dataplane
+ * and iptables in lock-step. Defaults match the shipped values.
+ */
+const volatile __u32 cube_l7_mark_mask = 0xFFFF0000u;
+const volatile __u32 cube_l7_mark_http = 0xCE010000u;
+const volatile __u32 cube_l7_mark_https = 0xCE020000u;
+#define DNS_QUERY_TRACK_TTL_NS		(10ULL * NSEC_PER_SEC)
+/* Positive cache lifetime for a fib-learned neighbor MAC. Must be well below
+ * the userspace keepalive period (16s) so the cache is re-validated against the
+ * kernel neighbor table at least once per keepalive cycle. */
+#define DIRECT_NEIGH_CACHE_TTL_NS		(4ULL * NSEC_PER_SEC)
+/* Negative cache lifetime after a fib failure, so a dead destination does not
+ * trigger a fib lookup on every packet. */
+#define DIRECT_NEIGH_NEG_TTL_NS			(1ULL * NSEC_PER_SEC)
+/* Minimum interval between last_used_ns writes, bounding map-write pressure on
+ * high-pps flows. */
+#define DIRECT_NEIGH_TOUCH_THROTTLE_NS		(1ULL * NSEC_PER_SEC)
 
 /* https://en.wikipedia.org/wiki/IPv4#Header
  *
@@ -50,6 +109,7 @@
 
 /* Offsets to the start of the packet */
 #define IP_CSUM_OFF			(sizeof(struct ethhdr) + offsetof(struct iphdr, check))
+#define IP_TOT_LEN_OFF			(sizeof(struct ethhdr) + offsetof(struct iphdr, tot_len))
 #define IP_SADDR_OFF			(sizeof(struct ethhdr) + offsetof(struct iphdr, saddr))
 #define IP_DADDR_OFF			(sizeof(struct ethhdr) + offsetof(struct iphdr, daddr))
 #define TCP_CSUM_OFF(LEN)		(sizeof(struct ethhdr) + LEN + offsetof(struct tcphdr, check))
@@ -60,6 +120,9 @@
 #define UDP_DST_OFF(LEN)		(sizeof(struct ethhdr) + LEN + offsetof(struct udphdr, dest))
 #define ICMP_CSUM_OFF(LEN)		(sizeof(struct ethhdr) + LEN + offsetof(struct icmphdr, checksum))
 #define ICMP_ECHO_ID_OFF(LEN)		(sizeof(struct ethhdr) + LEN + offsetof(struct icmphdr, un.echo.id))
+
+/* Current network namespace */
+#define BPF_F_CURRENT_NETNS		(-1L)
 
 /* IP and MAC address inside MVMs */
 const volatile __u32 mvm_inner_ip       = 0x0644fea9;	/* 169.254.68.6, network byte order */
@@ -75,8 +138,19 @@ const volatile __u32 cubegw0_ifindex    = 216;
 const volatile __u32 cubegw0_macaddr_p1 = 0xcf6f9020;	/* 20:90:6f:cf:cf:cf */
 const volatile __u16 cubegw0_macaddr_p2 = 0xcfcf;
 
+/* L2 rewrite and redirect flags for ordinary egress traffic.
+ * direct mode: src=node MAC, dst=node gateway MAC, redirect flags=0.
+ * custom mode: src=MVM MAC, dst=cube-router MAC, redirect flags=BPF_F_INGRESS.
+ */
+const volatile __u32 egress_smacaddr_p1     = 0xfc6f9020;	/* 20:90:6f:fc:fc:fc */
+const volatile __u16 egress_smacaddr_p2     = 0xfcfc;
+const volatile __u32 egress_dmacaddr_p1     = 0xcf6f9022;	/* 22:90:6f:cf:cf:cf */
+const volatile __u16 egress_dmacaddr_p2     = 0xcfcf;
+const volatile __u64 egress_redirect_flags  = BPF_F_INGRESS;
+
 /* Ifindex, IP and MAC address of Node itself */
 const volatile __u32 nodenic_ip         = 0x020a8709;	/* 9.135.10.2, network byte order */
+const volatile __u32 nodenic_netmask    = 0x00ffffff;	/* 255.255.255.0, packet-byte layout */
 const volatile __u32 nodenic_ifindex    = 2;
 const volatile __u32 nodenic_macaddr_p1 = 0x68005452;	/* 52:54:00:68:dd:16 */
 const volatile __u16 nodenic_macaddr_p2 = 0x16dd;
@@ -85,11 +159,29 @@ const volatile __u16 nodenic_macaddr_p2 = 0x16dd;
 const volatile __u32 nodegw_macaddr_p1  = 0x4732eefe;	/* fe:ee:32:47:6b:93 */
 const volatile __u16 nodegw_macaddr_p2  = 0x936b;
 
+/* policy_version is the per-sandbox network-policy generation. It is bumped by
+ * userspace after a policy update has been fully applied, and every packet on
+ * an established flow compares it against the generation cached in nat_session
+ * to decide whether the flow must be re-evaluated.
+ *
+ * No value is reserved: this is a plain counter compared for equality. A fresh
+ * TAP starts at 0, which is also what metadata and sessions written before this
+ * field existed carry, so an upgrade finds them in agreement and re-checks
+ * nothing -- those flows were admitted under a policy that has not changed.
+ * Wrapping takes 2^32 updates to one sandbox and would at worst let a session
+ * that outlived all of them skip one re-check, so it is not special-cased.
+ *
+ * Do NOT reuse the `version` field above for this: it is part of session_key,
+ * so bumping it would orphan every live session for this TAP.
+ */
 struct mvm_meta {
 	__u32 version;
 	__u32 ip;
 	__u8 uuid[64];
-	__u8 reserved[56];
+	__u8 dns_policy_flags;
+	__u8 reserved0[3];	/* aligns policy_version; reserved starts at an odd offset */
+	__u32 policy_version;
+	__u8 reserved[48];
 };
 
 /* https://elixir.bootlin.com/linux/v5.4.217/source/include/uapi/linux/if_arp.h#L144 */
@@ -106,6 +198,26 @@ struct arphdr_eth {
 	__be32 ar_tip;			/* target IP address */
 } __attribute__((packed));
 
+/* Direct-egress on-link neighbor trigger/cache entry.
+ *
+ * The kernel neighbor table is the only source of truth for the MAC; this entry
+ * is a TTL-bounded cache of the last bpf_fib_lookup() result plus the trigger
+ * state the userspace scanner schedules against. Field ownership:
+ *   BPF datapath writes: addr, fib_ok, valid_until_ns, last_used_ns
+ *   userspace scanner writes: step, next_attempt_ns, next_refresh_ns
+ */
+struct direct_neighbor {
+	unsigned char addr[ETH_ALEN];	/* cached MAC; all-zero = no valid cache */
+	__u8	fib_ok;			/* last fib lookup result (1=learned) */
+	__u8	step;			/* scanner: backoff level */
+	__u16	flags;
+	__u32	reserved;
+	__u64	valid_until_ns;	/* cache expiry; written only on fib success/failure, never renewed on hit */
+	__u64	last_used_ns;		/* last packet time (1s write throttle) */
+	__u64	next_attempt_ns;	/* scanner: next learning-trigger time */
+	__u64	next_refresh_ns;	/* scanner: next keepalive-trigger time */
+};
+
 union macaddr {
 	struct {
 		__u32 p1;
@@ -119,16 +231,119 @@ struct lpm_key {
 	__u32 ip;
 };
 
+/* LPM key for allow_out_v3. Carries the destination IP (32-bit, network
+ * byte order) and an optional destination port (16-bit, network byte order)
+ * so a single longest-prefix lookup resolves:
+ *   - exact (ip, port): prefixlen = 48  (ip[4] + port[2])
+ *   - ip only (any port): prefixlen = 32  (ip[4], port ignored)
+ *   - ip/mask subnet:        prefixlen < 32  (only top bits of ip matter)
+ * The struct is padded to 12 bytes (8-byte data payload) so the trie's
+ * word-wise compare stays 4-byte aligned on every kernel. Insert and
+ * lookup MUST both fill ip/port from network-byte-order bytes (matching
+ * iphdr->daddr / tcphdr->dest), never from a host-byte-order integer
+ * shift — otherwise the exact (ip, port) match silently fails.
+ */
+struct lpm_key_v3 {
+	__u32 prefixlen;
+	__u32 ip;     /* network byte order */
+	__u16 port;   /* network byte order; 0 when key is ip-only/subnet */
+	__u16 _pad;   /* 0; keeps the data payload at 8 bytes */
+};
+
+struct dns_allow_key {
+	__u32 prefixlen;
+	char name[MAX_DNS_NAME_LEN];
+};
+
+/* Per-host L7 port entry. Attached inline to both dns_allow_value and
+ * net_policy_value_v2 so the datapath can pick the right scheme for a given
+ * destination port without a second map lookup. port is in network byte order
+ * (matches tcphdr->dest), scheme is one of L7_SCHEME_HTTP / L7_SCHEME_HTTPS.
+ */
+struct l7_port_entry {
+	__u16 port;   /* network byte order */
+	__u8 scheme;
+	__u8 _pad;
+};
+
+/* dns_allow_value carries the L7 policy attached to a matched DNS name.
+ * port_count = 0 is the "unspecified" case: the datapath applies the default
+ * port set {80/http, 443/https} for backward compatibility with rules that
+ * omit port. port_count > 0 restricts L7 handling to the listed (port, scheme)
+ * tuples only.
+ */
+struct dns_allow_value {
+	__u32 name_len;
+	__u8 flags;
+	__u8 port_count;
+	__u8 reserved[2];
+	struct l7_port_entry ports[MAX_L7_PORTS_PER_HOST];
+};
+
+struct dns_query_track_key {
+	__u32 ifindex;
+	__u32 server_ip;
+	__u16 source_port;
+	__u16 dns_id;
+	__u32 reserved;
+	__u64 qname_hash;
+};
+
+struct dns_query_track_value {
+	__u64 expires_at_ns;
+	__u8 flags;
+	__u8 port_count;
+	__u8 reserved[6];
+	struct l7_port_entry ports[MAX_L7_PORTS_PER_HOST];
+};
+
+/* Per-packet query parser state shared by the DNS tail-call pipeline. */
+struct dns_query_state {
+	__u32 dns_off;
+	__u32 ifindex;
+	__u16 flags;
+	__u32 cursor;
+	__u32 label_remaining;
+	__u32 dotted_len;
+	__u32 reverse_pos;
+	bool failed;
+	bool done;
+	char name[MAX_DNS_NAME_LEN];
+};
+
+/* net_policy_value_v2 stores the per-sandbox allow_out_v2 verdict. This is the
+ * legacy 16-byte layout read only when migrating a pre-v3 allow_out_v2 map to
+ * allow_out_v3; the current dataplane uses net_policy_value_v3.
+ */
+struct net_policy_value_v2 {
+	__u64 expires_at_ns;
+	__u8 flags;
+	__u8 reserved[7];
+};
+
+/* Per-sandbox allow_out_v3 verdict. Unlike v2, the port lives in the
+ * LPM key (see lpm_key_v3), so the value no longer needs the 8-tuple
+ * (port, scheme) array: the scheme is resolved at insert time and
+ * stored here directly. A zero expires_at_ns is a static entry; a
+ * non-zero expires_at_ns is a temporary DNS-learned entry.
+ */
+struct net_policy_value_v3 {
+	__u64 expires_at_ns;
+	__u8 flags;
+	__u8 scheme;   /* L7_SCHEME_* */
+	/* prefixlen of the lpm_key_v3 this value was written under. LPM trie
+	 * lookups are longest-prefix, so a lookup for key K may return an
+	 * entry written under a SHORTER covering key; writers that mean to
+	 * merge with an existing entry for the EXACT same key must compare
+	 * this field against their key's prefixlen first.
+	 */
+	__u8 key_prefixlen;
+	__u8 reserved[5];
+};
+
 struct mvm_port {
 	__u32 ifindex;
 	__u16 listen_port;
-	__u16 reserved;
-};
-
-/* The size of this structure must be a multiple of 4 */
-struct csum_buff {
-	__u32 addr;
-	__u16 port;
 	__u16 reserved;
 };
 
@@ -152,7 +367,12 @@ struct nat_session {
 	__u16 vm_port;
 	__u8 state;
 	__u8 active_close;
-	__u8 reserved[34];
+	__u8 packet_class;	/* SNAT_PACKET or L7PROXY_PACKET */
+	__u8 l7_scheme;		/* L7_SCHEME_*; NONE for non-L7 sessions */
+	__u32 policy_version;	/* mvm_meta.policy_version at create / last re-check */
+	__u32 gen;		/* mvm_meta->version at creation; a sandbox rollback
+				 * bumps it, so a gen != current session is stale */
+	__u8 reserved[24];
 };
 
 struct ingress_session {
@@ -170,26 +390,74 @@ struct snat_ip {
 	__u16 reserved;
 };
 
+/* Tail-call state for DNS response handling on the ingress UDP NAT path.
+ *
+ * The response handler is split into its own tail-called program to keep the
+ * from_world verifier complexity within the 1M instruction budget. We stash
+ * the values the caller already derived (DNS payload offset, target sandbox
+ * ifindex, DNS server IP, sandbox-side port) so the tail-called program can
+ * re-pull headers, learn A records, and finish UDP NAT without re-deriving
+ * them from scratch.
+ */
+struct dns_response_state {
+	__u32 dns_off;
+	__u32 ifindex;		/* sandbox tap ifindex (sess->vm_ifindex) */
+	__u32 server_ip;	/* DNS server IP (l3->saddr in network byte order) */
+	__u16 source_port;	/* sandbox-side UDP port (sess->vm_port in nbo) */
+	__u16 reserved;
+};
+
+/* skb->cb[0] is reserved as a per-invocation NAT status word used by
+ * create_nat_session() to communicate the failure reason back to callers
+ * in from_cube(). skb->cb[] is 5 * u32 scratch that survives across
+ * bpf-to-bpf calls within a single program invocation, so this works even
+ * when the session helpers are compiled as subprogs.
+ */
+#define NAT_CB_STATUS_INDEX		0
+#define NAT_CB_OK			0
+#define NAT_CB_DENIED_BY_POLICY		1
+
+static __always_inline void nat_cb_set(struct __sk_buff *skb, __u32 status)
+{
+	skb->cb[NAT_CB_STATUS_INDEX] = status;
+}
+
+static __always_inline __u32 nat_cb_get(const struct __sk_buff *skb)
+{
+	return skb->cb[NAT_CB_STATUS_INDEX];
+}
+
 /* static assert, make sure size of structs are expected
  */
 static __always_inline int _()
 {
 	int b[sizeof(struct mvm_meta) == 128 ? 1 : -1] = {};
 	int d[sizeof(struct lpm_key) == 8 ? 1 : -1] = {};
+	int dv3[sizeof(struct lpm_key_v3) == 12 ? 1 : -1] = {};
+	int r[sizeof(struct net_policy_value_v2) == 16 ? 1 : -1] = {};
+	int rv3[sizeof(struct net_policy_value_v3) == 16 ? 1 : -1] = {};
+	int f[sizeof(struct dns_allow_key) == MAX_DNS_NAME_LEN + 4 ? 1 : -1] = {};
+	int g[sizeof(struct dns_allow_value) == 40 ? 1 : -1] = {};
+	int h[sizeof(struct dns_query_track_key) == 24 ? 1 : -1] = {};
+	int i[sizeof(struct dns_query_track_value) == 48 ? 1 : -1] = {};
 	int l[sizeof(struct mvm_port) == 8 ? 1 : -1] = {};
-	int m[sizeof(struct csum_buff) % 4 == 0 ? 1 : -1] = {};
 	int n[sizeof(struct session_key) % 20 == 0 ? 1 : -1] = {};
-	int o[sizeof(struct nat_session) % 64 == 0 ? 1 : -1] = {};
+	int o[sizeof(struct nat_session) == 64 ? 1 : -1] = {};
 	int p[sizeof(struct ingress_session) % 16 == 0 ? 1 : -1] = {};
 	int q[sizeof(struct snat_ip) % 16 == 0 ? 1 : -1] = {};
+	int s[sizeof(struct l7_port_entry) == 4 ? 1 : -1] = {};
 
-	return b[0] + d[0] + l[0] + m[0] + n[0] + o[0] + p[0] + q[0];
+	return b[0] + d[0] + dv3[0] + r[0] + rv3[0] + f[0] + g[0] + h[0] + i[0] + l[0] + n[0] + o[0] + p[0] + q[0] + s[0];
 }
 
-static __always_inline __u16 csum_fold(__wsum sum)
+static __always_inline __attribute__((used)) __u32 __btf_pin(void)
 {
-	sum = (sum & 0xffff) + (sum >> 16);
-	return ~((sum & 0xffff) + (sum >> 16));
+	return __builtin_btf_type_id(*(struct lpm_key *)0, BPF_TYPE_ID_LOCAL) +
+	       __builtin_btf_type_id(*(struct net_policy_value_v2 *)0, BPF_TYPE_ID_LOCAL) +
+	       __builtin_btf_type_id(*(struct lpm_key_v3 *)0, BPF_TYPE_ID_LOCAL) +
+	       __builtin_btf_type_id(*(struct net_policy_value_v3 *)0, BPF_TYPE_ID_LOCAL) +
+	       __builtin_btf_type_id(*(struct dns_allow_key *)0, BPF_TYPE_ID_LOCAL) +
+	       __builtin_btf_type_id(*(struct dns_allow_value *)0, BPF_TYPE_ID_LOCAL);
 }
 
 #endif /* __CUBEVS_H */

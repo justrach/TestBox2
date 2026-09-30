@@ -4,30 +4,43 @@
 import { useTranslation } from 'react-i18next';
 import { useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRuntimeConfig } from '@/hooks/useRuntimeConfig';
 import {
-  Palette, Plug, Keyboard, Info,
-  Sun, Moon, Monitor, Check, ExternalLink,
-  Loader2, Wifi, WifiOff,
+  Palette,
+  Plug,
+  Keyboard,
+  Info,
+  Sun,
+  Moon,
+  Monitor,
+  Check,
+  ExternalLink,
+  Loader2,
+  Wifi,
+  WifiOff,
+  UserCog,
+  LogOut,
+  KeyRound,
 } from 'lucide-react';
 import { useThemeStore, type ThemeMode } from '@/store/theme';
-import { clusterApi } from '@/api/client';
+import { clusterApi, authApi } from '@/api/client';
+import { useControlPlaneVersion } from '@/hooks/useControlPlaneVersion';
+import { ApiError } from '@/lib/api';
+import { clearSession, getSessionUser } from '@/lib/session';
 import { cn } from '@/lib/utils';
 
 // ── Sidebar nav ───────────────────────────────────────────────────────────────
 
 const SECTIONS = [
   { key: 'appearance', icon: Palette },
-  { key: 'cluster',    icon: Plug },
-  { key: 'shortcuts',  icon: Keyboard },
-  { key: 'about',      icon: Info },
+  { key: 'cluster', icon: Plug },
+  { key: 'account', icon: UserCog },
+  { key: 'shortcuts', icon: Keyboard },
+  { key: 'about', icon: Info },
 ] as const;
 
-function SettingsSidebar({ active, onChange }: {
-  active: string;
-  onChange: (k: string) => void;
-}) {
+function SettingsSidebar({ active, onChange }: { active: string; onChange: (k: string) => void }) {
   const { t } = useTranslation('settings');
   return (
     <nav className="w-44 shrink-0 space-y-0.5">
@@ -39,7 +52,7 @@ function SettingsSidebar({ active, onChange }: {
             'flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors',
             active === key
               ? 'bg-primary/10 text-primary font-medium'
-              : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground'
+              : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground',
           )}
         >
           <Icon size={15} />
@@ -54,8 +67,8 @@ function SettingsSidebar({ active, onChange }: {
 
 const THEME_OPTIONS: { value: ThemeMode; icon: typeof Sun; labelKey: string }[] = [
   { value: 'system', icon: Monitor, labelKey: 'system' },
-  { value: 'light',  icon: Sun,     labelKey: 'light' },
-  { value: 'dark',   icon: Moon,    labelKey: 'dark' },
+  { value: 'light', icon: Sun, labelKey: 'light' },
+  { value: 'dark', icon: Moon, labelKey: 'dark' },
 ];
 
 const LANGS = [
@@ -86,7 +99,7 @@ function AppearanceSection() {
                 'flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-all',
                 mode === value
                   ? 'border-primary/40 bg-primary/10 text-primary'
-                  : 'border-border/60 bg-card/40 text-muted-foreground hover:border-border hover:text-foreground'
+                  : 'border-border/60 bg-card/40 text-muted-foreground hover:border-border hover:text-foreground',
               )}
             >
               <Icon size={14} />
@@ -108,7 +121,7 @@ function AppearanceSection() {
                 'flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-all',
                 currentLang === code
                   ? 'border-primary/40 bg-primary/10 text-primary'
-                  : 'border-border/60 bg-card/40 text-muted-foreground hover:border-border hover:text-foreground'
+                  : 'border-border/60 bg-card/40 text-muted-foreground hover:border-border hover:text-foreground',
               )}
             >
               {label}
@@ -126,9 +139,13 @@ function AppearanceSection() {
 function ClusterSection() {
   const { t } = useTranslation('settings');
   const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<{ ok: boolean; latency?: number; msg?: string } | null>(null);
+  const [testResult, setTestResult] = useState<{
+    ok: boolean;
+    latency?: number;
+    msg?: string;
+  } | null>(null);
 
-  const { data: cfg, isLoading } = useRuntimeConfig();
+  const { data: cfg } = useRuntimeConfig();
 
   const handleTest = async () => {
     setTesting(true);
@@ -166,42 +183,147 @@ function ClusterSection() {
           </div>
 
           {testResult && (
-            <div className={cn(
-              'flex items-center gap-2 rounded-lg border px-3 py-2 text-sm animate-fade-in',
-              testResult.ok
-                ? 'border-cube-emerald/20 bg-cube-emerald/[0.06] text-cube-emerald'
-                : 'border-cube-rose/20 bg-cube-rose/[0.06] text-cube-rose'
-            )}>
-              {testResult.ok
-                ? <><Wifi size={13} /> {t('cluster.connected')} · {testResult.latency}ms</>
-                : <><WifiOff size={13} /> {testResult.msg}</>
-              }
+            <div
+              className={cn(
+                'flex items-center gap-2 rounded-lg border px-3 py-2 text-sm animate-fade-in',
+                testResult.ok
+                  ? 'border-cube-ok/20 bg-cube-ok/[0.06] text-cube-ok'
+                  : 'border-cube-err/20 bg-cube-err/[0.06] text-cube-err',
+              )}
+            >
+              {testResult.ok ? (
+                <>
+                  <Wifi size={13} /> {t('cluster.connected')} · {testResult.latency}ms
+                </>
+              ) : (
+                <>
+                  <WifiOff size={13} /> {testResult.msg}
+                </>
+              )}
             </div>
           )}
         </div>
       </SettingRow>
+    </div>
+  );
+}
 
-      {/* Runtime info */}
-      <SettingRow label={t('cluster.runtime')} desc={t('cluster.runtimeDesc')}>
-        {isLoading ? (
-          <div className="space-y-2">
-            {[1,2,3,4].map(i => <div key={i} className="h-4 w-48 animate-pulse rounded bg-muted/60" />)}
-          </div>
-        ) : (
-          <dl className="space-y-2 text-sm">
-            {([
-              { label: t('cluster.sandboxDomain'), value: cfg?.sandboxDomain ?? '—',  numeric: false },
-              { label: t('cluster.instanceType'),  value: cfg?.instanceType ?? '—',   numeric: false },
-              { label: t('cluster.rateLimit'),     value: `${cfg?.rateLimitPerSec ?? '—'} req/s`, numeric: true },
-              { label: t('cluster.auth'),          value: cfg?.authEnabled ? t('cluster.authOn') : t('cluster.authOff'), numeric: false },
-            ] as Array<{ label: string; value: string; numeric: boolean }>).map(({ label, value, numeric }) => (
-              <div key={label} className="flex items-center gap-3">
-                <span className="w-36 text-muted-foreground">{label}</span>
-                <span className={cn('text-foreground/90', numeric && 'text-num')}>{value}</span>
-              </div>
-            ))}
-          </dl>
-        )}
+// ── Section: Account ──────────────────────────────────────────────────────────
+
+function AccountSection() {
+  const { t } = useTranslation('auth');
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const username = getSessionUser() || 'admin';
+  const [oldPassword, setOldPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const handleLogout = async () => {
+    try {
+      await authApi.logout();
+    } catch {
+      // ignore network errors on logout
+    }
+    clearSession();
+    queryClient.clear();
+    navigate('/login', { replace: true });
+  };
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMsg(null);
+    if (newPassword.length < 4) {
+      setMsg({ ok: false, text: t('changePassword.tooShort') });
+      return;
+    }
+    if (newPassword !== confirm) {
+      setMsg({ ok: false, text: t('changePassword.mismatch') });
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await authApi.changePassword({ username, oldPassword, newPassword });
+      // Password changes revoke all existing refresh tokens on the server.
+      // Force a fresh login instead of leaving an unusable session in place.
+      clearSession();
+      queryClient.clear();
+      navigate('/login', {
+        replace: true,
+        state: { from: '/settings?tab=account' },
+      });
+    } catch (err) {
+      const text =
+        err instanceof ApiError && err.status === 401
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : t('changePassword.error');
+      setMsg({ ok: false, text });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const inputClass =
+    'w-full rounded-lg border border-border/60 bg-card/40 px-3 py-2 text-sm outline-none transition-colors focus:border-primary/50 focus:ring-2 focus:ring-primary/15';
+
+  return (
+    <div className="space-y-8">
+      <SectionHeader icon={UserCog} title={t('account.title')} desc={t('account.description')} />
+
+      <SettingRow label={t('account.title')} desc={t('account.loggedInAs', { username })}>
+        <button
+          onClick={handleLogout}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-border/60 bg-card/40 px-3 py-2 text-sm text-muted-foreground transition-colors hover:border-rose-400/40 hover:text-rose-500"
+        >
+          <LogOut size={14} />
+          {t('account.logout')}
+        </button>
+      </SettingRow>
+
+      <SettingRow label={t('changePassword.title')}>
+        <form onSubmit={handleChangePassword} className="max-w-sm space-y-3">
+          <input
+            type="password"
+            className={inputClass}
+            placeholder={t('changePassword.oldPlaceholder')}
+            autoComplete="current-password"
+            value={oldPassword}
+            onChange={(e) => setOldPassword(e.target.value)}
+          />
+          <input
+            type="password"
+            className={inputClass}
+            placeholder={t('changePassword.newPlaceholder')}
+            autoComplete="new-password"
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+          />
+          <input
+            type="password"
+            className={inputClass}
+            placeholder={t('changePassword.confirmPlaceholder')}
+            autoComplete="new-password"
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+          />
+          <button
+            type="submit"
+            disabled={submitting || !oldPassword || !newPassword}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
+          >
+            {submitting ? <Loader2 size={14} className="animate-spin" /> : <KeyRound size={14} />}
+            {submitting ? t('changePassword.submitting') : t('changePassword.submit')}
+          </button>
+          {msg && (
+            <p className={cn('text-sm', msg.ok ? 'text-cube-emerald' : 'text-rose-500')}>
+              {msg.text}
+            </p>
+          )}
+        </form>
       </SettingRow>
     </div>
   );
@@ -214,9 +336,9 @@ const MOD = isMac ? '⌘' : 'Ctrl';
 
 const SHORTCUTS: { action: string; keys: string[] }[] = [
   { action: 'shortcut.commandPalette', keys: [MOD, 'K'] },
-  { action: 'shortcut.escape',         keys: ['Esc'] },
-  { action: 'shortcut.refresh',        keys: ['R'] },
-  { action: 'shortcut.helpShortcuts',  keys: ['?'] },
+  { action: 'shortcut.escape', keys: ['Esc'] },
+  { action: 'shortcut.refresh', keys: ['R'] },
+  { action: 'shortcut.helpShortcuts', keys: ['?'] },
 ];
 
 function Kbd({ children }: { children: string }) {
@@ -260,17 +382,23 @@ function ShortcutsSection() {
 function AboutSection() {
   const { t } = useTranslation('settings');
   const { data: cfg } = useRuntimeConfig();
+  const version = useControlPlaneVersion();
 
   return (
     <div className="space-y-8">
       <SectionHeader icon={Info} title={t('about.title')} desc={t('about.desc')} />
 
       <div className="rounded-xl border border-border/60 bg-card/40 divide-y divide-border/40">
-        {([
-          { label: t('about.version'),     value: `v${__APP_VERSION__}`,                                     mono: true  },
-          { label: t('about.cubeApi'),     value: cfg?.apiEndpoint ?? `${window.location.origin}/cubeapi/v1`, mono: true  },
-          { label: t('about.instanceType'),value: cfg?.instanceType ?? '—',                                   mono: false },
-        ] as Array<{ label: string; value: string; mono: boolean }>).map(({ label, value, mono }) => (
+        {(
+          [
+            { label: t('about.version'), value: `v${version}`, mono: true },
+            {
+              label: t('about.cubeApi'),
+              value: cfg?.apiEndpoint ?? `${window.location.origin}/cubeapi/v1`,
+              mono: true,
+            },
+          ] as Array<{ label: string; value: string; mono: boolean }>
+        ).map(({ label, value, mono }) => (
           <div key={label} className="flex items-center justify-between px-5 py-3.5">
             <span className="text-sm text-muted-foreground">{label}</span>
             <span className={cn('text-sm text-foreground/90', mono && 'font-mono')}>{value}</span>
@@ -302,7 +430,15 @@ function AboutSection() {
 
 // ── Shared primitives ─────────────────────────────────────────────────────────
 
-function SectionHeader({ icon: Icon, title, desc }: { icon: React.ElementType; title: string; desc: string }) {
+function SectionHeader({
+  icon: Icon,
+  title,
+  desc,
+}: {
+  icon: React.ElementType;
+  title: string;
+  desc: string;
+}) {
   return (
     <div className="flex items-start gap-3 pb-2 border-b border-border/40">
       <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted/40 border border-border/60">
@@ -316,7 +452,15 @@ function SectionHeader({ icon: Icon, title, desc }: { icon: React.ElementType; t
   );
 }
 
-function SettingRow({ label, desc, children }: { label: string; desc?: string; children: React.ReactNode }) {
+function SettingRow({
+  label,
+  desc,
+  children,
+}: {
+  label: string;
+  desc?: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
       <div className="sm:w-56 shrink-0">
@@ -332,9 +476,10 @@ function SettingRow({ label, desc, children }: { label: string; desc?: string; c
 
 const SECTION_COMPONENTS: Record<string, React.ComponentType> = {
   appearance: AppearanceSection,
-  cluster:    ClusterSection,
-  shortcuts:  ShortcutsSection,
-  about:      AboutSection,
+  cluster: ClusterSection,
+  account: AccountSection,
+  shortcuts: ShortcutsSection,
+  about: AboutSection,
 };
 
 export default function SettingsPage() {
@@ -342,7 +487,7 @@ export default function SettingsPage() {
   const location = useLocation();
   const defaultTab = new URLSearchParams(location.search).get('tab') ?? 'appearance';
   const [active, setActive] = useState<string>(
-    SECTIONS.some(s => s.key === defaultTab) ? defaultTab : 'appearance'
+    SECTIONS.some((s) => s.key === defaultTab) ? defaultTab : 'appearance',
   );
   const ActiveSection = SECTION_COMPONENTS[active] ?? AppearanceSection;
 

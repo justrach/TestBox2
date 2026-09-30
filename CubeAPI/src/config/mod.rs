@@ -48,9 +48,11 @@ pub struct ServerConfig {
     ///   - `Authorization: Bearer <token>`, or
     ///   - `X-API-Key: <key>`
     ///
-    /// The middleware will POST to this URL with the credential headers plus
-    /// `X-Request-Path: <original request path>`. An HTTP 200 response grants
-    /// access; any other status code returns 401 to the client.
+    /// The middleware will POST to this URL with the credential headers plus:
+    ///   - `X-Request-Path: <original request path>`
+    ///   - `X-Request-Method: <HTTP method>` (e.g. GET, POST, DELETE, PATCH)
+    ///
+    /// An HTTP 200 response grants access; any other status code returns 401 to the client.
     ///
     /// When unset (default), all requests are allowed through without authentication.
     ///
@@ -58,12 +60,22 @@ pub struct ServerConfig {
     #[serde(default)]
     pub auth_callback_url: Option<String>,
 
-    /// Optional MySQL database URL used by AgentHub persistence.
+    /// Built-in simple API key for lightweight authentication.
     ///
-    /// Env vars checked by default: DATABASE_URL, then CUBE_API_DATABASE_URL.
-    /// Example: mysql://cube:cube_pass@127.0.0.1:3306/cube_mvp
-    #[serde(default = "default_database_url")]
-    pub database_url: Option<String>,
+    /// When `auth_callback_url` is unset and this field is set, every request
+    /// (except /health) must carry either:
+    ///   - `Authorization: Bearer <token>`, or
+    ///   - `X-API-Key: <key>`
+    ///
+    /// The extracted credential is compared as a string against this value.
+    /// A match grants access; a mismatch or missing credential returns 401.
+    ///
+    /// This is mutually exclusive with `auth_callback_url`: when both are set,
+    /// `auth_callback_url` (callback mode) takes priority.
+    ///
+    /// Env var: CUBE_API_KEY
+    #[serde(default)]
+    pub cube_api_key: Option<String>,
 }
 
 fn default_bind() -> String {
@@ -97,25 +109,6 @@ fn default_log_dir() -> String {
 fn default_log_prefix() -> String {
     "cube-api".to_string()
 }
-fn default_database_url() -> Option<String> {
-    std::env::var("DATABASE_URL")
-        .ok()
-        .or_else(|| std::env::var("CUBE_API_DATABASE_URL").ok())
-        .or_else(default_cube_sandbox_mysql_url)
-}
-
-fn default_cube_sandbox_mysql_url() -> Option<String> {
-    let host = std::env::var("CUBE_SANDBOX_MYSQL_HOST").ok()?;
-    let port = std::env::var("CUBE_SANDBOX_MYSQL_PORT").unwrap_or_else(|_| "3306".to_string());
-    let user = std::env::var("CUBE_SANDBOX_MYSQL_USER").ok()?;
-    let password = std::env::var("CUBE_SANDBOX_MYSQL_PASSWORD").ok()?;
-    let database = std::env::var("CUBE_SANDBOX_MYSQL_DB").ok()?;
-
-    Some(format!(
-        "mysql://{}:{}@{}:{}/{}",
-        user, password, host, port, database
-    ))
-}
 
 impl ServerConfig {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -141,7 +134,7 @@ impl Default for ServerConfig {
             log_dir: default_log_dir(),
             log_prefix: default_log_prefix(),
             auth_callback_url: None,
-            database_url: default_database_url(),
+            cube_api_key: std::env::var("CUBE_API_KEY").ok().filter(|s| !s.is_empty()),
         }
     }
 }

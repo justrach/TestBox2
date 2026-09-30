@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Tencent. All rights reserved.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useLocation } from 'react-router-dom';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import {
@@ -25,6 +26,7 @@ import {
   GitBranch,
   HeartPulse,
   Loader2,
+  Settings as SettingsIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -33,13 +35,39 @@ import { ROBOT_CHANNELS, type Agent, type RobotChannel } from '@/data/agents';
 import { useAgentStore } from '@/state/agentStore';
 import { AgentAvatar } from '@/components/agents/AgentAvatar';
 import { CreateAgentDialog } from '@/components/agents/CreateAgentDialog';
-import { agentHubApi, type AgentOperationDto, type AgentSnapshotDto, type AgentTemplateDto } from '@/api/client';
+import { AgentSettingsDialog } from '@/components/agents/AgentSettingsDialog';
+import { OnboardingGuide } from '@/components/agents/OnboardingGuide';
+import {
+  agentHubApi,
+  templateApi,
+  type AgentOperationDto,
+  type AgentSnapshotDto,
+  type AgentTemplateDto,
+} from '@/api/client';
 
 type Tab = 'personal' | 'team';
 
 const HIDE_AGENT_RECOVER = import.meta.env.VITE_HIDE_AGENT_RECOVER === '1';
 const OPENCLAW_GATEWAY_PORT = 18789;
-const LOGIN_ENV_PORT = 8080;
+const DEFAULT_LOGIN_ENV_PORT = 49999;
+
+/// Extract the environment port from the agent's envUrl.
+/// envUrl format: http://{port}-{sandboxId}.{domain}
+/// Falls back to DEFAULT_LOGIN_ENV_PORT when parsing fails.
+function envPortFromUrl(envUrl?: string): number {
+  if (!envUrl) return DEFAULT_LOGIN_ENV_PORT;
+  try {
+    const url = new URL(
+      envUrl,
+      typeof window !== 'undefined' ? window.location.href : 'http://localhost',
+    );
+    const match = url.hostname.match(/^(\d+)-/);
+    if (match) return parseInt(match[1], 10);
+  } catch {
+    /* fall through */
+  }
+  return DEFAULT_LOGIN_ENV_PORT;
+}
 
 const MODEL_OPTIONS = [
   { value: 'DeepSeek V4 Flash', labelKey: 'modelDialog.options.deepseekV4Flash' },
@@ -56,8 +84,25 @@ function gatewayTokenFromUrl(sourceUrl?: string): string | undefined {
   }
 }
 
-function buildCubeProxyUrl(agent: Agent, port: number, sourceUrl?: string, options?: { gateway?: boolean }): string | undefined {
+function buildCubeProxyUrl(
+  agent: Agent,
+  port: number,
+  sourceUrl?: string,
+  options?: { gateway?: boolean; gatewayDomain?: string },
+): string | undefined {
   if (!agent.sandboxId || typeof window === 'undefined') return sourceUrl;
+
+  // When a gateway domain is configured, each assistant gets its own origin via
+  // the `<port>-<sandboxId>.<domain>` subdomain. A distinct origin gives the
+  // OpenClaw UI its own localStorage, eliminating WebSocket "crosstalk" without
+  // the same-origin clearing workaround. The token rides along in the hash.
+  const gatewayDomain = options?.gatewayDomain?.trim();
+  if (options?.gateway && gatewayDomain) {
+    const token = gatewayTokenFromUrl(sourceUrl);
+    return `https://${port}-${agent.sandboxId}.${gatewayDomain}/${
+      token ? `#token=${encodeURIComponent(token)}` : ''
+    }`;
+  }
 
   let source: URL | undefined;
   if (sourceUrl) {
@@ -69,7 +114,10 @@ function buildCubeProxyUrl(agent: Agent, port: number, sourceUrl?: string, optio
   }
 
   const sourcePath = source?.pathname.replace(/^\/+/, '') ?? '';
-  const cubeProxyBase = `${window.location.protocol}//${window.location.hostname}`;
+  // Keep the sandbox proxy URL on the SAME origin as the dashboard (including port)
+  // so it is served through the WebUI nginx /sandbox/ forward. Same-origin is what
+  // lets clearOpenclawClientState() actually clear the OpenClaw UI's localStorage.
+  const cubeProxyBase = window.location.origin;
   const target = new URL(
     `/sandbox/${encodeURIComponent(agent.sandboxId)}/${port}/${sourcePath}`,
     cubeProxyBase,
@@ -78,7 +126,7 @@ function buildCubeProxyUrl(agent: Agent, port: number, sourceUrl?: string, optio
   source?.searchParams.forEach((value, key) => target.searchParams.set(key, value));
   if (options?.gateway) {
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${wsProtocol}//${window.location.hostname}/sandbox/${encodeURIComponent(agent.sandboxId)}/${port}/`;
+    const wsUrl = `${wsProtocol}//${window.location.host}/sandbox/${encodeURIComponent(agent.sandboxId)}/${port}/`;
     const token = gatewayTokenFromUrl(sourceUrl);
     target.hash = `ws=${wsUrl}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
   }
@@ -86,8 +134,31 @@ function buildCubeProxyUrl(agent: Agent, port: number, sourceUrl?: string, optio
   return target.toString();
 }
 
+// Demo-grade mitigation for OpenClaw WebSocket "crosstalk": all assistants are
+// proxied under the same dashboard origin (/sandbox/<id>/<port>/), so the OpenClaw
+// control UI shares one localStorage bucket and may reuse a cached gateway/token
+// from another assistant instead of the one in the URL. Clearing the OpenClaw keys
+// (everything not prefixed with the dashboard's own `cube.` namespace) right before
+// opening forces the freshly opened tab to read the wss address + token from the URL.
+// NOTE: real deployments should give each assistant a distinct origin (subdomain),
+// which makes this unnecessary.
+function clearOpenclawClientState(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const toRemove: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i += 1) {
+      const key = window.localStorage.key(i);
+      if (key && !key.startsWith('cube.')) toRemove.push(key);
+    }
+    toRemove.forEach((key) => window.localStorage.removeItem(key));
+  } catch {
+    // Storage may be unavailable (private mode / blocked); ignore.
+  }
+}
+
 export default function AgentHubPage() {
   const { t } = useTranslation('agentHub');
+  const location = useLocation();
   const [tab, setTab] = useState<Tab>('personal');
   const [dialogOpen, setDialogOpen] = useState(false);
   const [templateListOpen, setTemplateListOpen] = useState(false);
@@ -97,12 +168,18 @@ export default function AgentHubPage() {
   const [createError, setCreateError] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [previewNoticeDismissed, setPreviewNoticeDismissed] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [onboardingLoading, setOnboardingLoading] = useState(true);
+  const [apiKeyConfigured, setApiKeyConfigured] = useState(false);
+  const [llmModel, setLlmModel] = useState('deepseek/deepseek-v4-flash');
+  const [templateReady, setTemplateReady] = useState(false);
 
   const userAgents = useAgentStore((s) => s.userAgents);
   const setAgents = useAgentStore((s) => s.setAgents);
   const addAgent = useAgentStore((s) => s.addAgent);
   const updateAgent = useAgentStore((s) => s.updateAgent);
   const removeAgent = useAgentStore((s) => s.removeAgent);
+  const setGatewayDomain = useAgentStore((s) => s.setGatewayDomain);
   const agents = useMemo(() => userAgents, [userAgents]);
   const personalCount = agents.length;
   const teamCount = 0;
@@ -122,6 +199,52 @@ export default function AgentHubPage() {
     };
   }, [setAgents]);
 
+  // First-run readiness: a DeepSeek API key must be configured and at least one
+  // 龙虾助手 template (cluster template installed from the market, or a published
+  // assistant template) must exist before assistants can be created.
+  const refreshOnboarding = useCallback(() => {
+    setOnboardingLoading(true);
+    return Promise.allSettled([
+      agentHubApi.getSettings(),
+      templateApi.list(),
+      agentHubApi.listTemplates(),
+    ]).then(([settingsRes, clusterRes, agentRes]) => {
+      setApiKeyConfigured(
+        settingsRes.status === 'fulfilled'
+          ? (settingsRes.value.llmApiKeyConfigured ?? settingsRes.value.deepseekApiKeyConfigured)
+          : false,
+      );
+      setLlmModel(
+        settingsRes.status === 'fulfilled'
+          ? settingsRes.value.llmModel || 'deepseek/deepseek-v4-flash'
+          : 'deepseek/deepseek-v4-flash',
+      );
+      setGatewayDomain(
+        settingsRes.status === 'fulfilled' ? (settingsRes.value.gatewayDomain ?? '') : '',
+      );
+      const clusterHasOpenclaw =
+        clusterRes.status === 'fulfilled' &&
+        clusterRes.value.some(
+          (tpl) =>
+            /openclaw|wecom-ds/i.test(tpl.templateID) || /openclaw/i.test(tpl.imageInfo ?? ''),
+        );
+      const hasAgentTemplate = agentRes.status === 'fulfilled' && agentRes.value.length > 0;
+      setTemplateReady(clusterHasOpenclaw || hasAgentTemplate);
+      setOnboardingLoading(false);
+    });
+  }, []);
+
+  useEffect(() => {
+    void refreshOnboarding();
+  }, [refreshOnboarding]);
+
+  useEffect(() => {
+    const templateId = new URLSearchParams(location.search).get('createTemplate')?.trim();
+    if (!templateId) return;
+    setInitialTemplateId(templateId);
+    setDialogOpen(true);
+  }, [location.search]);
+
   return (
     <div className="animate-fade-in space-y-6">
       <header className="flex items-end justify-between gap-4">
@@ -129,15 +252,26 @@ export default function AgentHubPage() {
           <h1 className="text-2xl font-semibold tracking-tight">{t('title')}</h1>
           <p className="mt-1 text-sm text-muted-foreground">{t('subtitle')}</p>
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          className="gap-2"
-          onClick={() => setTemplateListOpen(true)}
-        >
-          <LayoutTemplate size={16} />
-          {t('templates.actions.open')}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            className="gap-2"
+            onClick={() => setSettingsOpen(true)}
+          >
+            <SettingsIcon size={16} />
+            {t('settings.openAction')}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            className="gap-2"
+            onClick={() => setTemplateListOpen(true)}
+          >
+            <LayoutTemplate size={16} />
+            {t('templates.actions.open')}
+          </Button>
+        </div>
       </header>
 
       {!previewNoticeDismissed && (
@@ -163,6 +297,13 @@ export default function AgentHubPage() {
           </div>
         </div>
       )}
+
+      <OnboardingGuide
+        loading={onboardingLoading}
+        apiKeyConfigured={apiKeyConfigured}
+        templateReady={templateReady}
+        onConfigureApiKey={() => setSettingsOpen(true)}
+      />
 
       <div className="flex items-center gap-2 rounded-full bg-muted/40 p-1 ring-1 ring-border/60 w-fit">
         <TabButton
@@ -201,7 +342,20 @@ export default function AgentHubPage() {
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         initialTemplateId={initialTemplateId}
+        apiKeyConfigured={apiKeyConfigured}
+        llmModel={llmModel}
+        onConfigureApiKey={() => {
+          setDialogOpen(false);
+          setSettingsOpen(true);
+        }}
         onError={setCreateError}
+      />
+      <AgentSettingsDialog
+        open={settingsOpen}
+        onOpenChange={setSettingsOpen}
+        onSaved={() => {
+          void refreshOnboarding();
+        }}
       />
       <ActionErrorDialog
         message={createError}
@@ -255,14 +409,14 @@ function TabButton({
         'flex items-center gap-2 rounded-full px-4 py-1.5 text-sm font-medium transition-colors',
         active
           ? 'bg-background text-foreground shadow-sm ring-1 ring-border/60'
-          : 'text-muted-foreground hover:text-foreground'
+          : 'text-muted-foreground hover:text-foreground',
       )}
     >
       <span>{label}</span>
       <span
         className={cn(
           'rounded-full px-1.5 py-0.5 text-[10px] tabular-nums',
-          active ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground'
+          active ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground',
         )}
       >
         {count}
@@ -339,8 +493,10 @@ function TemplateListDialog({
     setError(null);
     try {
       await agentHubApi.deleteTemplate(template.templateId);
+      setTemplates((previous) =>
+        previous.filter((item) => item.templateId !== template.templateId),
+      );
       setDeleteTemplate(null);
-      loadTemplates();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -394,7 +550,9 @@ function TemplateListDialog({
               <div className="rounded-2xl border border-dashed border-border/70 bg-muted/20 px-6 py-10 text-center">
                 <LayoutTemplate className="mx-auto text-muted-foreground/50" size={28} />
                 <div className="mt-3 text-sm font-medium">{t('templates.emptyTitle')}</div>
-                <p className="mt-1 text-xs text-muted-foreground">{t('templates.emptyDescription')}</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t('templates.emptyDescription')}
+                </p>
               </div>
             ) : (
               <div className="space-y-3">
@@ -422,10 +580,22 @@ function TemplateListDialog({
                       </span>
                     </div>
                     <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
-                      <TemplateMeta label={t('templates.fields.sourceAgent')} value={template.sourceAgentId} />
-                      <TemplateMeta label={t('templates.fields.sourceSnapshot')} value={template.sourceSnapshotId} />
-                      <TemplateMeta label={t('templates.fields.sourceSandbox')} value={template.sourceSandboxId} />
-                      <TemplateMeta label={t('templates.fields.createdAt')} value={template.createdAt || '-'} />
+                      <TemplateMeta
+                        label={t('templates.fields.sourceAgent')}
+                        value={template.sourceAgentId}
+                      />
+                      <TemplateMeta
+                        label={t('templates.fields.sourceSnapshot')}
+                        value={template.sourceSnapshotId}
+                      />
+                      <TemplateMeta
+                        label={t('templates.fields.sourceSandbox')}
+                        value={template.sourceSandboxId}
+                      />
+                      <TemplateMeta
+                        label={t('templates.fields.createdAt')}
+                        value={template.createdAt || '-'}
+                      />
                     </div>
                     <div className="mt-4 flex flex-wrap justify-end gap-2">
                       <Button
@@ -452,9 +622,15 @@ function TemplateListDialog({
                         disabled={actingTemplateId === template.templateId}
                         onClick={() => handleToggleRecommended(template)}
                       >
-                        {template.recommended ? t('templates.actions.unrecommend') : t('templates.actions.recommend')}
+                        {template.recommended
+                          ? t('templates.actions.unrecommend')
+                          : t('templates.actions.recommend')}
                       </Button>
-                      <Button type="button" size="sm" onClick={() => onUseTemplate(template.templateId)}>
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={() => onUseTemplate(template.templateId)}
+                      >
                         {t('templates.actions.useTemplate')}
                       </Button>
                       <Button
@@ -545,7 +721,7 @@ function PersonalGrid({
             onCloned={onCloned}
             onDeleted={onDeleted}
           />
-        )
+        ),
       )}
       <CreateAgentCard onClick={onCreate} />
     </div>
@@ -623,10 +799,12 @@ function AgentCard({
   const updateAgent = useAgentStore((s) => s.updateAgent);
   const addAgent = useAgentStore((s) => s.addAgent);
   const removeAgent = useAgentStore((s) => s.removeAgent);
+  const gatewayDomain = useAgentStore((s) => s.gatewayDomain);
   const isRunning = agent.status === 'running';
   const bots = agent.bots.filter(isSupportedRobotChannel);
   const botsAvailable = agent.botsAvailable.filter(isSupportedRobotChannel);
-  const actionDisabled = restarting || pausing || resuming || upgrading || deleting || Boolean(stateAction);
+  const actionDisabled =
+    restarting || pausing || resuming || upgrading || deleting || Boolean(stateAction);
   const operationTypeLabels: Record<string, string> = {
     snapshot: t('state.operations.types.snapshot'),
     rollback: t('state.operations.types.rollback'),
@@ -640,7 +818,7 @@ function AgentCard({
     failed: t('state.operations.status.failed'),
   };
   const snapshotNameById = new Map(
-    snapshots.map((s) => [s.snapshotID, s.names[0] || s.snapshotID] as const)
+    snapshots.map((s) => [s.snapshotID, s.names[0] || s.snapshotID] as const),
   );
   const healthySnapshotCount = snapshots.filter((s) => s.isHealthy).length;
 
@@ -973,7 +1151,7 @@ function AgentCard({
       return { placeholderId, name };
     });
     const results = await Promise.allSettled(
-      jobs.map((job) => agentHubApi.clone(agent.id, { name: job.name, snapshotId }))
+      jobs.map((job) => agentHubApi.clone(agent.id, { name: job.name, snapshotId })),
     );
     let firstError: string | null = null;
     results.forEach((res, i) => {
@@ -1016,9 +1194,7 @@ function AgentCard({
       onClick={onSelect}
       className={cn(
         'panel relative flex cursor-pointer flex-col p-5 transition-all hover:shadow-md',
-        selected
-          ? 'border-primary/60 shadow-md ring-2 ring-primary/50'
-          : 'hover:border-primary/30'
+        selected ? 'border-primary/60 shadow-md ring-2 ring-primary/50' : 'hover:border-primary/30',
       )}
     >
       {/* Top row: status + restart + menu */}
@@ -1027,12 +1203,10 @@ function AgentCard({
           <span
             className={cn(
               'inline-block h-2 w-2 rounded-full',
-              isRunning ? 'bg-emerald-500' : 'bg-muted-foreground/60'
+              isRunning ? 'bg-emerald-500' : 'bg-muted-foreground/60',
             )}
           />
-          <span className="text-muted-foreground">
-            {t(`card.status.${agent.status}` as const)}
-          </span>
+          <span className="text-muted-foreground">{t(`card.status.${agent.status}` as const)}</span>
           <button
             type="button"
             disabled={actionDisabled}
@@ -1087,13 +1261,9 @@ function AgentCard({
 
       {/* Field rows */}
       <div className="mt-5 space-y-2.5 text-xs">
-        <Row
-          label={t('card.fields.model')}
-          value={agent.model}
-          action={t('card.fields.modifyModel')}
-          actionDisabled={actionDisabled}
-          onAction={() => onChangeModel(agent)}
-        />
+        {/* Runtime model changes are disabled; the model is fixed when the
+            instance is provisioned. Clone or recreate to switch models. */}
+        <Row label={t('card.fields.model')} value={agent.model} />
         <Row
           label={t('card.fields.version')}
           value={agent.version}
@@ -1101,16 +1271,9 @@ function AgentCard({
           actionDisabled={actionDisabled}
           onAction={handleUpgrade}
         />
-        {agent.sandboxId && (
-          <Row
-            label={t('card.fields.sandboxId')}
-            value={agent.sandboxId}
-          />
-        )}
+        {agent.sandboxId && <Row label={t('card.fields.sandboxId')} value={agent.sandboxId} />}
         <div className="flex items-center gap-2">
-          <span className="w-12 shrink-0 text-muted-foreground">
-            {t('card.fields.robot')}
-          </span>
+          <span className="w-12 shrink-0 text-muted-foreground">{t('card.fields.robot')}</span>
           <Info
             size={11}
             className="shrink-0 text-muted-foreground/50"
@@ -1118,19 +1281,10 @@ function AgentCard({
           />
           <div className="ml-1 flex flex-wrap gap-1">
             {bots.map((b) => (
-              <BotChip
-                key={b}
-                channel={b}
-                bound
-                onClick={() => onConfigureWecom(agent)}
-              />
+              <BotChip key={b} channel={b} bound onClick={() => onConfigureWecom(agent)} />
             ))}
             {botsAvailable.map((b) => (
-              <BotChip
-                key={b}
-                channel={b}
-                onClick={() => onConfigureWecom(agent)}
-              />
+              <BotChip key={b} channel={b} onClick={() => onConfigureWecom(agent)} />
             ))}
           </div>
         </div>
@@ -1154,7 +1308,9 @@ function AgentCard({
                 title={t('state.recover.hint')}
                 className="h-8"
               >
-                {stateAction === 'recover' ? t('state.recover.recovering') : t('state.recover.action')}
+                {stateAction === 'recover'
+                  ? t('state.recover.recovering')
+                  : t('state.recover.action')}
               </Button>
             )}
             <Button
@@ -1183,13 +1339,18 @@ function AgentCard({
           <Dialog.Content className="fixed left-1/2 top-1/2 z-50 flex max-h-[calc(100vh-3rem)] w-[min(920px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 flex-col rounded-2xl border border-border/60 bg-card shadow-2xl">
             <div className="flex items-start justify-between gap-4 border-b border-border/60 px-6 py-4">
               <div>
-                <Dialog.Title className="text-base font-semibold">{t('state.detailTitle', { name: agent.name })}</Dialog.Title>
+                <Dialog.Title className="text-base font-semibold">
+                  {t('state.detailTitle', { name: agent.name })}
+                </Dialog.Title>
                 <Dialog.Description className="mt-1 text-sm text-muted-foreground">
                   {t('state.description')}
                 </Dialog.Description>
               </div>
               <Dialog.Close asChild>
-                <button type="button" className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+                <button
+                  type="button"
+                  className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                >
                   <span className="sr-only">{t('templates.actions.close')}</span>
                   <X size={18} />
                 </button>
@@ -1200,10 +1361,20 @@ function AgentCard({
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <div className="text-sm font-medium">{t('state.archives.title')}</div>
-                    <div className="text-xs text-muted-foreground">{t('state.archives.description')}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {t('state.archives.description')}
+                    </div>
                   </div>
-                  <Button type="button" size="sm" variant="outline" disabled={actionDisabled} onClick={refreshSnapshots}>
-                    {stateAction === 'list' ? t('state.actions.loading') : t('state.actions.refresh')}
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={actionDisabled}
+                    onClick={refreshSnapshots}
+                  >
+                    {stateAction === 'list'
+                      ? t('state.actions.loading')
+                      : t('state.actions.refresh')}
                   </Button>
                 </div>
                 <div className="flex gap-2">
@@ -1214,8 +1385,16 @@ function AgentCard({
                     placeholder={t('state.placeholders.snapshotName')}
                     className="h-9 text-xs"
                   />
-                  <Button type="button" size="sm" disabled={actionDisabled || !isRunning} onClick={handleCreateSnapshot} className="h-9 shrink-0">
-                    {stateAction === 'snapshot' ? t('state.actions.snapshotting') : t('state.actions.createSnapshot')}
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={actionDisabled || !isRunning}
+                    onClick={handleCreateSnapshot}
+                    className="h-9 shrink-0"
+                  >
+                    {stateAction === 'snapshot'
+                      ? t('state.actions.snapshotting')
+                      : t('state.actions.createSnapshot')}
                   </Button>
                 </div>
                 {snapshots.length === 0 ? (
@@ -1225,7 +1404,10 @@ function AgentCard({
                 ) : (
                   <div className="relative space-y-2">
                     {snapshots.length > 1 && (
-                      <div className="pointer-events-none absolute bottom-4 left-2 top-4 w-px bg-border/70" aria-hidden />
+                      <div
+                        className="pointer-events-none absolute bottom-4 left-2 top-4 w-px bg-border/70"
+                        aria-hidden
+                      />
                     )}
                     {snapshots.map((snapshot) => {
                       const parentName = snapshot.parentSnapshotID
@@ -1242,7 +1424,7 @@ function AgentCard({
                                 ? 'animate-pulse bg-amber-400'
                                 : snapshot.isHealthy
                                   ? 'bg-emerald-500'
-                                  : 'bg-muted-foreground/40'
+                                  : 'bg-muted-foreground/40',
                             )}
                             aria-hidden
                           />
@@ -1253,14 +1435,18 @@ function AgentCard({
                               actionDisabled && 'pointer-events-none opacity-60',
                               isSelected
                                 ? 'border-primary/50 bg-primary/5'
-                                : 'border-border/60 bg-background hover:border-primary/30'
+                                : 'border-border/60 bg-background hover:border-primary/30',
                             )}
                           >
                             <div className="flex flex-wrap items-start justify-between gap-2">
                               <div className="min-w-0">
-                                <div className="truncate text-sm font-medium">{snapshot.names[0] || snapshot.snapshotID}</div>
+                                <div className="truncate text-sm font-medium">
+                                  {snapshot.names[0] || snapshot.snapshotID}
+                                </div>
                                 {!isPending && (
-                                  <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{snapshot.snapshotID}</div>
+                                  <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
+                                    {snapshot.snapshotID}
+                                  </div>
                                 )}
                               </div>
                               <div className="flex flex-wrap items-center justify-end gap-1">
@@ -1297,9 +1483,16 @@ function AgentCard({
                               </div>
                             )}
                             <div className="mt-2 grid gap-1 text-[11px] text-muted-foreground sm:grid-cols-2">
-                              <span>{t('state.archives.createdAt')}: {snapshot.createdAt || '-'}</span>
-                              <span>{t('state.archives.updatedAt')}: {snapshot.updatedAt || '-'}</span>
-                              <span className="break-all sm:col-span-2">{t('state.archives.originSandbox')}: {snapshot.originSandboxID || '-'}</span>
+                              <span>
+                                {t('state.archives.createdAt')}: {snapshot.createdAt || '-'}
+                              </span>
+                              <span>
+                                {t('state.archives.updatedAt')}: {snapshot.updatedAt || '-'}
+                              </span>
+                              <span className="break-all sm:col-span-2">
+                                {t('state.archives.originSandbox')}:{' '}
+                                {snapshot.originSandboxID || '-'}
+                              </span>
                             </div>
                             {!isPending && (
                               <div className="mt-3 flex flex-wrap justify-end gap-2">
@@ -1335,14 +1528,20 @@ function AgentCard({
                                   type="button"
                                   size="sm"
                                   variant="outline"
-                                  disabled={actionDisabled || snapshot.templateReferenced || stateAction === 'deleteSnapshot'}
+                                  disabled={
+                                    actionDisabled ||
+                                    snapshot.templateReferenced ||
+                                    stateAction === 'deleteSnapshot'
+                                  }
                                   onClick={(event) => {
                                     event.stopPropagation();
                                     setSnapshotToDelete(snapshot);
                                   }}
                                   className="h-7"
                                 >
-                                  {stateAction === 'deleteSnapshot' ? t('state.actions.deleting') : t('state.actions.deleteSnapshot')}
+                                  {stateAction === 'deleteSnapshot'
+                                    ? t('state.actions.deleting')
+                                    : t('state.actions.deleteSnapshot')}
                                 </Button>
                               </div>
                             )}
@@ -1357,33 +1556,73 @@ function AgentCard({
                 <div className="rounded-xl border border-border/60 bg-background p-3">
                   <div className="text-sm font-medium">{t('state.actionsPanel.title')}</div>
                   <div className="mt-3 space-y-2">
-                    <Button type="button" size="sm" variant="outline" disabled={actionDisabled || !selectedSnapshotId} onClick={() => setRollbackConfirmOpen(true)} className="h-8 w-full">
-                      {stateAction === 'rollback' ? t('state.actions.rollbacking') : t('state.actions.rollback')}
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={actionDisabled || !selectedSnapshotId}
+                      onClick={() => setRollbackConfirmOpen(true)}
+                      className="h-8 w-full"
+                    >
+                      {stateAction === 'rollback'
+                        ? t('state.actions.rollbacking')
+                        : t('state.actions.rollback')}
                     </Button>
                     <div className="flex gap-2">
-                      <Input value={cloneName} disabled={actionDisabled} onChange={(e) => setCloneName(e.target.value)} placeholder={t('state.placeholders.cloneName')} className="h-8 flex-1 text-xs" />
+                      <Input
+                        value={cloneName}
+                        disabled={actionDisabled}
+                        onChange={(e) => setCloneName(e.target.value)}
+                        placeholder={t('state.placeholders.cloneName')}
+                        className="h-8 flex-1 text-xs"
+                      />
                       <Input
                         type="number"
                         min={1}
                         max={10}
                         value={cloneCount}
                         disabled={actionDisabled}
-                        onChange={(e) => setCloneCount(Math.min(Math.max(Math.trunc(Number(e.target.value)) || 1, 1), 10))}
+                        onChange={(e) =>
+                          setCloneCount(
+                            Math.min(Math.max(Math.trunc(Number(e.target.value)) || 1, 1), 10),
+                          )
+                        }
                         title={t('state.placeholders.cloneCount')}
                         aria-label={t('state.placeholders.cloneCount')}
                         className="h-8 w-16 text-center text-xs"
                       />
                     </div>
-                    <Button type="button" size="sm" variant="outline" disabled={actionDisabled} onClick={() => setCloneConfirmOpen(true)} className="h-8 w-full">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={actionDisabled}
+                      onClick={() => setCloneConfirmOpen(true)}
+                      className="h-8 w-full"
+                    >
                       {stateAction === 'clone'
                         ? t('state.actions.cloning')
                         : cloneCount > 1
                           ? t('state.actions.cloneN', { count: cloneCount })
                           : t('state.actions.clone')}
                     </Button>
-                    <Input value={templateName} disabled={actionDisabled} onChange={(e) => setTemplateName(e.target.value)} placeholder={t('state.placeholders.templateName')} className="h-8 text-xs" />
-                    <Button type="button" size="sm" disabled={actionDisabled} onClick={() => setPublishConfirmOpen(true)} className="h-8 w-full">
-                      {stateAction === 'publish' ? t('state.actions.publishing') : t('state.actions.publishAssistantTemplate')}
+                    <Input
+                      value={templateName}
+                      disabled={actionDisabled}
+                      onChange={(e) => setTemplateName(e.target.value)}
+                      placeholder={t('state.placeholders.templateName')}
+                      className="h-8 text-xs"
+                    />
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={actionDisabled}
+                      onClick={() => setPublishConfirmOpen(true)}
+                      className="h-8 w-full"
+                    >
+                      {stateAction === 'publish'
+                        ? t('state.actions.publishing')
+                        : t('state.actions.publishAssistantTemplate')}
                     </Button>
                     {publishResult && (
                       <div className="rounded-lg bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-600">
@@ -1401,7 +1640,9 @@ function AgentCard({
                           className="h-8 w-full"
                         >
                           <HeartPulse size={14} className="mr-1" />
-                          {stateAction === 'recover' ? t('state.recover.recovering') : t('state.recover.action')}
+                          {stateAction === 'recover'
+                            ? t('state.recover.recovering')
+                            : t('state.recover.action')}
                         </Button>
                         <div className="mt-1 text-[11px] text-muted-foreground">
                           {t('state.recover.panelHint', { count: healthySnapshotCount })}
@@ -1421,27 +1662,37 @@ function AgentCard({
                   <div className="text-sm font-medium">{t('state.operations.title')}</div>
                   <div className="mt-2 space-y-1.5">
                     {operations.length === 0 ? (
-                      <div className="text-xs text-muted-foreground">{t('state.operations.empty')}</div>
+                      <div className="text-xs text-muted-foreground">
+                        {t('state.operations.empty')}
+                      </div>
                     ) : (
                       operations.map((operation) => (
-                        <div key={operation.operationId} className="rounded-lg bg-muted/30 px-2 py-1.5 text-[11px]">
+                        <div
+                          key={operation.operationId}
+                          className="rounded-lg bg-muted/30 px-2 py-1.5 text-[11px]"
+                        >
                           <div className="flex items-center justify-between gap-2">
                             <span className="truncate text-muted-foreground">
-                              {operationTypeLabels[operation.operationType] || operation.operationType}
+                              {operationTypeLabels[operation.operationType] ||
+                                operation.operationType}
                             </span>
                             <span
                               className={cn(
                                 'shrink-0 rounded-full px-1.5 py-0.5',
-                                operation.status === 'succeeded' && 'bg-emerald-500/10 text-emerald-600',
-                                operation.status === 'failed' && 'bg-destructive/10 text-destructive',
-                                operation.status === 'running' && 'bg-primary/10 text-primary'
+                                operation.status === 'succeeded' &&
+                                  'bg-emerald-500/10 text-emerald-600',
+                                operation.status === 'failed' &&
+                                  'bg-destructive/10 text-destructive',
+                                operation.status === 'running' && 'bg-primary/10 text-primary',
                               )}
                               title={operation.errorMessage || operation.targetId || undefined}
                             >
                               {operationStatusLabels[operation.status]}
                             </span>
                           </div>
-                          <div className="mt-1 text-muted-foreground/70">{operation.updatedAt || operation.createdAt || '-'}</div>
+                          <div className="mt-1 text-muted-foreground/70">
+                            {operation.updatedAt || operation.createdAt || '-'}
+                          </div>
                         </div>
                       ))
                     )}
@@ -1523,9 +1774,15 @@ function AgentCard({
       <ConfirmDialog
         open={cloneConfirmOpen}
         title={t('state.dialogs.cloneTitle')}
-        description={t('state.prompts.clone', { count: Math.min(Math.max(Math.trunc(cloneCount) || 1, 1), 10) })}
+        description={t('state.prompts.clone', {
+          count: Math.min(Math.max(Math.trunc(cloneCount) || 1, 1), 10),
+        })}
         confirming={stateAction === 'clone'}
-        confirmLabel={cloneCount > 1 ? t('state.actions.cloneN', { count: cloneCount }) : t('state.actions.clone')}
+        confirmLabel={
+          cloneCount > 1
+            ? t('state.actions.cloneN', { count: cloneCount })
+            : t('state.actions.clone')
+        }
         onOpenChange={(open) => {
           if (!open) setCloneConfirmOpen(false);
         }}
@@ -1544,10 +1801,22 @@ function AgentCard({
       />
       <ConfirmDialog
         open={Boolean(healthyTarget)}
-        title={healthyTarget?.isHealthy ? t('state.dialogs.unmarkHealthyTitle') : t('state.dialogs.markHealthyTitle')}
-        description={healthyTarget?.isHealthy ? t('state.prompts.unmarkHealthy') : t('state.prompts.markHealthy')}
+        title={
+          healthyTarget?.isHealthy
+            ? t('state.dialogs.unmarkHealthyTitle')
+            : t('state.dialogs.markHealthyTitle')
+        }
+        description={
+          healthyTarget?.isHealthy
+            ? t('state.prompts.unmarkHealthy')
+            : t('state.prompts.markHealthy')
+        }
         confirming={stateAction === 'healthy'}
-        confirmLabel={healthyTarget?.isHealthy ? t('state.actions.unmarkHealthy') : t('state.actions.markHealthy')}
+        confirmLabel={
+          healthyTarget?.isHealthy
+            ? t('state.actions.unmarkHealthy')
+            : t('state.actions.markHealthy')
+        }
         onOpenChange={(open) => {
           if (!open) setHealthyTarget(null);
         }}
@@ -1563,8 +1832,16 @@ function AgentCard({
           className="gap-1.5"
           disabled={!isRunning || !agent.sandboxId || !gatewayReady}
           onClick={() => {
-            const url = buildCubeProxyUrl(agent, OPENCLAW_GATEWAY_PORT, agent.gatewayUrl, { gateway: true });
-            if (url) window.open(url, '_blank', 'noopener,noreferrer');
+            const url = buildCubeProxyUrl(agent, OPENCLAW_GATEWAY_PORT, agent.gatewayUrl, {
+              gateway: true,
+              gatewayDomain,
+            });
+            if (url) {
+              // Subdomain origins isolate localStorage on their own, so the
+              // same-origin clearing workaround is only needed for the proxy path.
+              if (!gatewayDomain.trim()) clearOpenclawClientState();
+              window.open(url, '_blank', 'noopener,noreferrer');
+            }
           }}
           title={!isRunning ? t('card.status.stopped') : undefined}
         >
@@ -1577,7 +1854,7 @@ function AgentCard({
           className="gap-1.5"
           disabled={!isRunning || !agent.sandboxId}
           onClick={() => {
-            const url = buildCubeProxyUrl(agent, LOGIN_ENV_PORT, agent.envUrl);
+            const url = buildCubeProxyUrl(agent, envPortFromUrl(agent.envUrl), agent.envUrl);
             if (url) window.open(url, '_blank', 'noopener,noreferrer');
           }}
           title={!isRunning ? t('card.status.stopped') : undefined}
@@ -1629,7 +1906,12 @@ function TemplateRenameDialog({
             autoFocus
           />
           <div className="mt-6 flex justify-end gap-2">
-            <Button type="button" variant="outline" disabled={saving} onClick={() => onOpenChange(false)}>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={saving}
+              onClick={() => onOpenChange(false)}
+            >
               {t('deleteDialog.actions.cancel')}
             </Button>
             <Button type="button" disabled={saving || !trimmed} onClick={() => onSubmit(trimmed)}>
@@ -1681,7 +1963,12 @@ function SnapshotRenameDialog({
             autoFocus
           />
           <div className="mt-6 flex justify-end gap-2">
-            <Button type="button" variant="outline" disabled={saving} onClick={() => onOpenChange(false)}>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={saving}
+              onClick={() => onOpenChange(false)}
+            >
               {t('deleteDialog.actions.cancel')}
             </Button>
             <Button type="button" disabled={saving || !trimmed} onClick={() => onSubmit(trimmed)}>
@@ -1727,7 +2014,12 @@ function ConfirmDialog({
             {description}
           </Dialog.Description>
           <div className="mt-6 flex justify-end gap-2">
-            <Button type="button" variant="outline" disabled={confirming} onClick={() => handleOpenChange(false)}>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={confirming}
+              onClick={() => handleOpenChange(false)}
+            >
               {t('deleteDialog.actions.cancel')}
             </Button>
             <Button type="button" disabled={confirming} onClick={onConfirm}>
@@ -1762,9 +2054,7 @@ function DeleteConfirmDialog({
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-40 bg-background/70 backdrop-blur-sm data-[state=open]:animate-fade-in" />
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-[min(440px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-border/60 bg-card p-6 shadow-2xl">
-          <Dialog.Title className="text-base font-semibold">
-            {t('deleteDialog.title')}
-          </Dialog.Title>
+          <Dialog.Title className="text-base font-semibold">{t('deleteDialog.title')}</Dialog.Title>
           <Dialog.Description className="mt-2 text-sm text-muted-foreground">
             {t('card.actions.deleteConfirm')}
           </Dialog.Description>
@@ -1801,9 +2091,7 @@ function ActionErrorDialog({
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-40 bg-background/70 backdrop-blur-sm data-[state=open]:animate-fade-in" />
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-[min(560px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-border/60 bg-card p-6 shadow-2xl">
-          <Dialog.Title className="text-base font-semibold">
-            {t('errorDialog.title')}
-          </Dialog.Title>
+          <Dialog.Title className="text-base font-semibold">{t('errorDialog.title')}</Dialog.Title>
           <Dialog.Description className="mt-1 text-sm text-muted-foreground">
             {t('errorDialog.description')}
           </Dialog.Description>
@@ -2096,7 +2384,7 @@ function ModelDialog({
                   size={16}
                   className={cn(
                     'shrink-0 text-muted-foreground transition-transform',
-                    modelPickerOpen && 'rotate-180'
+                    modelPickerOpen && 'rotate-180',
                   )}
                 />
               </button>
@@ -2115,7 +2403,7 @@ function ModelDialog({
                         }}
                         className={cn(
                           'flex w-full items-center justify-between px-4 py-2 text-left text-sm text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60',
-                          selected && 'bg-primary/10 text-foreground'
+                          selected && 'bg-primary/10 text-foreground',
                         )}
                       >
                         <span>{t(option.labelKey)}</span>
@@ -2223,9 +2511,7 @@ function WeComConfigDialog({
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-40 bg-background/70 backdrop-blur-sm data-[state=open]:animate-fade-in" />
         <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-[min(520px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-border/60 bg-card p-6 shadow-2xl">
-          <Dialog.Title className="text-base font-semibold">
-            {t('wecomDialog.title')}
-          </Dialog.Title>
+          <Dialog.Title className="text-base font-semibold">{t('wecomDialog.title')}</Dialog.Title>
           <Dialog.Description className="mt-1 text-sm text-muted-foreground">
             {t('wecomDialog.description')}
           </Dialog.Description>
@@ -2318,9 +2604,7 @@ function TeamComingSoon() {
         {t('tabs.comingSoonBadge')}
       </div>
       <h2 className="mt-3 text-lg font-semibold">{t('teamPlaceholder.title')}</h2>
-      <p className="max-w-md text-sm text-muted-foreground">
-        {t('teamPlaceholder.description')}
-      </p>
+      <p className="max-w-md text-sm text-muted-foreground">{t('teamPlaceholder.description')}</p>
     </div>
   );
 }

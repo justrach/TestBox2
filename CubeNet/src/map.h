@@ -96,26 +96,35 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } snat_iplist SEC(".maps");
 
-/* Inner map template for network policy (LPM trie)
+/* Direct-egress on-link neighbor trigger/cache.
  *
- * key:   struct lpm_key (prefixlen + IP)
- * value: __u32 (action / placeholder)
+ * key:   destination IPv4 address in packet-byte layout
+ * value: struct direct_neighbor — a TTL-bounded cache of the last
+ *        bpf_fib_lookup() result (MAC + valid_until + fib_ok + last_used) plus
+ *        the userspace scanner's trigger scheduling fields (step +
+ *        next_attempt/next_refresh). The MAC always comes from fib; this map
+ *        only caches it briefly and drives scanner scheduling.
  */
 struct {
-	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, MAX_ENTRIES);
-	__type(key, struct lpm_key);
-	__type(value, __u32);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-} net_policy_inner SEC(".maps");
+	__type(key, __u32);
+	__type(value, struct direct_neighbor);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} direct_neigh SEC(".maps");
 
-/* Egress allow list (hash of maps)
+/* Egress allow list v3 (hash of maps)
  *
  * key:   ifindex of the TAP device
- * value: fd of inner LPM trie map (destination IP allow list)
+ * value: fd of inner LPM trie map (destination ip[:port] allow list)
  *
- * If the inner map exists for a given ifindex and the destination IP
- * matches an entry, the packet is allowed regardless of deny_out.
+ * Inner keys use lpm_key_v3 so a single longest-prefix lookup resolves
+ * exact (ip, port) (prefixlen 48), ip-only / any-port (prefixlen 32),
+ * or ip/mask subnet (prefixlen < 32) rules. Inner values use
+ * net_policy_value_v3, which marks the L7 scheme directly (the port is
+ * now part of the key, so no per-packet (port, scheme) array scan).
+ * A zero expires_at_ns means a static entry; a non-zero expires_at_ns
+ * means a temporary DNS-learned entry.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
@@ -124,12 +133,12 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__array(values, struct {
 		__uint(type, BPF_MAP_TYPE_LPM_TRIE);
-		__uint(max_entries, MAX_ENTRIES);
-		__type(key, struct lpm_key);
-		__type(value, __u32);
+		__uint(max_entries, MAX_IP_RULE_ENTRIES);
+		__type(key, struct lpm_key_v3);
+		__type(value, struct net_policy_value_v3);
 		__uint(map_flags, BPF_F_NO_PREALLOC);
 	});
-} allow_out SEC(".maps");
+} allow_out_v3 SEC(".maps");
 
 /* Egress deny list (hash of maps)
  *
@@ -146,11 +155,86 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__array(values, struct {
 		__uint(type, BPF_MAP_TYPE_LPM_TRIE);
-		__uint(max_entries, MAX_ENTRIES);
+		__uint(max_entries, MAX_IP_RULE_ENTRIES);
 		__type(key, struct lpm_key);
 		__type(value, __u32);
 		__uint(map_flags, BPF_F_NO_PREALLOC);
 	});
 } deny_out SEC(".maps");
+
+/* DNS policy rules (hash of maps)
+ *
+ * key:   ifindex of the TAP device
+ * value: fd of inner LPM trie map for this sandbox's DNS policy rules
+ *
+ * Inner keys are reversed lower-case domain name prefixes. DNS policy mode is
+ * stored in ifindex_to_mvmmeta, while dns_allow_v2 stores only domain rules.
+ * Exact rule "qq.com" is encoded as "moc.qq\0" with the trailing NUL included
+ * in prefixlen. Wildcard rule "*.qq.com" is encoded as "moc.qq." without NUL,
+ * so only subdomains such as "a.qq.com" can match it.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+	__uint(max_entries, MAX_ENTRIES);
+	__type(key, __u32);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__array(values, struct {
+		__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+		__uint(max_entries, MAX_DOMAIN_RULE_ENTRIES);
+		__type(key, struct dns_allow_key);
+		__type(value, struct dns_allow_value);
+		__uint(map_flags, BPF_F_NO_PREALLOC);
+	});
+} dns_allow_v2 SEC(".maps");
+
+/* Pending DNS queries waiting for responses.
+ *
+ * key:   sandbox ifindex + DNS server IP + sandbox UDP source port + DNS id
+ *        + raw DNS QNAME hash
+ * value: L7 flags inherited from dns_allow_v2 and pending expiration time
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, MAX_DNS_QUERY_TRACK_ENTRIES);
+	__type(key, struct dns_query_track_key);
+	__type(value, struct dns_query_track_value);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} dns_query_track SEC(".maps");
+
+/* Per-CPU scratch space for DNS query parsing.
+ *
+ * Store parsed QNAMEs directly as LPM keys so they stay out of caller stack.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct dns_allow_key);
+} dns_query_scratch SEC(".maps");
+
+/* Tail-call state for chunked DNS query parsing. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct dns_query_state);
+} dns_query_state SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct dns_response_state);
+} dns_response_state SEC(".maps");
+
+/* Tail-call jump table for the DNS parser pipeline. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	/* Reserve extra slots for future DNS parser pipeline stages. */
+	__uint(max_entries, 16);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} dns_tail_calls SEC(".maps");
 
 #endif /* __MAP_H */

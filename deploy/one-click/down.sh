@@ -12,8 +12,7 @@ fi
 
 require_root
 
-TOOLBOX_ROOT="${ONE_CLICK_TOOLBOX_ROOT:-/usr/local/services/cubetoolbox}"
-INSTALL_PREFIX="${ONE_CLICK_INSTALL_PREFIX:-${TOOLBOX_ROOT}}"
+INSTALL_PREFIX="${CUBE_SANDBOX_INSTALL_ROOT}"
 ensure_dir "${INSTALL_PREFIX}"
 
 ROLE_FILE="${INSTALL_PREFIX}/.one-click.env"
@@ -29,3 +28,17 @@ if [[ "${ROLE}" == "compute" ]]; then
 else
   systemctl stop cube-sandbox-control.target
 fi
+
+# CubeS3lvol (when enabled) is a Wants= member of the role target, so starting
+# that target pulls it up. It is deliberately NOT PartOf= it (see the unit), so
+# the stop above does not reach it and it is asked for here: a stop of this
+# service is a full teardown -- disconnect, unload, SIGTERM -- and down.sh is
+# where that is wanted. An upgrade, which is not tearing anything down, stops it
+# on its own terms instead.
+if systemctl is-enabled cube-sandbox-s3lvol.service >/dev/null 2>&1; then
+  systemctl stop cube-sandbox-s3lvol.service
+fi
+
+# down.sh intentionally does NOT delete the s3lvol per-node state
+# (/data/cubelet/rcow/wal_bdev.img, lvstore/bstore metadata): the next
+# install/start attaches and replays it.

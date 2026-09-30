@@ -5,15 +5,25 @@
 -- they are truly distributed and don't lead to synchronized stampedes.
 math.randomseed(ngx.now() * 1000 + ngx.worker.id())
 
-local function monitor_cache_usage()
-    local cache_free_space = ngx.shared.local_cache:free_space()
-    ngx.shared.local_cache:set("cache_free_space", cache_free_space)
-end
-
-local worker_id = ngx.worker.id()
--- Only worker 0 performs these timed tasks
--- Even if worker PID is changed, worker ID still keep same
-if worker_id == 0 then
-    -- Creating the initial timer
-    ngx.timer.every(60, monitor_cache_usage)
-end
+-- Register this CubeProxy replica in Redis so Cube Lifecycle Manager can
+-- discover us. Config comes from environment variables so the operator can
+-- flip the feature on without editing nginx.conf (ngx.var.* is unavailable
+-- in init_worker_by_lua). All settings are optional; if CUBE_PROXY_REGISTRY_ENABLE
+-- is unset the setup call short-circuits.
+local proxy_registry = require "proxy_registry"
+proxy_registry.setup({
+    enable      = (os.getenv("CUBE_PROXY_REGISTRY_ENABLE") == "1"),
+    proxy_id    = os.getenv("CUBE_PROXY_ID"),
+    admin_url   = os.getenv("CUBE_PROXY_ADMIN_URL"),
+    resume_url  = os.getenv("CUBE_PROXY_RESUME_URL"),
+    node_ip     = os.getenv("CUBE_PROXY_NODE_IP"),
+    version     = os.getenv("CUBE_PROXY_VERSION"),
+    interval_ms = tonumber(os.getenv("CUBE_PROXY_HEARTBEAT_INTERVAL_MS") or "") or 5000,
+    redis_ip = os.getenv("CUBE_PROXY_REGISTRY_REDIS_HOST"),
+    redis_port  = tonumber(os.getenv("CUBE_PROXY_REGISTRY_REDIS_PORT") or "") or 6379,
+    redis_pd    = os.getenv("CUBE_PROXY_REGISTRY_REDIS_PASSWORD") or "",
+    redis_index = tonumber(os.getenv("CUBE_PROXY_REGISTRY_REDIS_DB") or "") or 0,
+    redis_master_name = os.getenv("CUBE_PROXY_REGISTRY_REDIS_MASTER_NAME"),
+    redis_sentinel_nodes = os.getenv("CUBE_PROXY_REGISTRY_REDIS_SENTINEL_NODES"),
+    redis_sentinel_pd = os.getenv("CUBE_PROXY_REGISTRY_REDIS_SENTINEL_PASSWORD"),
+})

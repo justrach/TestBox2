@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	cubeboxv1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db/models"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
@@ -21,6 +20,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	sandboxtypes "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"gorm.io/gorm"
 )
 
@@ -40,14 +40,18 @@ const cleanupTemplateRPCTimeout = 1 * time.Minute
 // the JobPhase* set in template_image.go; they are referenced here without
 // re-declaration to avoid duplicate constants.
 
-func SubmitTemplateCommit(ctx context.Context, sandboxID, nodeID, nodeIP string, req *sandboxtypes.CreateCubeSandboxReq) (*sandboxtypes.TemplateImageJobInfo, error) {
+func SubmitTemplateCommit(ctx context.Context, requestID, sandboxID, nodeID, nodeIP, templateID string, override *sandboxtypes.CreateCubeSandboxReq) (*sandboxtypes.TemplateImageJobInfo, error) {
 	if !isReady() {
 		return nil, ErrTemplateStoreNotInitialized
 	}
-	if req == nil || req.Request == nil || strings.TrimSpace(req.RequestID) == "" {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
 		return nil, errors.New("requestID is required for commit; retry should generate a new request id")
 	}
-	requestID := strings.TrimSpace(req.RequestID)
+	req, err := prepareTemplateCommitRequest(ctx, requestID, sandboxID, templateID, override)
+	if err != nil {
+		return nil, err
+	}
 	createReq, templateID, err := NormalizeRequest(req)
 	if err != nil {
 		return nil, err
@@ -151,7 +155,7 @@ func SubmitTemplateCommit(ctx context.Context, sandboxID, nodeID, nodeIP string,
 	// job invisible to the response. Match the sibling SubmitTemplateImage()
 	// path: detach the context (so HTTP client disconnects do not cancel the
 	// background work) and dispatch onto a fresh goroutine.
-	go runTemplateCommitJob(detachTemplateImageJobContext(ctx, map[string]any{
+	go runTemplateCommitJob(detachTemplateImageJobContext(ctx, "template_commit", map[string]any{
 		"job_id":          jobID,
 		"template_id":     templateID,
 		"attempt_no":      attemptNo,
@@ -162,6 +166,31 @@ func SubmitTemplateCommit(ctx context.Context, sandboxID, nodeID, nodeIP string,
 	}), jobID, sandboxID, nodeID, nodeIP, createReq, storedReq)
 
 	return GetTemplateImageJobInfo(ctx, jobID)
+}
+
+func prepareTemplateCommitRequest(ctx context.Context, requestID, sandboxID, templateID string, override *sandboxtypes.CreateCubeSandboxReq) (*sandboxtypes.CreateCubeSandboxReq, error) {
+	var source *sandboxtypes.CreateCubeSandboxReq
+	var err error
+	if override == nil {
+		source, err = loadSandboxCreateRequestFn(ctx, sandboxID)
+	} else {
+		source, err = cloneCreateRequest(override)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if source == nil {
+		return nil, errors.New("sandbox create request is empty")
+	}
+	if source.Request == nil {
+		source.Request = &sandboxtypes.Request{}
+	}
+	source.RequestID = requestID
+	if source.Annotations == nil {
+		source.Annotations = map[string]string{}
+	}
+	source.Annotations[constants.CubeAnnotationAppSnapshotTemplateID] = strings.TrimSpace(templateID)
+	return source, nil
 }
 
 func runTemplateCommitJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP string, createReq, storedReq *sandboxtypes.CreateCubeSandboxReq) {
@@ -197,6 +226,7 @@ func runTemplateCommitJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 		SandboxID:   sandboxID,
 		TemplateID:  templateID,
 		SnapshotDir: createReq.SnapshotDir,
+		Backend:     storageBackendFromCreate(createReq),
 	})
 	commitCancel()
 	if err != nil {
@@ -251,6 +281,7 @@ func runTemplateCommitJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 		_, cleanupErr := cubelet.CleanupTemplate(cleanupCtx, cubelet.GetCubeletAddr(nodeIP), &cubeboxv1.CleanupTemplateRequest{
 			RequestID:  uuid.NewString(),
 			TemplateID: templateID,
+			Backend:    pinnedCleanupBackend(storageBackendFromCreate(createReq)),
 		})
 		cleanupCancel()
 		if cleanupErr != nil {
@@ -288,6 +319,7 @@ func runTemplateCommitJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 		Spec:         calculateRequestSpec(createReq),
 		Status:       ReplicaStatusReady,
 	}
+	bindGuestVersionToReplica(&replica, commitRsp.GetGuestImageVersion(), commitRsp.GetAgentVersion(), commitRsp.GetKernelVersion(), commitRsp.GetShimVersion())
 	if err := UpsertReplica(ctx, templateID, createReq.InstanceType, replica); err != nil {
 		cleanupOnFailure(err)
 		return
@@ -390,6 +422,9 @@ func isDuplicateKeyError(err error) bool {
 	if errors.Is(err, gorm.ErrDuplicatedKey) {
 		return true
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "Duplicate entry") || strings.Contains(msg, "1062")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "1062") ||
+		strings.Contains(msg, "duplicate entry") ||
+		strings.Contains(msg, "unique constraint") ||
+		strings.Contains(msg, "duplicate key")
 }

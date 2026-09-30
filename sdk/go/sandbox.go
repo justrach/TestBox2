@@ -13,7 +13,14 @@ import (
 	"time"
 )
 
-const JupyterPort = 49999
+// JupyterPort hosts the code-interpreter (`/execute`), while EnvdPort hosts the
+// envd data-plane RPCs (commands, files, filesystem, pty). They mirror the
+// Python/Node SDKs (JUPYTER_PORT=49999, ENVD_PORT=49983); routing an envd RPC
+// to JupyterPort returns 404.
+const (
+	JupyterPort = 49999
+	EnvdPort    = 49983
+)
 
 func (s *Sandbox) GetHost(port int) string {
 	domain := s.Domain
@@ -21,6 +28,14 @@ func (s *Sandbox) GetHost(port int) string {
 		domain = s.client.config.SandboxDomain
 	}
 	return fmt.Sprintf("%d-%s.%s", port, s.SandboxID, domain)
+}
+
+func (s *Sandbox) addTrafficTokenHeaders(req *http.Request) {
+	if s.TrafficAccessToken == "" {
+		return
+	}
+	req.Header.Set("e2b-traffic-access-token", s.TrafficAccessToken)
+	req.Header.Set("cube-traffic-access-token", s.TrafficAccessToken)
 }
 
 func (s *Sandbox) GetInfo(ctx context.Context) (*SandboxInfo, error) {
@@ -89,17 +104,71 @@ func (s *Sandbox) Pause(ctx context.Context, opts PauseOptions) error {
 //
 // Deprecated: use Client.Connect instead, which auto-resumes paused sandboxes
 // and returns a fresh Sandbox instance.
-func (s *Sandbox) Resume(ctx context.Context, timeout time.Duration) error {
+// The timeout is optional; nil omits it. See docs/guide/lifecycle.md.
+func (s *Sandbox) Resume(ctx context.Context, timeout *time.Duration) error {
 	if err := s.ensureClient(); err != nil {
 		return err
 	}
-	if timeout <= 0 {
-		timeout = s.client.config.Timeout
-	}
 
 	path := "/sandboxes/" + url.PathEscape(s.SandboxID) + "/resume"
-	payload := map[string]any{"timeout": durationSeconds(timeout)}
+	payload := map[string]any{}
+	if timeout != nil {
+		payload["timeout"] = timeoutPayloadSeconds(*timeout)
+	}
 	return s.client.doJSON(ctx, http.MethodPost, path, payload, nil, http.StatusOK, http.StatusCreated, http.StatusNoContent)
+}
+
+// SetTimeout updates the sandbox idle timeout (POST /sandboxes/:id/timeout).
+//
+// Positive values set a new TTL in seconds. Zero requests immediate expiry.
+// NeverTimeout (-1) disables idle timeout entirely. Sub-second durations are
+// rounded up because the wire protocol uses integer seconds. Values other
+// than NeverTimeout that are < 0 are rejected with a descriptive error.
+//
+// Errors wrap ErrSandboxNotFound (404) or an *APIError for other HTTP errors.
+//
+// See docs/guide/lifecycle.md for timeout semantics.
+func (s *Sandbox) SetTimeout(ctx context.Context, timeout time.Duration) error {
+	if err := s.ensureClient(); err != nil {
+		return err
+	}
+	if timeout < 0 && timeout != NeverTimeout {
+		return fmt.Errorf("cubesandbox: timeout must be >= 0 or NeverTimeout (-1), got %v", timeout)
+	}
+
+	seconds := timeoutPayloadSeconds(timeout)
+	path := "/sandboxes/" + url.PathEscape(s.SandboxID) + "/timeout"
+	payload := map[string]any{"timeout": seconds}
+	return s.client.doJSON(ctx, http.MethodPost, path, payload, nil, http.StatusNoContent)
+}
+
+// UpdateNetwork replaces the sandbox's egress policy.
+//
+// network is the complete desired policy, not a patch: a field left at its zero
+// value clears whatever the sandbox currently has.
+//
+// The new policy applies to established connections as well as new ones — a
+// connection it no longer permits is reset rather than left running.
+//
+// Errors wrap ErrSandboxNotFound (404) or an *APIError for other HTTP errors,
+// including 409 when the sandbox is not running.
+func (s *Sandbox) UpdateNetwork(ctx context.Context, network UpdateNetworkOptions) error {
+	if err := s.ensureClient(); err != nil {
+		return err
+	}
+	internetAccessDisabled := network.AllowInternetAccess != nil && !*network.AllowInternetAccess
+	payload, err := buildNetworkPayload(network.NetworkOptions, internetAccessDisabled)
+	if err != nil {
+		return err
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	if network.AllowInternetAccess != nil {
+		payload["allowInternetAccess"] = *network.AllowInternetAccess
+	}
+	path := "/sandboxes/" + url.PathEscape(s.SandboxID) + "/network"
+	return s.client.doJSON(ctx, http.MethodPut, path, payload, nil, http.StatusNoContent)
 }
 
 func (s *Sandbox) Kill(ctx context.Context) error {
@@ -108,7 +177,13 @@ func (s *Sandbox) Kill(ctx context.Context) error {
 	}
 
 	path := "/sandboxes/" + url.PathEscape(s.SandboxID)
-	return s.client.doJSON(ctx, http.MethodDelete, path, nil, nil, http.StatusOK, http.StatusNoContent)
+	if err := s.client.doJSON(ctx, http.MethodDelete, path, nil, nil, http.StatusOK, http.StatusNoContent); err != nil {
+		return err
+	}
+	if s.cloneCleanup != nil {
+		s.cloneCleanup.release(ctx, s.SandboxID)
+	}
+	return nil
 }
 
 // Close releases idle HTTP connections used by this sandbox's client. It does
@@ -156,6 +231,7 @@ func (s *Sandbox) RunCode(ctx context.Context, code string, opts RunCodeOptions)
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	s.addTrafficTokenHeaders(req)
 
 	resp, err := s.client.dataHTTP.Do(req)
 	if err != nil {
@@ -179,7 +255,7 @@ func (s *Sandbox) Commands() *Commands {
 }
 
 func (s *Sandbox) Files() *Files {
-	return &Files{reader: s}
+	return &Files{reader: s, writer: s, filer: s}
 }
 
 func (s *Sandbox) ensureClient() error {

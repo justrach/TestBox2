@@ -21,11 +21,11 @@ import (
 	fwk "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/framework"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/nodehealth"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/rediskey"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/wrapredis"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 type EventType string
@@ -55,7 +55,7 @@ func Init(ctx context.Context) error {
 	l.imageCache = cache.New(0, 0)
 	l.templateNodeCache = cache.New(0, 0)
 	l.db = db.Init(config.GetDbConfig())
-	l.dbAddr = config.GetConfig().OssDBConfig.Addr
+	l.dbAddr = config.GetDbConfig().Addr
 	l.totalSelfNodes = config.GetConfig().Common.DefaultHeadlessServiceNodesNum
 	l.sortedNodesByClusters = make(map[string]node.NodeList)
 	l.sortedNodesByClusters[constants.DefaultInstanceTypeName] = node.NodeList{}
@@ -63,7 +63,7 @@ func Init(ctx context.Context) error {
 		l.sortedNodesByClusters[k] = node.NodeList{}
 	}
 
-	if err := l.loadAllFromDB(); err != nil {
+	if err := l.loadAllFromDB(context.Background()); err != nil {
 		return fmt.Errorf("loadAllFromDB:%v", err)
 	}
 
@@ -104,6 +104,46 @@ func GetNodes(n int) node.NodeList {
 }
 
 func GetHealthyNodes(n int) node.NodeList {
+	return collectCacheNodes(n, false)
+}
+
+func GetHealthyNodesByInstanceType(n int, product string) node.NodeList {
+	return collectClusterNodes(n, product, false)
+}
+
+// GetSchedulableNodesByInstanceType returns healthy nodes that may receive new
+// sandboxes. Cordon filtering happens before limit n so isolated nodes do not
+// consume PreSelectNum. Healthy-but-isolated nodes remain in GetHealthyNodes*.
+func GetSchedulableNodesByInstanceType(n int, product string) node.NodeList {
+	return collectClusterNodes(n, product, true)
+}
+
+func collectClusterNodes(n int, product string, requireSchedulable bool) node.NodeList {
+	l.lockSortedNodes.RLock()
+	clusterNodes, exists := l.sortedNodesByClusters[product]
+	l.lockSortedNodes.RUnlock()
+	if !exists {
+		return collectCacheNodes(n, requireSchedulable)
+	}
+
+	nodes := node.NodeList{}
+	now := time.Now()
+	for _, v := range clusterNodes {
+		if n >= 0 && nodes.Len() >= n {
+			break
+		}
+		if requireSchedulable && !v.SchedulingAllowed() {
+			continue
+		}
+		current := cloneNodeWithCurrentHealth(v, now)
+		if current.Healthy {
+			nodes.Append(current)
+		}
+	}
+	return nodes
+}
+
+func collectCacheNodes(n int, requireSchedulable bool) node.NodeList {
 	nodes := node.NodeList{}
 	elems := l.cache.Items()
 	now := time.Now()
@@ -112,42 +152,17 @@ func GetHealthyNodes(n int) node.NodeList {
 			break
 		}
 		h, ok := v.Object.(*node.Node)
-		if ok {
-			current := cloneNodeWithCurrentHealth(h, now)
-			if current.Healthy {
-				nodes.Append(current)
-			}
+		if !ok {
+			continue
 		}
-
-	}
-	return nodes
-}
-
-func GetHealthyNodesByInstanceType(n int, product string) node.NodeList {
-
-	l.lockSortedNodes.RLock()
-	clusterNodes, exists := l.sortedNodesByClusters[product]
-	l.lockSortedNodes.RUnlock()
-	if !exists {
-
-		return GetHealthyNodes(n)
-	}
-
-	nodes := node.NodeList{}
-	now := time.Now()
-
-	for _, v := range clusterNodes {
-
-		if n >= 0 && nodes.Len() >= n {
-			break
+		if requireSchedulable && !h.SchedulingAllowed() {
+			continue
 		}
-
-		current := cloneNodeWithCurrentHealth(v, now)
+		current := cloneNodeWithCurrentHealth(h, now)
 		if current.Healthy {
 			nodes.Append(current)
 		}
 	}
-
 	return nodes
 }
 
@@ -163,19 +178,13 @@ func GetNode(id string) (*node.Node, bool) {
 	return nil, false
 }
 
-func metadataHealthTimeout() time.Duration {
-	return nodehealth.MetadataTimeout(config.GetConfig().Common.SyncMetaDataInterval)
-}
-
-func cloneNodeWithCurrentHealth(n *node.Node, now time.Time) *node.Node {
+// cloneNodeWithCurrentHealth returns a defensive copy of n; CubeMaster trusts
+// the CubeOps Healthy verdict without overriding it on sync staleness.
+func cloneNodeWithCurrentHealth(n *node.Node, _ time.Time) *node.Node {
 	if n == nil {
 		return nil
 	}
-	current := n.Clone()
-	status := nodehealth.EvaluateFromFacts(n.ReportedReady, n.MetaDataUpdateAt, now, metadataHealthTimeout())
-	current.Healthy = status.Healthy
-	current.UnhealthyReason = status.UnhealthyReason
-	return current
+	return n.Clone()
 }
 
 func GetNodesByIp(ip string) (*node.Node, bool) {
@@ -209,60 +218,42 @@ func NotifyEvent(e *Event) error {
 }
 
 func SetSandboxProxyMap(ctx context.Context, proxyInfo *types.SandboxProxyMap) error {
-	keyByPass := "bypass_host_proxy" + ":" + proxyInfo.SandboxID
-	err := l.setByPassProsyToRedis(ctx, keyByPass, proxyInfo)
-	if err != nil {
-		return err
-	}
-	return nil
+	return l.setByPassProsyToRedis(ctx, rediskey.SandboxProxy(proxyInfo.SandboxID), proxyInfo)
 }
 
 func GetSandboxProxyMap(ctx context.Context, sandboxID string) (*types.SandboxProxyMap, bool) {
-
-	keyByPass := "bypass_host_proxy" + ":" + sandboxID
-	proxyMap, err := l.getByPassProsyFromRedis(ctx, keyByPass)
-	if err != nil {
-		return nil, false
+	for _, key := range rediskey.ReadKeysWithFallback(rediskey.SandboxProxy(sandboxID), rediskey.LegacySandboxProxy(sandboxID)) {
+		proxyMap, err := l.getByPassProsyFromRedis(ctx, key)
+		if err == nil && proxyMap != nil {
+			return proxyMap, true
+		}
 	}
-
-	if proxyMap != nil {
-		return proxyMap, true
-	} else {
-		return nil, false
-	}
+	return nil, false
 }
 
 func GetInstanceInfoMap(ctx context.Context, insID string) (*types.InstanceInfoMap, bool) {
-	keyByIns := "cube_instance_info" + ":" + insID
-	proxyMap, err := l.getInsInfoFromRedis(ctx, keyByIns)
-	if err != nil {
-		return nil, false
-	}
-
-	if proxyMap != nil {
-		return proxyMap, true
+	for _, key := range rediskey.ReadKeysWithFallback(rediskey.InstanceInfo(insID), rediskey.LegacyInstanceInfo(insID)) {
+		insMap, err := l.getInsInfoFromRedis(ctx, key)
+		if err == nil && insMap != nil {
+			return insMap, true
+		}
 	}
 	return nil, false
 }
 
 func SetInstanceInfoMap(ctx context.Context, insInfo *types.InstanceInfoMap) error {
-	keyByIns := "cube_instance_info" + ":" + insInfo.InsID
-	err := l.setInstanceInfoMapToRedis(ctx, keyByIns, insInfo)
-	if err != nil {
-		return err
-	}
-	return nil
+	return l.setInstanceInfoMapToRedis(ctx, rediskey.InstanceInfo(insInfo.InsID), insInfo)
 }
 
 func SetInstanceInfoField(ctx context.Context, insID string, kv ...string) error {
-	keyByIns := "cube_instance_info" + ":" + insID
 	fieldValues := []interface{}{}
 	for i := 0; i < len(kv); i += 2 {
 		fieldValues = append(fieldValues, kv[i], kv[i+1])
 	}
-	_, err := wrapredis.GetRedis(wrapredis.RedisWrite).Do("HSET", redis.Args{keyByIns}.AddFlat(fieldValues)...)
+	key := rediskey.InstanceInfo(insID)
+	_, err := wrapredis.GetRedis().Do("HSET", redis.Args{key}.AddFlat(fieldValues)...)
 	if err != nil {
-		log.G(ctx).Errorf("redis set error, key: %s, err: %s", keyByIns, err)
+		log.G(ctx).Errorf("redis set error, key: %s, err: %s", key, err)
 		return err
 	}
 	if log.IsDebug() {
@@ -272,44 +263,69 @@ func SetInstanceInfoField(ctx context.Context, insID string, kv ...string) error
 }
 
 func DeleteInstanceInfoMap(ctx context.Context, insID string) error {
-	keyByIns := "cube_instance_info" + ":" + insID
-	err := l.deleteKeyFromRedis(ctx, keyByIns)
-	if err != nil {
-		return err
+	var firstErr error
+	for _, key := range rediskey.DeleteKeys(rediskey.InstanceInfo(insID), rediskey.LegacyInstanceInfo(insID)) {
+		if err := l.deleteKeyFromRedis(ctx, key); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return nil
+	return firstErr
 }
 
 func DeleteSandboxProxyMap(ctx context.Context, sandboxID string) error {
-	keyByPass := "bypass_host_proxy" + ":" + sandboxID
-	err := l.deleteKeyFromRedis(ctx, keyByPass)
-	if err != nil {
-		return err
+	var firstErr error
+	for _, key := range rediskey.DeleteKeys(rediskey.SandboxProxy(sandboxID), rediskey.LegacySandboxProxy(sandboxID)) {
+		if err := l.deleteKeyFromRedis(ctx, key); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return nil
+	return firstErr
 }
 
 func SetDescribeTask(ctx context.Context, taskInfo *types.DescribeTaskMap) error {
-	key := "describetask" + ":" + taskInfo.TaskID
-	err := l.setDescribeTaskToRedis(ctx, key, taskInfo)
-	if err != nil {
-		return err
-	}
-	return nil
+	return l.setDescribeTaskToRedis(ctx, rediskey.DescribeTask(taskInfo.TaskID), taskInfo)
 }
 
 func GetDescribeTask(ctx context.Context, taskID string) (*types.DescribeTaskMap, bool) {
-	key := "describetask" + ":" + taskID
-	taskInfo, err := l.getDescribeTaskFromRedis(ctx, key)
-	if err != nil {
-		return nil, false
+	for _, key := range rediskey.ReadKeysWithFallback(rediskey.DescribeTask(taskID), rediskey.LegacyDescribeTask(taskID)) {
+		taskInfo, err := l.getDescribeTaskFromRedis(ctx, key)
+		if err == nil && taskInfo != nil {
+			return taskInfo, true
+		}
 	}
+	return nil, false
+}
 
-	if taskInfo != nil {
-		return taskInfo, true
-	} else {
+func SetTemplateImageJobPullProgress(ctx context.Context, progress *types.TemplateImageJobPullProgressMap) error {
+	if progress == nil || progress.JobID == "" {
+		return errors.New("template image job pull progress requires job id")
+	}
+	return l.setTemplateImageJobPullProgressToRedis(ctx, templateImageJobPullProgressKey(progress.JobID), progress)
+}
+
+func SetTemplateImageJobPullProgressNoTTL(ctx context.Context, progress *types.TemplateImageJobPullProgressMap) error {
+	if progress == nil || progress.JobID == "" {
+		return errors.New("template image job pull progress requires job id")
+	}
+	return l.setTemplateImageJobPullProgressFieldsToRedis(ctx, templateImageJobPullProgressKey(progress.JobID), progress)
+}
+
+func GetTemplateImageJobPullProgress(ctx context.Context, jobID string) (*types.TemplateImageJobPullProgressMap, bool) {
+	if jobID == "" {
 		return nil, false
 	}
+	progress, err := l.getTemplateImageJobPullProgressFromRedis(ctx, templateImageJobPullProgressKey(jobID))
+	if err != nil || progress == nil {
+		return nil, false
+	}
+	return progress, true
+}
+
+func DeleteTemplateImageJobPullProgress(ctx context.Context, jobID string) error {
+	if jobID == "" {
+		return nil
+	}
+	return l.deleteKeyFromRedis(ctx, templateImageJobPullProgressKey(jobID))
 }
 
 func RangeDBHost(index, size int, product string) ([]*node.Node, int) {
@@ -450,6 +466,10 @@ func GetImageStateByNode(imageName string, nodeName string) *fwk.ImageStateSumma
 
 func RegisterTemplateReplica(templateID, nodeID string, sizeBytes int64) {
 	registerTemplateReplica(templateID, nodeID, sizeBytes, true)
+}
+
+func DeregisterTemplateReplica(templateID, nodeID string) {
+	deregisterTemplateReplica(templateID, nodeID, true)
 }
 
 func registerTemplateReplica(templateID, nodeID string, sizeBytes int64, syncNodeTemplates bool) {

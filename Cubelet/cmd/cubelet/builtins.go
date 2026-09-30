@@ -66,6 +66,7 @@ import (
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/cubes"
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/metric"
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/netfile"
+	_ "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/resourcemetrics"
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/multimeta"
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/runtime"
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/snapshots/overlay/plugin"
@@ -80,6 +81,7 @@ import (
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/services/gc"
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/services/images"
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/services/nbi"
+	_ "github.com/tencentcloud/CubeSandbox/Cubelet/services/snapshot"
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/services/version"
 	_ "github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 )

@@ -7,7 +7,7 @@ package ret
 import (
 	"fmt"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -113,7 +113,7 @@ func WrapWithDefaultError(err error, defaultErr errorcode.ErrorCode) error {
 	if ok {
 		return err
 	}
-	return Errorf(defaultErr, err.Error())
+	return Errorf(defaultErr, "%s", err.Error())
 }
 
 func FetchErrorCode(err error) string {

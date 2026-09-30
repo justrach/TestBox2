@@ -6,7 +6,7 @@
 package version
 
 import (
-	"strings"
+	"fmt"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/version"
 	"github.com/urfave/cli"
@@ -14,26 +14,23 @@ import (
 
 var Command = cli.Command{
 	Name:  "version",
-	Usage: "print the client and server versions",
+	Usage: "print the client version",
 	Flags: []cli.Flag{
 		&cli.BoolFlag{
 			Name:  "versiononly,v",
-			Usage: "print server version only",
+			Usage: "print semantic version only",
 		},
 		&cli.BoolFlag{
 			Name:  "withclient,c",
-			Usage: "print client version",
+			Usage: "deprecated: client version is printed by default",
 		},
 	},
 	Action: func(context *cli.Context) error {
-		var buf strings.Builder
-		if context.Bool("withclient") {
-			buf.WriteString(version.ShowVersion() + "\n")
-			buf.WriteString("Client:" + "\n")
-			buf.WriteString("  Version: " + version.Version + "\n")
-			buf.WriteString("  Revision :" + version.Revision + "\n")
-			buf.WriteString("  Go version: " + version.GoVersion + "\n")
+		if context.Bool("versiononly") {
+			fmt.Println(version.Version)
+			return nil
 		}
+		fmt.Println(version.VersionString("cubemastercli"))
 		return nil
 	},
 }

@@ -12,5 +12,19 @@ class CubeSandboxError(Exception):
 
 class SandboxNotFoundError(CubeSandboxError): ...
 class TemplateNotFoundError(CubeSandboxError): ...
+class VolumeNotFoundError(CubeSandboxError): ...
 class AuthenticationError(CubeSandboxError): ...
 class ApiError(CubeSandboxError): ...
+class FilesystemNotFoundError(CubeSandboxError): ...
+
+
+class PartialWriteError(IOError):
+    """Raised when write_files fails partway through.
+
+    Attributes:
+        written: Number of files successfully written before the failure.
+    """
+
+    def __init__(self, message: str, *, written: int):
+        super().__init__(message)
+        self.written = written

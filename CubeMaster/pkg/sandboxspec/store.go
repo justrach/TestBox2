@@ -44,7 +44,7 @@ func Init(client *gorm.DB) error {
 	if client == nil {
 		return errors.New("sandboxspec.Init: nil db")
 	}
-	// Schema for t_cube_sandbox_spec is owned by pkg/base/dao/migrate and
+	// Schema for t_cube_sandbox_spec is owned by pkgs/cubedb/migrate and
 	// applied at startup before Init runs; here we only cache the handle.
 	dbMu.Lock()
 	db = client
@@ -108,6 +108,19 @@ func doPut(ctx context.Context, sandboxID string, req *sandboxtypes.CreateCubeSa
 	if canonical.Annotations != nil {
 		templateID = strings.TrimSpace(canonical.Annotations[constants.CubeAnnotationAppSnapshotTemplateID])
 	}
+	backend := ""
+	if normalized, ok, err := constants.OptionalSnapshotBackend(canonical.Backend); err == nil && ok {
+		backend = normalized
+		canonical.Backend = normalized
+		if canonical.Annotations == nil {
+			canonical.Annotations = map[string]string{}
+		}
+		canonical.Annotations[constants.CubeAnnotationStorageBackend] = normalized
+		payload, err = json.Marshal(canonical)
+		if err != nil {
+			return err
+		}
+	}
 	rec := &models.SandboxSpec{
 		SandboxID:    sandboxID,
 		TemplateID:   templateID,
@@ -116,6 +129,7 @@ func doPut(ctx context.Context, sandboxID string, req *sandboxtypes.CreateCubeSa
 		HostID:       strings.TrimSpace(opts.HostID),
 		HostIP:       strings.TrimSpace(opts.HostIP),
 		RequestJSON:  string(payload),
+		Backend:      backend,
 		Backfilled:   opts.Backfilled,
 	}
 	// Single-roundtrip UPSERT keyed on the unique sandbox_id index so the
@@ -135,6 +149,7 @@ func doPut(ctx context.Context, sandboxID string, req *sandboxtypes.CreateCubeSa
 				"host_id",
 				"host_ip",
 				"request_json",
+				"backend",
 				"backfilled",
 				"updated_at",
 			}),
@@ -181,6 +196,9 @@ func Get(ctx context.Context, sandboxID string) (*sandboxtypes.CreateCubeSandbox
 	out := &sandboxtypes.CreateCubeSandboxReq{}
 	if err := json.Unmarshal([]byte(rec.RequestJSON), out); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(out.Backend) == "" && strings.TrimSpace(rec.Backend) != "" {
+		out.Backend = rec.Backend
 	}
 	return out, nil
 }
@@ -232,7 +250,7 @@ func CanonicalizeRequest(req *sandboxtypes.CreateCubeSandboxReq) (*sandboxtypes.
 	if out.Labels == nil {
 		out.Labels = map[string]string{}
 	}
-	out.Timeout = 0
+	out.Timeout = nil
 	out.InsId = ""
 	out.InsIp = ""
 	out.Request = nil

@@ -20,10 +20,10 @@ import (
 
 	"github.com/google/uuid"
 	jsoniter "github.com/json-iterator/go"
-	api "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
 	commands "github.com/tencentcloud/CubeSandbox/CubeMaster/cmd/cubemastercli/commands"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	api "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"github.com/urfave/cli"
 )
 
@@ -39,15 +39,24 @@ type templateReplicaStatus struct {
 }
 
 type templateResponse struct {
-	RequestID     string                      `json:"requestID,omitempty"`
-	Ret           *types.Ret                  `json:"ret,omitempty"`
-	TemplateID    string                      `json:"template_id,omitempty"`
-	InstanceType  string                      `json:"instance_type,omitempty"`
-	Version       string                      `json:"version,omitempty"`
-	Status        string                      `json:"status,omitempty"`
-	LastError     string                      `json:"last_error,omitempty"`
-	Replicas      []templateReplicaStatus     `json:"replicas,omitempty"`
-	CreateRequest *types.CreateCubeSandboxReq `json:"create_request,omitempty"`
+	RequestID                  string                      `json:"requestID,omitempty"`
+	Ret                        *types.Ret                  `json:"ret,omitempty"`
+	TemplateID                 string                      `json:"template_id,omitempty"`
+	InstanceType               string                      `json:"instance_type,omitempty"`
+	Version                    string                      `json:"version,omitempty"`
+	Status                     string                      `json:"status,omitempty"`
+	LastError                  string                      `json:"last_error,omitempty"`
+	DisplayName                string                      `json:"display_name,omitempty"`
+	StorageBackend             string                      `json:"storage_backend,omitempty"`
+	Backend                    string                      `json:"backend,omitempty"`
+	CreatedAt                  string                      `json:"created_at,omitempty"`
+	ImageInfo                  string                      `json:"image_info,omitempty"`
+	JobID                      string                      `json:"job_id,omitempty"`
+	Replicas                   []templateReplicaStatus     `json:"replicas,omitempty"`
+	CreateRequest              *types.CreateCubeSandboxReq `json:"create_request,omitempty"`
+	CubeEgressCABaked          bool                        `json:"cube_egress_ca_baked,omitempty"`
+	CubeEgressCAFingerprint    string                      `json:"cube_egress_ca_fingerprint,omitempty"`
+	CubeEgressCATargetsWritten int                         `json:"cube_egress_ca_targets_written,omitempty"`
 }
 
 type templateListResponse struct {
@@ -56,13 +65,19 @@ type templateListResponse struct {
 }
 
 type templateSummary struct {
-	TemplateID   string `json:"template_id,omitempty"`
-	InstanceType string `json:"instance_type,omitempty"`
-	Version      string `json:"version,omitempty"`
-	Status       string `json:"status,omitempty"`
-	LastError    string `json:"last_error,omitempty"`
-	CreatedAt    string `json:"created_at,omitempty"`
-	ImageInfo    string `json:"image_info,omitempty"`
+	TemplateID     string `json:"template_id,omitempty"`
+	InstanceType   string `json:"instance_type,omitempty"`
+	Version        string `json:"version,omitempty"`
+	Status         string `json:"status,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+	DisplayName    string `json:"display_name,omitempty"`
+	StorageBackend string `json:"storage_backend,omitempty"`
+	Backend        string `json:"backend,omitempty"`
+	OriginNodeID   string `json:"origin_node_id,omitempty"`
+	OriginNodeIP   string `json:"origin_node_ip,omitempty"`
+	CreatedAt      string `json:"created_at,omitempty"`
+	ImageInfo      string `json:"image_info,omitempty"`
+	JobID          string `json:"job_id,omitempty"`
 }
 
 type templateImageJobResponse struct {
@@ -74,7 +89,6 @@ type templateImageJobResponse struct {
 type templateCommitRequest struct {
 	RequestID     string                      `json:"requestID,omitempty"`
 	SandboxID     string                      `json:"sandbox_id,omitempty"`
-	TemplateID    string                      `json:"template_id,omitempty"`
 	CreateRequest *types.CreateCubeSandboxReq `json:"create_request,omitempty"`
 }
 
@@ -112,21 +126,26 @@ type templateDeleteRequest struct {
 	Sync         bool   `json:"sync,omitempty"`
 }
 
-func mergeCubeVSContextFlags(c *cli.Context, existing *types.CubeVSContext) *types.CubeVSContext {
+type templateMigrateRequest struct {
+	RequestID  string `json:"requestID,omitempty"`
+	TemplateID string `json:"template_id,omitempty"`
+}
+
+func mergeCubeNetworkConfigFlags(c *cli.Context, existing *types.CubeNetworkConfig) *types.CubeNetworkConfig {
 	hasAllowInternetAccess := c.IsSet("allow-internet-access")
 	allowOut := dedupeCIDRs(c.StringSlice("allow-out-cidr"))
 	denyOut := dedupeCIDRs(c.StringSlice("deny-out-cidr"))
-	return mergeCubeVSContextValues(existing, hasAllowInternetAccess, c.Bool("allow-internet-access"), allowOut, denyOut)
+	return mergeCubeNetworkConfigValues(existing, hasAllowInternetAccess, c.Bool("allow-internet-access"), allowOut, denyOut)
 }
 
-func mergeCubeVSContextValues(existing *types.CubeVSContext, hasAllowInternetAccess bool, allowInternetAccess bool, allowOut []string, denyOut []string) *types.CubeVSContext {
+func mergeCubeNetworkConfigValues(existing *types.CubeNetworkConfig, hasAllowInternetAccess bool, allowInternetAccess bool, allowOut []string, denyOut []string) *types.CubeNetworkConfig {
 	if !hasAllowInternetAccess && len(allowOut) == 0 && len(denyOut) == 0 {
 		return existing
 	}
 
-	out := cloneCubeVSContext(existing)
+	out := cloneCubeNetworkConfig(existing)
 	if out == nil {
-		out = &types.CubeVSContext{}
+		out = &types.CubeNetworkConfig{}
 	}
 	if hasAllowInternetAccess {
 		out.AllowInternetAccess = &allowInternetAccess
@@ -140,15 +159,15 @@ func mergeCubeVSContextValues(existing *types.CubeVSContext, hasAllowInternetAcc
 	return out
 }
 
-type createFromImageExtraCubeVSFlags struct {
+type createFromImageExtraNetworkFlags struct {
 	hasAllowInternetAccess bool
 	allowInternetAccess    bool
 	allowOut               []string
 	denyOut                []string
 }
 
-func mergeCreateFromImageCubeVSContextFlags(c *cli.Context, existing *types.CubeVSContext) (*types.CubeVSContext, error) {
-	extra, err := parseCreateFromImageExtraCubeVSFlags(c)
+func mergeCreateFromImageCubeNetworkConfigFlags(c *cli.Context, existing *types.CubeNetworkConfig) (*types.CubeNetworkConfig, error) {
+	extra, err := parseCreateFromImageExtraNetworkFlags(c)
 	if err != nil {
 		return nil, err
 	}
@@ -159,18 +178,26 @@ func mergeCreateFromImageCubeVSContextFlags(c *cli.Context, existing *types.Cube
 	}
 	allowOut := appendUniqueCIDRs(dedupeCIDRs(c.StringSlice("allow-out-cidr")), extra.allowOut)
 	denyOut := appendUniqueCIDRs(dedupeCIDRs(c.StringSlice("deny-out-cidr")), extra.denyOut)
-	return mergeCubeVSContextValues(existing, hasAllowInternetAccess, allowInternetAccess, allowOut, denyOut), nil
+	return mergeCubeNetworkConfigValues(existing, hasAllowInternetAccess, allowInternetAccess, allowOut, denyOut), nil
 }
 
-func parseCreateFromImageExtraCubeVSFlags(c *cli.Context) (*createFromImageExtraCubeVSFlags, error) {
+func applyCreateFromImageIvshmemFlag(c *cli.Context, req *types.CreateTemplateFromImageReq) {
+	if !c.IsSet("enable-ivshmem") {
+		return
+	}
+	enableIvshmem := c.Bool("enable-ivshmem")
+	req.EnableIvshmem = &enableIvshmem
+}
+
+func parseCreateFromImageExtraNetworkFlags(c *cli.Context) (*createFromImageExtraNetworkFlags, error) {
 	extraArgs := make([]string, 0, c.NArg())
 	for i := 0; i < c.NArg(); i++ {
 		extraArgs = append(extraArgs, c.Args().Get(i))
 	}
 	if len(extraArgs) == 0 {
-		return &createFromImageExtraCubeVSFlags{}, nil
+		return &createFromImageExtraNetworkFlags{}, nil
 	}
-	extra := &createFromImageExtraCubeVSFlags{}
+	extra := &createFromImageExtraNetworkFlags{}
 	idx := 0
 
 	if c.IsSet("allow-internet-access") {
@@ -245,19 +272,8 @@ func parseBoolToken(value string) (bool, bool) {
 	}
 }
 
-func cloneCubeVSContext(in *types.CubeVSContext) *types.CubeVSContext {
-	if in == nil {
-		return nil
-	}
-	out := &types.CubeVSContext{
-		AllowOut: append([]string(nil), in.AllowOut...),
-		DenyOut:  append([]string(nil), in.DenyOut...),
-	}
-	if in.AllowInternetAccess != nil {
-		allowInternetAccess := *in.AllowInternetAccess
-		out.AllowInternetAccess = &allowInternetAccess
-	}
-	return out
+func cloneCubeNetworkConfig(in *types.CubeNetworkConfig) *types.CubeNetworkConfig {
+	return in.DeepCopy()
 }
 
 func dedupeCIDRs(values []string) []string {
@@ -283,26 +299,26 @@ func appendUniqueCIDRs(base []string, extra []string) []string {
 	return out
 }
 
-func formatCubeVSContext(ctx *types.CubeVSContext) string {
-	if ctx == nil {
-		return "allow_internet_access=default(true) allow_out=[] deny_out=[]"
+func formatCubeNetworkConfig(cfg *types.CubeNetworkConfig) string {
+	if cfg == nil {
+		return "allow_internet_access=default(true) allow_out=[] deny_out=[] rules=0"
 	}
 	allow := "default(true)"
-	if ctx.AllowInternetAccess != nil {
-		allow = fmt.Sprintf("%t", *ctx.AllowInternetAccess)
+	if cfg.AllowInternetAccess != nil {
+		allow = fmt.Sprintf("%t", *cfg.AllowInternetAccess)
 	}
-	return fmt.Sprintf("allow_internet_access=%s allow_out=%v deny_out=%v", allow, ctx.AllowOut, ctx.DenyOut)
+	return fmt.Sprintf("allow_internet_access=%s allow_out=%v deny_out=%v rules=%d", allow, cfg.AllowOut, cfg.DenyOut, len(cfg.Rules))
 }
 
-func formatProtoCubeVSContext(ctx *api.CubeVSContext) string {
-	if ctx == nil {
-		return "allow_internet_access=default(true) allow_out=[] deny_out=[]"
+func formatProtoCubeNetworkConfig(cfg *api.CubeNetworkConfig) string {
+	if cfg == nil {
+		return "allow_internet_access=default(true) allow_out=[] deny_out=[] rules=0"
 	}
 	allow := "default(true)"
-	if ctx.AllowInternetAccess != nil {
-		allow = fmt.Sprintf("%t", ctx.GetAllowInternetAccess())
+	if cfg.AllowInternetAccess != nil {
+		allow = fmt.Sprintf("%t", cfg.GetAllowInternetAccess())
 	}
-	return fmt.Sprintf("allow_internet_access=%s allow_out=%v deny_out=%v", allow, ctx.GetAllowOut(), ctx.GetDenyOut())
+	return fmt.Sprintf("allow_internet_access=%s allow_out=%v deny_out=%v rules=%d", allow, cfg.GetAllowOut(), cfg.GetDenyOut(), len(cfg.GetRules()))
 }
 
 var TemplateCommand = cli.Command{
@@ -313,8 +329,10 @@ var TemplateCommand = cli.Command{
 		TemplateCreateCommand,
 		TemplateCommitCommand,
 		TemplateCreateFromImageCommand,
+		TemplateMergeCommand,
 		TemplateRedoCommand,
 		TemplateDeleteCommand,
+		TemplateSetAliasCommand,
 		TemplateStatusCommand,
 		TemplateWatchCommand,
 		TemplateBuildStatusCommand,
@@ -352,15 +370,15 @@ var TemplateCreateCommand = cli.Command{
 		},
 		cli.BoolFlag{
 			Name:  "allow-internet-access",
-			Usage: "set CubeVS allowInternetAccess for the template request",
+			Usage: "set allowInternetAccess on the network config for the template request",
 		},
 		cli.StringSliceFlag{
 			Name:  "allow-out-cidr",
-			Usage: "append an allowed egress CIDR to cubevs_context; repeat the flag to specify multiple CIDRs",
+			Usage: "append an allowed egress CIDR to cube_network_config; repeat the flag to specify multiple CIDRs",
 		},
 		cli.StringSliceFlag{
 			Name:  "deny-out-cidr",
-			Usage: "append a denied egress CIDR to cubevs_context; repeat the flag to specify multiple CIDRs",
+			Usage: "append a denied egress CIDR to cube_network_config; repeat the flag to specify multiple CIDRs",
 		},
 		cli.BoolFlag{
 			Name:  "json",
@@ -406,7 +424,7 @@ var TemplateCreateCommand = cli.Command{
 		if scope := c.StringSlice("node"); len(scope) > 0 {
 			req.DistributionScope = scope
 		}
-		req.CubeVSContext = mergeCubeVSContextFlags(c, req.CubeVSContext)
+		req.CubeNetworkConfig = mergeCubeNetworkConfigFlags(c, req.CubeNetworkConfig)
 
 		serverList = getServerAddrs(c)
 		if len(serverList) == 0 {
@@ -441,9 +459,23 @@ var TemplateCreateCommand = cli.Command{
 	},
 }
 
+// resolveTemplateID returns the template ID from the --template-id flag,
+// falling back to the first positional argument to match docker/kubectl
+// conventions (e.g. `cubemastercli tpl info <template-id>`).
+func resolveTemplateID(c *cli.Context) string {
+	if id := c.String("template-id"); id != "" {
+		return id
+	}
+	if c.NArg() > 0 {
+		return c.Args().First()
+	}
+	return ""
+}
+
 var TemplateInfoCommand = cli.Command{
-	Name:  "info",
-	Usage: "show template metadata and node replicas",
+	Name:      "info",
+	Usage:     "show template metadata and node replicas",
+	ArgsUsage: "<template-id>",
 	Flags: []cli.Flag{
 		cli.StringFlag{
 			Name:  "template-id",
@@ -459,7 +491,7 @@ var TemplateInfoCommand = cli.Command{
 		},
 	},
 	Action: func(c *cli.Context) error {
-		templateID := c.String("template-id")
+		templateID := resolveTemplateID(c)
 		if templateID == "" {
 			return errors.New("template-id is required")
 		}
@@ -582,8 +614,9 @@ var TemplateRenderCommand = cli.Command{
 }
 
 var TemplateDeleteCommand = cli.Command{
-	Name:  "delete",
-	Usage: "delete template metadata and node replicas",
+	Name:      "delete",
+	Usage:     "delete template metadata and node replicas",
+	ArgsUsage: "<template-id> [template-id ...]",
 	Flags: []cli.Flag{
 		cli.StringFlag{
 			Name:  "template-id",
@@ -591,8 +624,8 @@ var TemplateDeleteCommand = cli.Command{
 		},
 	},
 	Action: func(c *cli.Context) error {
-		templateID := c.String("template-id")
-		if templateID == "" {
+		templateIDs := resolveTemplateIDs(c)
+		if len(templateIDs) == 0 {
 			return errors.New("template-id is required")
 		}
 
@@ -601,32 +634,128 @@ var TemplateDeleteCommand = cli.Command{
 			return errors.New("no server addr")
 		}
 		port = c.GlobalString("port")
-		requestID := uuid.New().String()
 		host := serverList[rand.Int()%len(serverList)]
 		url := fmt.Sprintf("http://%s/cube/template", net.JoinHostPort(host, port))
 
-		req := &templateDeleteRequest{
-			RequestID:  requestID,
-			TemplateID: templateID,
+		var deleteErr error
+		for _, templateID := range templateIDs {
+			if err := deleteTemplate(c, url, templateID); err != nil {
+				deleteErr = errors.Join(deleteErr, fmt.Errorf("%s: %w", templateID, err))
+				continue
+			}
+			log.Printf("template deleted: %s\n", templateID)
 		}
-		body, err := jsoniter.Marshal(req)
+		return deleteErr
+	},
+}
+
+func resolveTemplateIDs(c *cli.Context) []string {
+	if id := c.String("template-id"); id != "" {
+		return []string{id}
+	}
+	return c.Args()
+}
+
+func deleteTemplate(c *cli.Context, url, templateID string) error {
+	requestID := uuid.New().String()
+	req := &templateDeleteRequest{
+		RequestID:  requestID,
+		TemplateID: templateID,
+	}
+	body, err := jsoniter.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	rsp := &templateResponse{}
+	if err := doHttpReq(c, url, http.MethodDelete, requestID, bytes.NewBuffer(body), rsp); err != nil {
+		log.Printf("template delete request err. %s. TemplateId: %s. RequestId: %s\n", err.Error(), templateID, requestID)
+		return err
+	}
+	if rsp.Ret == nil {
+		return errors.New("empty response")
+	}
+	if rsp.Ret.RetCode != 200 {
+		log.Printf("template delete failed. %s. TemplateId: %s. RequestId: %s\n", rsp.Ret.RetMsg, templateID, requestID)
+		return errors.New(rsp.Ret.RetMsg)
+	}
+	return nil
+}
+
+// templateSetAliasRequest is the JSON body for PUT /cube/template/:id/alias.
+type templateSetAliasRequest struct {
+	Alias string `json:"alias,omitempty"`
+}
+
+var TemplateSetAliasCommand = cli.Command{
+	Name:      "set-alias",
+	Usage:     "set, change, or clear the alias of an existing template",
+	ArgsUsage: "<template-id>",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "template-id",
+			Usage: "template id (or current alias) to update",
+		},
+		cli.StringFlag{
+			Name:  "alias",
+			Usage: "new alias for the template; pass empty string (or --clear) to remove the alias",
+		},
+		cli.BoolFlag{
+			Name:  "clear",
+			Usage: "clear the template's alias; takes precedence over --alias (equivalent to --alias \"\")",
+		},
+		cli.BoolFlag{
+			Name:  "json",
+			Usage: "print raw json response",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		templateID := resolveTemplateID(c)
+		if templateID == "" {
+			return errors.New("template-id is required")
+		}
+		serverList = getServerAddrs(c)
+		if len(serverList) == 0 {
+			return errors.New("no server addr")
+		}
+		port = c.GlobalString("port")
+		host := serverList[rand.Int()%len(serverList)]
+
+		// --clear takes precedence and sends alias="". Otherwise forward the
+		// --alias value (which may itself be "" to clear, per the shared
+		// contract).
+		alias := c.String("alias")
+		if !c.Bool("clear") && !c.IsSet("alias") {
+			return errors.New("must specify --alias <alias> or --clear")
+		}
+		if c.Bool("clear") {
+			alias = ""
+		}
+
+		bodyReq := &templateSetAliasRequest{Alias: alias}
+		body, err := jsoniter.Marshal(bodyReq)
 		if err != nil {
 			return err
 		}
-
+		url := fmt.Sprintf("http://%s/cube/template/%s/alias", net.JoinHostPort(host, port), templateID)
+		requestID := uuid.New().String()
 		rsp := &templateResponse{}
-		if err := doHttpReq(c, url, http.MethodDelete, requestID, bytes.NewBuffer(body), rsp); err != nil {
-			log.Printf("template delete request err. %s. RequestId: %s\n", err.Error(), requestID)
+		if err := doHttpReq(c, url, http.MethodPut, requestID, bytes.NewBuffer(body), rsp); err != nil {
+			log.Printf("template set-alias request err. %s. RequestId: %s\n", err.Error(), requestID)
 			return err
 		}
 		if rsp.Ret == nil {
 			return errors.New("empty response")
 		}
 		if rsp.Ret.RetCode != 200 {
-			log.Printf("template delete failed. %s. RequestId: %s\n", rsp.Ret.RetMsg, requestID)
+			log.Printf("template set-alias failed. %s. RequestId: %s\n", rsp.Ret.RetMsg, requestID)
 			return errors.New(rsp.Ret.RetMsg)
 		}
-		log.Printf("template deleted: %s\n", templateID)
+		if c.Bool("json") {
+			commands.PrintAsJSON(rsp)
+			return nil
+		}
+		printTemplateSummary(rsp)
 		return nil
 	},
 }
@@ -641,19 +770,28 @@ var TemplateCommitCommand = cli.Command{
 		},
 		cli.StringFlag{
 			Name:  "file, f",
-			Usage: "original create_sandbox request json file",
+			Usage: "optional complete create_sandbox request json override",
 		},
 		cli.BoolFlag{
 			Name:  "allow-internet-access",
-			Usage: "set CubeVS allowInternetAccess for the create_request",
+			Usage: "set allowInternetAccess on the network config for the create_request",
 		},
 		cli.StringSliceFlag{
 			Name:  "allow-out-cidr",
-			Usage: "append an allowed egress CIDR to create_request.cubevs_context; repeat the flag to specify multiple CIDRs",
+			Usage: "append an allowed egress CIDR to create_request.cube_network_config; repeat the flag to specify multiple CIDRs",
 		},
 		cli.StringSliceFlag{
 			Name:  "deny-out-cidr",
-			Usage: "append a denied egress CIDR to create_request.cubevs_context; repeat the flag to specify multiple CIDRs",
+			Usage: "append a denied egress CIDR to create_request.cube_network_config; repeat the flag to specify multiple CIDRs",
+		},
+		cli.BoolFlag{
+			Name:  "detach, no-wait",
+			Usage: "submit and exit immediately instead of watching the build to completion",
+		},
+		cli.DurationFlag{
+			Name:  "interval",
+			Value: defaultWatchInterval,
+			Usage: "poll interval while watching the build",
 		},
 		cli.BoolFlag{
 			Name:  "json",
@@ -666,32 +804,8 @@ var TemplateCommitCommand = cli.Command{
 		if filePath == "" && c.NArg() > 0 {
 			filePath = c.Args().First()
 		}
-		if sandboxID == "" || filePath == "" {
-			return errors.New("sandbox-id and file are required")
-		}
-
-		reqBytes, err := getParams(filePath)
-		if err != nil {
-			return err
-		}
-		createReq := &types.CreateCubeSandboxReq{}
-		if err = jsoniter.Unmarshal(reqBytes, createReq); err != nil {
-			return err
-		}
-		if createReq.Request == nil {
-			createReq.Request = &types.Request{}
-		}
-		requestID := uuid.New().String()
-		createReq.RequestID = requestID
-		if createReq.Annotations == nil {
-			createReq.Annotations = map[string]string{}
-		}
-		createReq.CubeVSContext = mergeCubeVSContextFlags(c, createReq.CubeVSContext)
-
-		req := &templateCommitRequest{
-			RequestID:     requestID,
-			SandboxID:     sandboxID,
-			CreateRequest: createReq,
+		if sandboxID == "" {
+			return errors.New("sandbox-id is required")
 		}
 
 		serverList = getServerAddrs(c)
@@ -699,6 +813,31 @@ var TemplateCommitCommand = cli.Command{
 			return errors.New("no server addr")
 		}
 		port = c.GlobalString("port")
+
+		hasNetworkOverrides := c.IsSet("allow-internet-access") || len(c.StringSlice("allow-out-cidr")) > 0 || len(c.StringSlice("deny-out-cidr")) > 0
+		if filePath == "" && hasNetworkOverrides {
+			return errors.New("network override flags require --file")
+		}
+
+		var createReq *types.CreateCubeSandboxReq
+		if filePath != "" {
+			reqBytes, err := getParams(filePath)
+			if err != nil {
+				return err
+			}
+			createReq = &types.CreateCubeSandboxReq{}
+			if err = jsoniter.Unmarshal(reqBytes, createReq); err != nil {
+				return err
+			}
+			createReq.CubeNetworkConfig = mergeCubeNetworkConfigFlags(c, createReq.CubeNetworkConfig)
+		}
+
+		requestID := uuid.New().String()
+		req := &templateCommitRequest{
+			RequestID:     requestID,
+			SandboxID:     sandboxID,
+			CreateRequest: createReq,
+		}
 		host := serverList[rand.Int()%len(serverList)]
 		url := fmt.Sprintf("http://%s/cube/sandbox/commit", net.JoinHostPort(host, port))
 		body, err := jsoniter.Marshal(req)
@@ -724,7 +863,10 @@ var TemplateCommitCommand = cli.Command{
 		}
 		log.Printf("template_id: %s\n", rsp.TemplateID)
 		log.Printf("build_id: %s\n", rsp.BuildID)
-		return nil
+		if detachRequested(c) || rsp.BuildID == "" {
+			return nil
+		}
+		return runBuildWatch(c, rsp.BuildID)
 	},
 }
 
@@ -733,16 +875,19 @@ var TemplateCreateFromImageCommand = cli.Command{
 	Usage: "build ext4 rootfs from OCI image and create template asynchronously",
 	Flags: []cli.Flag{
 		cli.StringFlag{Name: "image", Usage: "source OCI image reference"},
+		cli.StringFlag{Name: "alias", Usage: "human-readable stable alias for the template (e.g. my-app); sandboxes can reference the template by this alias instead of the generated template ID; valid: [a-z0-9-], max 64 chars"},
 		cli.StringFlag{Name: "writable-layer-size", Usage: "immutable writable layer size, e.g. 20Gi"},
 		cli.StringSliceFlag{Name: "expose-port", Usage: "container port to expose for the template; repeat the flag to specify multiple ports"},
 		cli.StringFlag{Name: "instance-type", Value: "cubebox", Usage: "instance type"},
+		cli.StringFlag{Name: "backend", Usage: "CoW backend for this template and its sandboxes/snapshots (xfs|s3); omit to keep the historical xfs path"},
 		cli.StringFlag{Name: "network-type", Value: "tap", Usage: "network type"},
 		cli.StringSliceFlag{Name: "node", Usage: "create template only on the specified node id or host ip; repeat to specify multiple nodes"},
-		cli.BoolFlag{Name: "allow-internet-access", Usage: "set CubeVS allowInternetAccess for the generated template request"},
-		cli.StringSliceFlag{Name: "allow-out-cidr", Usage: "append an allowed egress CIDR to cubevs_context; repeat the flag to specify multiple CIDRs"},
-		cli.StringSliceFlag{Name: "deny-out-cidr", Usage: "append a denied egress CIDR to cubevs_context; repeat the flag to specify multiple CIDRs"},
+		cli.BoolFlag{Name: "allow-internet-access", Usage: "set allowInternetAccess on the network config for the generated template request"},
+		cli.StringSliceFlag{Name: "allow-out-cidr", Usage: "append an allowed egress CIDR to cube_network_config; repeat the flag to specify multiple CIDRs"},
+		cli.StringSliceFlag{Name: "deny-out-cidr", Usage: "append a denied egress CIDR to cube_network_config; repeat the flag to specify multiple CIDRs"},
 		cli.StringFlag{Name: "registry-username", Usage: "registry username"},
 		cli.StringFlag{Name: "registry-password", Usage: "registry password"},
+		cli.BoolFlag{Name: "enable-ivshmem", Usage: "boot the template build sandbox with ivshmem enabled"},
 
 		cli.StringSliceFlag{Name: "cmd", Usage: "override container ENTRYPOINT (command); repeat for multiple elements, e.g. --cmd /bin/sh --cmd -c"},
 		cli.StringSliceFlag{Name: "arg", Usage: "override container CMD (args); repeat for multiple elements"},
@@ -752,6 +897,11 @@ var TemplateCreateFromImageCommand = cli.Command{
 		cli.StringFlag{Name: "probe-path", Value: "/health", Usage: "HTTP path for the readiness probe (default: /health); only effective when --probe is set"},
 		cli.IntFlag{Name: "cpu", Value: 2000, Usage: "CPU millicores for the template container (default: 2000, i.e. 2 cores)"},
 		cli.IntFlag{Name: "memory", Value: 2000, Usage: "Memory for the template container in MB (default: 2000 MB)"},
+		cli.BoolTFlag{Name: "with-cube-ca", Usage: "bake the CubeEgress root CA at /etc/cube/ca/cube-root-ca.crt into the template rootfs so sandboxes trust CubeEgress's MITM. Pass --with-cube-ca=false to skip (default: true)"},
+		cli.BoolFlag{Name: "enable-inject-envd", Usage: "enable cubesandbox-envd injection for this template build"},
+		cli.StringFlag{Name: "envd-path", Usage: "local envd binary path to upload when --enable-inject-envd is set; defaults to the CLI-embedded envd if available"},
+		cli.BoolFlag{Name: "detach, no-wait", Usage: "submit and exit immediately instead of watching the job to completion"},
+		cli.DurationFlag{Name: "interval", Value: defaultWatchInterval, Usage: "poll interval while watching the job"},
 		cli.BoolFlag{Name: "json", Usage: "print raw json response"},
 	},
 	Action: func(c *cli.Context) error {
@@ -776,27 +926,105 @@ var TemplateCreateFromImageCommand = cli.Command{
 			return err
 		}
 		req := &types.CreateTemplateFromImageReq{
-			Request:            &types.Request{RequestID: uuid.New().String()},
-			SourceImageRef:     c.String("image"),
+			Request:        &types.Request{RequestID: uuid.New().String()},
+			SourceImageRef: c.String("image"),
+			Alias:          c.String("alias"),
 			// TemplateID is auto-generated by normalizeTemplateImageRequest.
 			WritableLayerSize:  c.String("writable-layer-size"),
 			DistributionScope:  c.StringSlice("node"),
 			ExposedPorts:       exposedPorts,
 			InstanceType:       c.String("instance-type"),
 			NetworkType:        c.String("network-type"),
+			Backend:            c.String("backend"),
 			RegistryUsername:   c.String("registry-username"),
 			RegistryPassword:   c.String("registry-password"),
 			ContainerOverrides: containerOverrides,
 		}
-		req.CubeVSContext, err = mergeCreateFromImageCubeVSContextFlags(c, req.CubeVSContext)
+		// --with-cube-ca defaults true (BoolTFlag). We always materialise
+		// the *bool on the wire so non-CLI callers (HTTP clients, future
+		// SDKs) can still rely on `nil = server-side default`.
+		withCubeCA := c.BoolT("with-cube-ca")
+		req.WithCubeCA = &withCubeCA
+		applyCreateFromImageIvshmemFlag(c, req)
+		req.CubeNetworkConfig, err = mergeCreateFromImageCubeNetworkConfigFlags(c, req.CubeNetworkConfig)
 		if err != nil {
 			return err
+		}
+		envdPayload, err := selectEnvdUploadPayload(c)
+		if err != nil {
+			return err
+		}
+		url := fmt.Sprintf("http://%s/cube/template/from-image", net.JoinHostPort(host, port))
+		rsp := &templateImageJobResponse{}
+		if envdPayload != nil {
+			body, contentType, err := buildCreateFromImageMultipartBody(req, envdPayload)
+			if err != nil {
+				return err
+			}
+			if err := doHttpReqWithContentType(c, url, http.MethodPost, req.RequestID, body, contentType, rsp); err != nil {
+				return err
+			}
+		} else {
+			body, err := jsoniter.Marshal(req)
+			if err != nil {
+				return err
+			}
+			if err := doHttpReq(c, url, http.MethodPost, req.RequestID, bytes.NewBuffer(body), rsp); err != nil {
+				return err
+			}
+		}
+		if rsp.Ret == nil {
+			return errors.New("empty response")
+		}
+		if rsp.Ret.RetCode != 200 {
+			return errors.New(rsp.Ret.RetMsg)
+		}
+		if c.Bool("json") {
+			commands.PrintAsJSON(rsp)
+			return nil
+		}
+		if detachRequested(c) || rsp.Job == nil {
+			printTemplateImageJob(rsp.Job)
+			return nil
+		}
+		log.Printf("submitted template image job: job_id=%s template_id=%s\n", rsp.Job.JobID, rsp.Job.TemplateID)
+		return runImageJobWatch(c, rsp.Job.JobID)
+	},
+}
+
+var TemplateMergeCommand = cli.Command{
+	Name: "merge",
+	// "merge" is the CLI spelling of the /cube/template/migrate API; the usage
+	// text keeps the word "migrate" so docs/errors that mention `tpl migrate`
+	// still lead here.
+	Usage:     "migrate one template artifact to the template center (the CLI command is `merge`; the API is /cube/template/migrate)",
+	ArgsUsage: "<template-id>",
+	Flags: []cli.Flag{
+		cli.StringFlag{Name: "template-id", Usage: "template id (or alias) to migrate"},
+		cli.BoolFlag{Name: "detach, no-wait", Usage: "submit and exit immediately instead of watching the merge job to completion"},
+		cli.DurationFlag{Name: "interval", Value: defaultWatchInterval, Usage: "poll interval while watching the job"},
+		cli.BoolFlag{Name: "json", Usage: "print raw json response"},
+	},
+	Action: func(c *cli.Context) error {
+		templateID := resolveTemplateID(c)
+		if templateID == "" {
+			return errors.New("template-id is required")
+		}
+		serverList = getServerAddrs(c)
+		if len(serverList) == 0 {
+			return errors.New("no server addr")
+		}
+		port = c.GlobalString("port")
+		host := serverList[rand.Int()%len(serverList)]
+		req := &templateMigrateRequest{
+			RequestID:  uuid.New().String(),
+			TemplateID: templateID,
 		}
 		body, err := jsoniter.Marshal(req)
 		if err != nil {
 			return err
 		}
-		url := fmt.Sprintf("http://%s/cube/template/from-image", net.JoinHostPort(host, port))
+		url := fmt.Sprintf("http://%s/cube/template/migrate", net.JoinHostPort(host, port))
 		rsp := &templateImageJobResponse{}
 		if err := doHttpReq(c, url, http.MethodPost, req.RequestID, bytes.NewBuffer(body), rsp); err != nil {
 			return err
@@ -811,24 +1039,33 @@ var TemplateCreateFromImageCommand = cli.Command{
 			commands.PrintAsJSON(rsp)
 			return nil
 		}
-		printTemplateImageJob(rsp.Job)
-		return nil
+		if detachRequested(c) || rsp.Job == nil {
+			printTemplateImageJob(rsp.Job)
+			return nil
+		}
+		log.Printf("submitted merge job: job_id=%s template_id=%s\n", rsp.Job.JobID, rsp.Job.TemplateID)
+		// Watch through the dedicated migrate endpoint, not the from-image one:
+		// the from-image status handler happens to return MIGRATE rows today
+		// only because it does not filter by operation.
+		return runMigrateJobWatch(c, rsp.Job.JobID)
 	},
 }
 
 var TemplateRedoCommand = cli.Command{
-	Name:  "redo",
-	Usage: "redo a template on all, specific, or failed nodes",
+	Name:      "redo",
+	Usage:     "redo a template on all, specific, or failed nodes",
+	ArgsUsage: "<template-id>",
 	Flags: []cli.Flag{
 		cli.StringFlag{Name: "template-id", Usage: "template id to redo"},
 		cli.StringSliceFlag{Name: "node", Usage: "redo only the specified node id or host ip; repeat to specify multiple nodes"},
 		cli.BoolFlag{Name: "failed-only", Usage: "redo only failed nodes"},
-		cli.BoolFlag{Name: "wait", Usage: "wait until redo job finishes"},
-		cli.DurationFlag{Name: "interval", Value: 2 * time.Second, Usage: "poll interval when --wait is set"},
+		cli.BoolFlag{Name: "wait", Usage: "deprecated: redo now waits by default; use --detach to opt out"},
+		cli.BoolFlag{Name: "detach, no-wait", Usage: "submit and exit immediately instead of watching the redo job to completion"},
+		cli.DurationFlag{Name: "interval", Value: defaultWatchInterval, Usage: "poll interval while watching the job"},
 		cli.BoolFlag{Name: "json", Usage: "print raw json response"},
 	},
 	Action: func(c *cli.Context) error {
-		templateID := c.String("template-id")
+		templateID := resolveTemplateID(c)
 		if templateID == "" {
 			return errors.New("template-id is required")
 		}
@@ -860,48 +1097,22 @@ var TemplateRedoCommand = cli.Command{
 		if rsp.Ret.RetCode != 200 {
 			return errors.New(rsp.Ret.RetMsg)
 		}
-		if c.Bool("json") && !c.Bool("wait") {
+		if c.Bool("json") {
 			commands.PrintAsJSON(rsp)
 			return nil
 		}
-		printTemplateImageJob(rsp.Job)
-		if !c.Bool("wait") {
+		if detachRequested(c) || rsp.Job == nil {
+			printTemplateImageJob(rsp.Job)
 			return nil
 		}
-		var lastPrinted string
-		for {
-			latest, err := fetchTemplateImageJob(c, rsp.Job.JobID)
-			if err != nil {
-				return err
-			}
-			if latest.Job == nil {
-				printTemplateImageJobWatchLine(nil)
-				printTemplateImageJobCompletionSummary(nil)
-				return errors.New("empty job")
-			}
-			current := formatTemplateImageJobWatchLine(latest.Job)
-			if current != lastPrinted {
-				printTemplateImageJobWatchLine(latest.Job)
-				lastPrinted = current
-			}
-			if latest.Job.Status == "READY" || latest.Job.Status == "FAILED" {
-				printTemplateImageJobCompletionSummary(latest.Job)
-				if c.Bool("json") {
-					commands.PrintAsJSON(latest)
-				}
-				if latest.Job.Status == "FAILED" {
-					return errors.New(latest.Job.ErrorMessage)
-				}
-				return nil
-			}
-			time.Sleep(c.Duration("interval"))
-		}
+		log.Printf("submitted redo job: job_id=%s template_id=%s\n", rsp.Job.JobID, rsp.Job.TemplateID)
+		return runImageJobWatch(c, rsp.Job.JobID)
 	},
 }
 
 var TemplateStatusCommand = cli.Command{
 	Name:  "status",
-	Usage: "show create-from-image job status",
+	Usage: "show template image/merge job status",
 	Flags: []cli.Flag{
 		cli.StringFlag{Name: "job-id", Usage: "template image job id"},
 		cli.BoolFlag{Name: "json", Usage: "print raw json response"},
@@ -926,7 +1137,7 @@ var TemplateStatusCommand = cli.Command{
 
 var TemplateWatchCommand = cli.Command{
 	Name:  "watch",
-	Usage: "watch create-from-image job progress until completion",
+	Usage: "watch template image/merge job progress until completion",
 	Flags: []cli.Flag{
 		cli.StringFlag{Name: "job-id", Usage: "template image job id"},
 		cli.DurationFlag{Name: "interval", Value: 2 * time.Second, Usage: "poll interval"},
@@ -937,34 +1148,7 @@ var TemplateWatchCommand = cli.Command{
 		if jobID == "" {
 			return errors.New("job-id is required")
 		}
-		var lastPrinted string
-		for {
-			rsp, err := fetchTemplateImageJob(c, jobID)
-			if err != nil {
-				return err
-			}
-			if rsp.Job == nil {
-				printTemplateImageJobWatchLine(nil)
-				printTemplateImageJobCompletionSummary(nil)
-				return errors.New("empty job")
-			}
-			current := formatTemplateImageJobWatchLine(rsp.Job)
-			if current != lastPrinted {
-				printTemplateImageJobWatchLine(rsp.Job)
-				lastPrinted = current
-			}
-			if rsp.Job.Status == "READY" || rsp.Job.Status == "FAILED" {
-				printTemplateImageJobCompletionSummary(rsp.Job)
-				if c.Bool("json") {
-					commands.PrintAsJSON(rsp)
-				}
-				if rsp.Job.Status == "FAILED" {
-					return errors.New(rsp.Job.ErrorMessage)
-				}
-				return nil
-			}
-			time.Sleep(c.Duration("interval"))
-		}
+		return runImageJobWatch(c, jobID)
 	},
 }
 
@@ -1006,28 +1190,7 @@ var TemplateBuildWatchCommand = cli.Command{
 		if buildID == "" {
 			return errors.New("build-id is required")
 		}
-		var lastPrinted string
-		for {
-			rsp, err := fetchTemplateBuildStatus(c, buildID)
-			if err != nil {
-				return err
-			}
-			current := fmt.Sprintf("%s/%d/%s", rsp.Status, rsp.Progress, rsp.Message)
-			if current != lastPrinted {
-				printTemplateBuildStatus(rsp)
-				lastPrinted = current
-			}
-			if rsp.Status == "ready" || rsp.Status == "error" {
-				if c.Bool("json") {
-					commands.PrintAsJSON(rsp)
-				}
-				if rsp.Status == "error" {
-					return errors.New(rsp.Message)
-				}
-				return nil
-			}
-			time.Sleep(c.Duration("interval"))
-		}
+		return runBuildWatch(c, buildID)
 	},
 }
 
@@ -1074,19 +1237,30 @@ var TemplateListCommand = cli.Command{
 		}
 		wideOutput := strings.EqualFold(strings.TrimSpace(c.String("output")), "wide")
 		w := tabwriter.NewWriter(os.Stdout, 4, 8, 4, ' ', 0)
-		tabHeader := "TEMPLATE_ID\tSTATUS\tCREATED_AT\tIMAGE_INFO"
+		tabHeader := "TEMPLATE_ID\tALIAS\tSTATUS\tBACKEND\tJOB_ID\tCREATED_AT\tIMAGE_INFO"
 		if wideOutput {
-			tabHeader = "TEMPLATE_ID\tSTATUS\tLAST_ERROR\tCREATED_AT\tIMAGE_INFO"
+			tabHeader = "TEMPLATE_ID\tALIAS\tSTATUS\tBACKEND\tJOB_ID\tLAST_ERROR\tCREATED_AT\tIMAGE_INFO"
 		}
 		fmt.Fprintln(w, tabHeader)
 		for _, item := range rsp.Data {
-			if wideOutput {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-					item.TemplateID, item.Status, item.LastError, item.CreatedAt, item.ImageInfo)
-				continue
+			jobID := item.JobID
+			if jobID == "" {
+				jobID = "-"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
-				item.TemplateID, item.Status, item.CreatedAt, item.ImageInfo)
+			alias := item.DisplayName
+			if alias == "" {
+				alias = "-"
+			}
+			backend := firstNonEmptyCLI(item.Backend, item.StorageBackend)
+			var row string
+			if wideOutput {
+				row = fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
+					item.TemplateID, alias, item.Status, backend, jobID, item.LastError, item.CreatedAt, item.ImageInfo)
+			} else {
+				row = fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%s",
+					item.TemplateID, alias, item.Status, backend, jobID, item.CreatedAt, item.ImageInfo)
+			}
+			fmt.Fprintln(w, row)
 		}
 		return w.Flush()
 	},
@@ -1094,14 +1268,36 @@ var TemplateListCommand = cli.Command{
 
 func printTemplateSummary(rsp *templateResponse) {
 	log.Printf("template_id: %s\n", rsp.TemplateID)
+	if rsp.DisplayName != "" {
+		log.Printf("alias: %s\n", rsp.DisplayName)
+	}
 	log.Printf("instance_type: %s\n", rsp.InstanceType)
+	if backend := firstNonEmptyCLI(rsp.Backend, rsp.StorageBackend); backend != "" {
+		log.Printf("backend: %s\n", backend)
+	}
 	log.Printf("version: %s\n", rsp.Version)
 	log.Printf("status: %s\n", rsp.Status)
+	if rsp.CreatedAt != "" {
+		log.Printf("created_at: %s\n", rsp.CreatedAt)
+	}
+	if rsp.ImageInfo != "" {
+		log.Printf("image_info: %s\n", rsp.ImageInfo)
+	}
 	if rsp.LastError != "" {
 		log.Printf("last_error: %s\n", rsp.LastError)
 	}
+	if jobID := strings.TrimSpace(rsp.JobID); jobID != "" {
+		log.Printf("job_id: %s\n", jobID)
+	}
+	// CubeEgress CA bake status. Always print so an operator can tell
+	// at a glance whether sandboxes from this template will trust
+	// CubeEgress's MITM certs. baked=false on a deployment that ships
+	// CubeEgress is a yellow flag worth investigating (most likely a
+	// distroless image that didn't have a ca-bundle to update).
+	log.Printf("cube_egress_ca: baked=%t fingerprint=%s targets_written=%d\n",
+		rsp.CubeEgressCABaked, fingerprintShortOrEmpty(rsp.CubeEgressCAFingerprint), rsp.CubeEgressCATargetsWritten)
 	if rsp.CreateRequest != nil {
-		log.Printf("cubevs_context: %s\n", formatCubeVSContext(rsp.CreateRequest.CubeVSContext))
+		log.Printf("cube_network_config: %s\n", formatCubeNetworkConfig(rsp.CreateRequest.CubeNetworkConfig))
 	}
 	w := tabwriter.NewWriter(os.Stdout, 4, 8, 4, ' ', 0)
 	fmt.Fprintln(w, "NODE_ID\tNODE_IP\tSTATUS\tPHASE\tSPEC\tERROR")
@@ -1110,6 +1306,20 @@ func printTemplateSummary(rsp *templateResponse) {
 			replica.NodeID, replica.NodeIP, replica.Status, replica.Phase, replica.Spec, replica.ErrorMessage)
 	}
 	_ = w.Flush()
+}
+
+// fingerprintShortOrEmpty trims a sha256 hex fingerprint to the first
+// 16 chars for printing. Full 64-char string is usable for grep but
+// noisy in info output; the short form is enough for human eyeballing
+// and the field gets shipped raw in the JSON --json mode.
+func fingerprintShortOrEmpty(fp string) string {
+	if fp == "" {
+		return "(none)"
+	}
+	if len(fp) > 16 {
+		return fp[:16]
+	}
+	return fp
 }
 
 func printSandboxPreviewSummary(rsp *sandboxPreviewResponse) {
@@ -1121,18 +1331,18 @@ func printSandboxPreviewSummary(rsp *sandboxPreviewResponse) {
 		log.Printf("api_request: template=%s containers=%d volumes=%d network=%s\n",
 			rsp.APIRequest.Annotations[constants.CubeAnnotationAppSnapshotTemplateID],
 			len(rsp.APIRequest.Containers), len(rsp.APIRequest.Volumes), rsp.APIRequest.NetworkType)
-		log.Printf("api_request_cubevs_context: %s\n", formatCubeVSContext(rsp.APIRequest.CubeVSContext))
+		log.Printf("api_request_cube_network_config: %s\n", formatCubeNetworkConfig(rsp.APIRequest.CubeNetworkConfig))
 	}
 	if rsp.MergedRequest != nil {
 		log.Printf("merged_request: containers=%d volumes=%d network=%s runtime=%s namespace=%s\n",
 			len(rsp.MergedRequest.Containers), len(rsp.MergedRequest.Volumes), rsp.MergedRequest.NetworkType,
 			rsp.MergedRequest.RuntimeHandler, rsp.MergedRequest.Namespace)
-		log.Printf("merged_request_cubevs_context: %s\n", formatCubeVSContext(rsp.MergedRequest.CubeVSContext))
+		log.Printf("merged_request_cube_network_config: %s\n", formatCubeNetworkConfig(rsp.MergedRequest.CubeNetworkConfig))
 	}
 	if rsp.CubeletRequest != nil {
 		log.Printf("cubelet_request: containers=%d volumes=%d exposed_ports=%d\n",
 			len(rsp.CubeletRequest.Containers), len(rsp.CubeletRequest.Volumes), len(rsp.CubeletRequest.ExposedPorts))
-		log.Printf("cubelet_request_cubevs_context: %s\n", formatProtoCubeVSContext(rsp.CubeletRequest.CubevsContext))
+		log.Printf("cubelet_request_cube_network_config: %s\n", formatProtoCubeNetworkConfig(rsp.CubeletRequest.CubeNetworkConfig))
 	}
 }
 
@@ -1145,6 +1355,28 @@ func fetchTemplateImageJob(c *cli.Context, jobID string) (*templateImageJobRespo
 	requestID := uuid.New().String()
 	host := serverList[rand.Int()%len(serverList)]
 	url := fmt.Sprintf("http://%s/cube/template/from-image?job_id=%s", net.JoinHostPort(host, port), jobID)
+	rsp := &templateImageJobResponse{}
+	if err := doHttpReq(c, url, http.MethodGet, requestID, nil, rsp); err != nil {
+		return nil, err
+	}
+	if rsp.Ret == nil {
+		return nil, errors.New("empty response")
+	}
+	if rsp.Ret.RetCode != 200 {
+		return nil, errors.New(rsp.Ret.RetMsg)
+	}
+	return rsp, nil
+}
+
+func fetchTemplateMigrateJob(c *cli.Context, jobID string) (*templateImageJobResponse, error) {
+	serverList = getServerAddrs(c)
+	if len(serverList) == 0 {
+		return nil, errors.New("no server addr")
+	}
+	port = c.GlobalString("port")
+	requestID := uuid.New().String()
+	host := serverList[rand.Int()%len(serverList)]
+	url := fmt.Sprintf("http://%s/cube/template/migrate?job_id=%s", net.JoinHostPort(host, port), jobID)
 	rsp := &templateImageJobResponse{}
 	if err := doHttpReq(c, url, http.MethodGet, requestID, nil, rsp); err != nil {
 		return nil, err
@@ -1187,6 +1419,16 @@ func printTemplateImageJob(job *types.TemplateImageJobInfo) {
 	log.Printf("status: %s\n", job.Status)
 	log.Printf("phase: %s\n", job.Phase)
 	log.Printf("progress: %d%%\n", job.Progress)
+	if job.PullTotalBytes > 0 {
+		pullLine := fmt.Sprintf("pull: %s/%s", humanBytes(job.PullDownloadedBytes), humanBytes(job.PullTotalBytes))
+		if job.PullSpeedBPS > 0 {
+			pullLine += fmt.Sprintf(" %s/s", humanBytes(job.PullSpeedBPS))
+		}
+		log.Printf("%s\n", pullLine)
+	}
+	if job.PullTotalLayers > 0 {
+		log.Printf("pull_layers: %d/%d\n", job.PullCompletedLayers, job.PullTotalLayers)
+	}
 	log.Printf("distribution: %d/%d ready, %d failed\n", job.ReadyNodeCount, job.ExpectedNodeCount, job.FailedNodeCount)
 	if job.TemplateSpecFingerprint != "" {
 		log.Printf("template_spec_fingerprint: %s\n", job.TemplateSpecFingerprint)
@@ -1207,11 +1449,20 @@ func formatTemplateImageJobWatchPhase(job *types.TemplateImageJobInfo) string {
 	phase := "UNKNOWN"
 	if job != nil {
 		if job.Status == "READY" {
+			if job.Operation == "MIGRATE" {
+				return "READY"
+			}
 			return "[7/7] READY"
 		}
 		if job.Phase != "" {
 			phase = job.Phase
 		}
+	}
+
+	// Migrate jobs have a single transfer phase; the 7-step build progress
+	// display is meaningless for them.
+	if job != nil && job.Operation == "MIGRATE" {
+		return phase
 	}
 
 	phaseOrder := map[string]int{
@@ -1354,8 +1605,9 @@ func parseContainerOverrides(c *cli.Context) (*types.ContainerOverrides, error) 
 	probePort := c.Int("probe")
 	cpuMillicores := c.Int("cpu")
 	memoryMB := c.Int("memory")
+	enableInjectEnvd := c.Bool("enable-inject-envd")
 
-	if len(cmds) == 0 && len(args) == 0 && len(rawEnvs) == 0 && len(dnsServers) == 0 && probePort == 0 && !c.IsSet("cpu") && !c.IsSet("memory") {
+	if len(cmds) == 0 && len(args) == 0 && len(rawEnvs) == 0 && len(dnsServers) == 0 && probePort == 0 && !c.IsSet("cpu") && !c.IsSet("memory") && !enableInjectEnvd {
 		return nil, nil
 	}
 
@@ -1409,6 +1661,12 @@ func parseContainerOverrides(c *cli.Context) (*types.ContainerOverrides, error) 
 			FailureThreshold: 60,
 			SuccessThreshold: 1,
 		}
+	}
+	if enableInjectEnvd {
+		if overrides.Annotations == nil {
+			overrides.Annotations = map[string]string{}
+		}
+		overrides.Annotations[constants.CubeAnnotationsInjectEnvd] = constants.CubeAnnotationsInjectEnvdOptIn
 	}
 	return overrides, nil
 }

@@ -38,6 +38,7 @@ func init() {
 			Buckets:   prometheus.ExponentialBuckets(1, 10, 8),
 		},
 	)
+	ns.Add(imageForwardLatency)
 	metrics.Register(ns)
 }
 

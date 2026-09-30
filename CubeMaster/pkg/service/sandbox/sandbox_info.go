@@ -6,10 +6,10 @@ package sandbox
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
@@ -17,8 +17,10 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/pausesnap"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 func SandboxInfo(ctx context.Context, req *types.GetCubeSandboxReq) (rsp *types.GetCubeSandboxRes) {
@@ -33,6 +35,12 @@ func SandboxInfo(ctx context.Context, req *types.GetCubeSandboxReq) (rsp *types.
 		},
 	}
 	log.G(ctx).Infof("GetSandboxInfo:%+v", utils.InterfaceToString(req))
+	if req.SandboxID != "" {
+		if ret := normalizeSandboxIDInReq(ctx, &req.SandboxID); ret != nil {
+			rsp.Ret = ret
+			return
+		}
+	}
 	defer func() {
 		if log.IsDebug() {
 			log.G(ctx).Debugf("GetSandboxInfo_rsp:%+v", utils.InterfaceToString(rsp))
@@ -64,6 +72,11 @@ func SandboxInfo(ctx context.Context, req *types.GetCubeSandboxReq) (rsp *types.
 		return
 	}
 
+	// Pause binding wins over Cubelet EXITED flicker / empty List: READY →
+	// paused tombstone view; FAILED → keep sandbox record with error.
+	if fillPauseBindingInfoFromMaster(ctx, req, rsp) {
+		return
+	}
 	if len(rsp.Data) == 0 {
 		setError(errorcode.ErrorCode_NotFoundAtCubelet, rsp)
 		return
@@ -163,6 +176,8 @@ func doget(ctx context.Context, calleep string, cubeletReq *cubebox.ListCubeSand
 				CreateAt:    container.GetCreatedAt(),
 				Cpu:         container.GetResources().GetCpu(),
 				Mem:         container.GetResources().GetMem(),
+				CpuMilli:    parseCPUMilli(container.GetResources().GetCpu()),
+				MemoryMiB:   parseMemoryMiB(container.GetResources().GetMem()),
 				Type:        container.GetType(),
 				PauseAt:     container.GetPausedAt(),
 			}
@@ -172,6 +187,8 @@ func doget(ctx context.Context, calleep string, cubeletReq *cubebox.ListCubeSand
 		one.TemplateID = templateID
 		one.Annotations = buildAnnotationsFromLabels(sandboxLabels)
 		one.Labels = sandboxLabels
+		one.EndAt = LookupSandboxEndAt(ctx, sandbox.GetId())
+		one.VolumeMounts = volumeMountsToContainerInfo(collectVolumeMountsFromContainers(sandbox.GetContainers()))
 		rsp.Data = append(rsp.Data, one)
 	}
 	return nil
@@ -225,4 +242,99 @@ func getContainerName(label map[string]string) string {
 		return name
 	}
 	return ""
+}
+
+// fillPauseBindingInfoFromMaster synthesizes Info from the pausesnap binding
+// when present. READY → PAUSED. CREATING/FAILED prefer Cubelet PAUSING/PAUSED
+// when the node already finished Pause (Master RPC may have timed out); otherwise
+// CREATING → PAUSING and FAILED → UNKNOWN + pause error. Overrides Cubelet
+// EXITED flicker during CoW Pause.
+func fillPauseBindingInfoFromMaster(ctx context.Context, req *types.GetCubeSandboxReq, rsp *types.GetCubeSandboxRes) bool {
+	if req == nil || rsp == nil || req.SandboxID == "" {
+		return false
+	}
+	proxyMap, ok := localcache.GetSandboxProxyMap(ctx, req.SandboxID)
+	if !ok || proxyMap == nil {
+		return false
+	}
+	rec, err := pausesnap.GetBySandbox(ctx, req.SandboxID)
+	if err != nil || rec == nil || strings.TrimSpace(rec.SnapshotID) == "" {
+		return false
+	}
+	status := strings.ToUpper(strings.TrimSpace(rec.Status))
+	ann := map[string]string{
+		constants.CubeAnnotationPauseSnapshotID: rec.SnapshotID,
+	}
+	var st int32
+	switch status {
+	case "READY":
+		st = int32(cubebox.ContainerState_CONTAINER_PAUSED)
+	case pausesnap.StatusFailed:
+		// Master timed out / failed, but Cubelet may still have reached PAUSED.
+		// Prefer the node view so Info/List stay usable; Resume heals separately.
+		if cubeletReportsPauseState(rsp) {
+			return false
+		}
+		st = int32(cubebox.ContainerState_CONTAINER_UNKNOWN)
+		errMsg := strings.TrimSpace(rec.LastError)
+		if errMsg == "" {
+			errMsg = "pause failed; sandbox may be unrecoverable"
+		}
+		ann[constants.CubeAnnotationPauseError] = errMsg
+	case "CREATING":
+		// Still in flight. Prefer Cubelet PAUSING/PAUSED when present.
+		if cubeletReportsPauseState(rsp) {
+			return false
+		}
+		st = int32(cubebox.ContainerState_CONTAINER_PAUSING)
+	default:
+		return false
+	}
+	endAt := int64(0)
+	for _, item := range rsp.Data {
+		if item != nil && item.SandboxID == req.SandboxID {
+			endAt = item.EndAt
+			break
+		}
+	}
+	if endAt == 0 {
+		endAt = LookupSandboxEndAt(ctx, req.SandboxID)
+	}
+	one := &types.SandboxData{
+		SandboxID:   req.SandboxID,
+		Status:      st,
+		HostIP:      proxyMap.HostIP,
+		SandboxIP:   proxyMap.SandboxIP,
+		Annotations: ann,
+		EndAt:       endAt,
+		Containers: []*types.ContainerInfo{
+			{
+				ContainerID: req.SandboxID,
+				Status:      st,
+			},
+		},
+	}
+	if n, exist := localcache.GetNodesByIp(proxyMap.HostIP); exist {
+		one.HostID = n.ID()
+	}
+	rsp.Data = []*types.SandboxData{one}
+	rsp.Ret.RetCode = int(errorcode.ErrorCode_Success)
+	rsp.Ret.RetMsg = errorcode.ErrorCode_Success.String()
+	return true
+}
+
+func cubeletReportsPauseState(rsp *types.GetCubeSandboxRes) bool {
+	if rsp == nil {
+		return false
+	}
+	for _, d := range rsp.Data {
+		if d == nil {
+			continue
+		}
+		if d.Status == int32(cubebox.ContainerState_CONTAINER_PAUSING) ||
+			d.Status == int32(cubebox.ContainerState_CONTAINER_PAUSED) {
+			return true
+		}
+	}
+	return false
 }

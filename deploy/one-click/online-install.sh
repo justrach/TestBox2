@@ -6,6 +6,11 @@ GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO}"
 
 CN_MIRROR_LATEST_URL="https://download.cubesandbox.com/release/latest.json"
 MIRROR="${MIRROR:-}"
+case "${MIRROR}" in
+  ""|cn) ;;
+  *) echo "[online-install] ERROR: unsupported MIRROR '${MIRROR}' (expected empty or cn)." >&2; exit 2 ;;
+esac
+export MIRROR
 
 SKIP_PRECHECK="${ONE_CLICK_SKIP_PRECHECK:-0}"
 DOWNLOAD_URL="${CUBE_SANDBOX_DOWNLOAD_URL:-}"
@@ -31,9 +36,46 @@ detect_glibc_version() {
   printf '%s\n' "${glibc_ver}"
 }
 
+# Snap Docker cannot read /usr/local/services (#1753).
+reject_snap_docker() {
+  local p resolved
+  p="$(command -v docker 2>/dev/null || true)"
+  [[ -n "${p}" ]] || return 0
+  resolved="$(readlink -f "${p}" 2>/dev/null || true)"
+  [[ "${p}" == /snap/* || "${resolved}" == /snap/* || "${resolved}" == /usr/bin/snap ]] || return 0
+  echo "[online-install] ERROR: snap Docker is not supported; it cannot read /usr/local/services." >&2
+  echo "[online-install]   sudo snap remove docker" >&2
+  echo "[online-install]   then install docker-ce: https://docs.docker.com/engine/install/ubuntu/" >&2
+  exit 3
+}
+
 # ---------------------------------------------------------------------------
 # Pre-download preflight checks (lightweight, self-contained)
 # ---------------------------------------------------------------------------
+check_bpf_fs_preflight() {
+  # Let the regular OS preflight report unsupported non-Linux hosts.
+  [[ "$(uname)" == "Linux" ]] || return 0
+
+  local bpf_dir="/sys/fs/bpf"
+  if ! grep -qw bpf /proc/filesystems; then
+    echo "[online-install] ERROR: Your kernel does not support the 'bpf' filesystem (eBPF is missing or not enabled)." >&2
+    echo "[online-install] Cubelet's embedded network runtime requires eBPF to function properly." >&2
+    echo "[online-install] Please upgrade your kernel or enable CONFIG_BPF_SYSCALL." >&2
+    exit 3
+  fi
+
+  local bpf_fs_type=""
+  if [[ -d "${bpf_dir}" ]]; then
+    bpf_fs_type="$(df -T "${bpf_dir}" 2>/dev/null | awk 'NR==2 {print $2}' || true)"
+  fi
+  if [[ "${bpf_fs_type}" != "bpf" ]]; then
+    echo "[online-install] ERROR: /sys/fs/bpf is not mounted as a bpf filesystem (type: ${bpf_fs_type:-unknown})." >&2
+    echo "[online-install] Cubelet's embedded network runtime requires bpffs for its pinned eBPF maps." >&2
+    echo "[online-install] Troubleshooting: https://github.com/TencentCloud/CubeSandbox/blob/master/docs/guide/troubleshooting/deployment.md#bpffs-is-not-mounted" >&2
+    exit 3
+  fi
+}
+
 check_early_preflight() {
   if [[ "${SKIP_PRECHECK:-0}" == "1" ]]; then
     echo "[online-install] Skipping pre-download preflight checks." >&2
@@ -248,6 +290,8 @@ EOF
       ;;
   esac
 
+  reject_snap_docker
+
   if [[ "${deploy_role}" != "compute" ]]; then
     # Verify package manager is available to install Docker if it is not present
     if ! command -v docker >/dev/null 2>&1; then
@@ -285,7 +329,12 @@ EOF
   echo "[online-install] Pre-download preflight checks passed." >&2
 }
 
-# Run early preflight checks before fetching release info or downloading large bundle
+# Run the mandatory bpffs check before fetching release info or downloading the
+# large bundle. Unlike the optional early checks, this is never skipped.
+check_bpf_fs_preflight
+
+# Run optional early preflight checks before fetching release info or downloading
+# the large bundle.
 check_early_preflight
 
 # ---------------------------------------------------------------------------
@@ -308,7 +357,7 @@ http_get() {
 #
 # Discovery order:
 #   1. MIRROR=cn   -> https://download.cubesandbox.com/release/latest.json
-#                     (JSON body: {"url": "https://.../cube-sandbox-one-click-<sha>.tar.gz"})
+#                     (JSON body: {"url": "https://.../cube-sandbox-one-click-<version-or-sha>.tar.gz"})
 #   2. default     -> GitHub API latest release asset
 # ---------------------------------------------------------------------------
 if [[ -z "${DOWNLOAD_URL}" ]]; then
@@ -351,7 +400,7 @@ PY
 import json, sys, re
 
 data = json.loads(sys.argv[1])
-pattern = re.compile(r'^cube-sandbox-one-click-[0-9a-f]+\.tar\.gz$')
+pattern = re.compile(r'^cube-sandbox-one-click-(?:[0-9a-f]+|v[0-9A-Za-z][0-9A-Za-z._-]*)\.tar\.gz$')
 for asset in data.get("assets", []):
     if pattern.match(asset.get("name", "")):
         print(asset["browser_download_url"])
@@ -359,7 +408,7 @@ for asset in data.get("assets", []):
 sys.exit(1)
 PY
     )" || {
-      echo "[online-install] ERROR: could not find a cube-sandbox-one-click-<sha>.tar.gz asset in the latest release." >&2
+      echo "[online-install] ERROR: could not find a cube-sandbox-one-click-<version-or-sha>.tar.gz asset in the latest release." >&2
       echo "[online-install] You can specify the URL manually:" >&2
       echo "[online-install]   online-install.sh --url=<download-url> [install.sh options...]" >&2
       exit 1
@@ -372,7 +421,7 @@ fi
 # ---------------------------------------------------------------------------
 # Derive the expected directory name from the tarball filename.
 # The tarball produced by build-release-bundle.sh is always named
-#   cube-sandbox-one-click-<git-short-sha>.tar.gz
+#   cube-sandbox-one-click-<version-or-sha>.tar.gz
 # and extracts to a single top-level directory with the same stem.
 # ---------------------------------------------------------------------------
 TARBALL_FILENAME="${DOWNLOAD_URL##*/}"   # basename of URL
@@ -380,7 +429,7 @@ BUNDLE_DIRNAME="${TARBALL_FILENAME%.tar.gz}"
 
 if [[ "${BUNDLE_DIRNAME}" != cube-sandbox-one-click-* ]]; then
   echo "[online-install] ERROR: unexpected tarball filename '${TARBALL_FILENAME}'." >&2
-  echo "[online-install] Expected: cube-sandbox-one-click-<sha>.tar.gz" >&2
+  echo "[online-install] Expected: cube-sandbox-one-click-<version-or-sha>.tar.gz" >&2
   exit 1
 fi
 

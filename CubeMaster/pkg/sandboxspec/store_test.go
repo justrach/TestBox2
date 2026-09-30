@@ -30,7 +30,7 @@ func TestCanonicalizeRequestStripsTransientSnapshotAnnotations(t *testing.T) {
 			"unrelated-annotation":                            "preserve",
 		},
 		Labels:  map[string]string{"keep": "me"},
-		Timeout: 30,
+		Timeout: sandboxtypes.TimeoutPtr(30),
 	}
 
 	out, err := CanonicalizeRequest(req)
@@ -61,4 +61,19 @@ func TestCanonicalizeRequestHandlesNilAnnotations(t *testing.T) {
 	require.NotNil(t, out.Labels)
 	assert.Empty(t, out.Annotations)
 	assert.Empty(t, out.Labels)
+}
+
+func TestCanonicalizeRequestPreservesMaskRequestHost(t *testing.T) {
+	mask := "localhost:${PORT}"
+	out, err := CanonicalizeRequest(&sandboxtypes.CreateCubeSandboxReq{
+		InstanceType: "cubebox",
+		CubeNetworkConfig: &sandboxtypes.CubeNetworkConfig{
+			MaskRequestHost: &mask,
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, out.CubeNetworkConfig)
+	require.NotNil(t, out.CubeNetworkConfig.MaskRequestHost)
+	assert.Equal(t, mask, *out.CubeNetworkConfig.MaskRequestHost)
+	assert.NotSame(t, &mask, out.CubeNetworkConfig.MaskRequestHost)
 }

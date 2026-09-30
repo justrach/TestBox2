@@ -4,10 +4,8 @@ version = "0.1.0"
 authors = ["The Kata Containers community <kata-dev@lists.katacontainers.io>"]
 edition = "2021"
 
+
 [dependencies]
-x86_64 = { version = "0.14.2", default-features = false, features = [
-    "instructions",
-] }
 moniclock = "0.1.0"
 oci = { path = "libs/oci" }
 rustjail = { path = "rustjail" }
@@ -33,7 +31,7 @@ futures = "0.3.17"
 
 # Async runtime
 tokio = { version = "1.45.1", features = ["full"] }
-tokio-vsock = "0.5.0"
+tokio-vsock = "0.7.2"
 
 netlink-sys = { version = "0.7.0", features = ["tokio_socket"] }
 rtnetlink = "0.14.0"
@@ -70,8 +68,19 @@ serde = { version = "1.0.129", features = ["derive"] }
 toml = "0.5.8"
 clap = { version = "3.0.1", features = ["derive"] }
 base64 = "0.22.1"
+
+# The `x86_64` crate provides x86-only intrinsics (CPUID, port I/O, MSRs, ...)
+# and only compiles on x86_64. Restrict it to that target so that aarch64
+# builds don't pull it into the dependency graph.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = { version = "0.14.2", default-features = false, features = [
+    "instructions",
+] }
+
 [dev-dependencies]
-tempfile = "3.1.0"
+# 3.20.0 is the release that renamed `TempDir::into_path` to `keep()`, which the
+# mount tests use — declare that minimum so the API is guaranteed present.
+tempfile = "3.20.0"
 
 [workspace]
 members = ["rustjail", "cube"]
@@ -88,3 +97,4 @@ standard-oci-runtime = ["rustjail/standard-oci-runtime"]
 [[bin]]
 name = "cube-agent"
 path = "src/main.rs"
+
