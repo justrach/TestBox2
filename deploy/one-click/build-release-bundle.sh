@@ -517,9 +517,9 @@ EOF
     printf '%s\n\n' "${header}"
     sed \
       -e 's|^worker_processes [0-9]\+;|worker_processes auto;|' \
-      -e 's|^\(\s*listen \)8081\( reuseport;\)|\1__CUBE_PROXY_HTTP_PORT__\2|' \
-      -e 's|^\(\s*listen \)8080\( ssl reuseport;\)|\1__CUBE_PROXY_HTTPS_PORT__\2|' \
-      -e 's|^\(\s*listen \)9090\( http2 reuseport;\)|\1__CUBE_PROXY_GRPC_PORT__\2|' \
+      -e 's|^\(\s*listen \)8081\( reuseport;\)|\1__CUBE_PROXY_LISTEN_HOST____CUBE_PROXY_HTTP_PORT__\2|' \
+      -e 's|^\(\s*listen \)8080\( ssl reuseport;\)|\1__CUBE_PROXY_LISTEN_HOST____CUBE_PROXY_HTTPS_PORT__\2|' \
+      -e 's|^\(\s*listen \)9090\( http2 reuseport;\)|\1__CUBE_PROXY_LISTEN_HOST____CUBE_PROXY_GRPC_PORT__\2|' \
       -e 's|^\(\s*set \$host_proxy_port \)8081;|\1__CUBE_PROXY_HTTP_PORT__;|' \
       -e 's|^\(\s*set \$host_proxy_port \)8080;|\1__CUBE_PROXY_HTTPS_PORT__;|' \
       -e 's|^\(\s*listen \)127\.0\.0\.1:8082;|\1__CUBE_PROXY_ADMIN_LISTEN__:__CUBE_PROXY_ADMIN_PORT__;|' \
@@ -528,7 +528,7 @@ EOF
       "${src}"
   } > "${dst}"
 
-  for token in __CUBE_PROXY_HTTP_PORT__ __CUBE_PROXY_HTTPS_PORT__ __CUBE_PROXY_GRPC_PORT__ __CUBE_PROXY_ADMIN_LISTEN__ __CUBE_PROXY_ADMIN_PORT__ __CUBE_PROXY_SSL_CERT__ __CUBE_PROXY_SSL_KEY__; do
+  for token in __CUBE_PROXY_LISTEN_HOST__ __CUBE_PROXY_HTTP_PORT__ __CUBE_PROXY_HTTPS_PORT__ __CUBE_PROXY_GRPC_PORT__ __CUBE_PROXY_ADMIN_LISTEN__ __CUBE_PROXY_ADMIN_PORT__ __CUBE_PROXY_SSL_CERT__ __CUBE_PROXY_SSL_KEY__; do
     if ! grep -q -F "${token}" "${dst}"; then
       die "generated nginx.conf.template is missing placeholder ${token}; upstream CubeProxy/nginx.conf may have changed"
     fi

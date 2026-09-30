@@ -69,6 +69,16 @@ CUBE_PROXY_REDIS_SENTINEL_PASSWORD="${CUBE_PROXY_REDIS_SENTINEL_PASSWORD:-${CUBE
 CUBE_PROXY_HTTPS_PORT="${CUBE_PROXY_HTTPS_PORT:-443}"
 CUBE_PROXY_HTTP_PORT="${CUBE_PROXY_HTTP_PORT:-80}"
 CUBE_PROXY_GRPC_PORT="${CUBE_PROXY_GRPC_PORT:-9090}"
+# Optional address the HTTP/HTTPS/gRPC listeners bind to (default: every address). Set 127.0.0.1
+# when another service owns the same ports on a public address: the proxy then coexists with it.
+CUBE_PROXY_BIND_ADDR="${CUBE_PROXY_BIND_ADDR:-}"
+if [[ -n "${CUBE_PROXY_BIND_ADDR}" ]]; then
+  [[ "${CUBE_PROXY_BIND_ADDR}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
+    || die "CUBE_PROXY_BIND_ADDR must be an IPv4 address (got '${CUBE_PROXY_BIND_ADDR}')"
+  CUBE_PROXY_LISTEN_HOST="${CUBE_PROXY_BIND_ADDR}:"
+else
+  CUBE_PROXY_LISTEN_HOST=""
+fi
 CUBE_PROXY_SSL_CERT="${CUBE_PROXY_SSL_CERT:-cube.app+3.pem}"
 CUBE_PROXY_SSL_KEY="${CUBE_PROXY_SSL_KEY:-cube.app+3-key.pem}"
 # Address the /admin/* server binds to. Defaults to the node's
@@ -215,6 +225,7 @@ ensure_file "${NGINX_TEMPLATE}"
 render_template_atomic \
   "${NGINX_TEMPLATE}" \
   "${NGINX_CONF}" \
+  -e "s/__CUBE_PROXY_LISTEN_HOST__/$(escape_sed "${CUBE_PROXY_LISTEN_HOST}")/g" \
   -e "s/__CUBE_PROXY_HTTPS_PORT__/$(escape_sed "${CUBE_PROXY_HTTPS_PORT}")/g" \
   -e "s/__CUBE_PROXY_HTTP_PORT__/$(escape_sed "${CUBE_PROXY_HTTP_PORT}")/g" \
   -e "s/__CUBE_PROXY_GRPC_PORT__/$(escape_sed "${CUBE_PROXY_GRPC_PORT}")/g" \
@@ -263,7 +274,14 @@ for entry in "${CUBE_PROXY_HTTP_PORT}:CUBE_PROXY_HTTP_PORT" \
              "${CUBE_PROXY_ADMIN_PORT}:CUBE_PROXY_ADMIN_PORT"; do
   port="${entry%%:*}"
   override_var="${entry##*:}"
-  if command_output_contains_fixed_string "LISTEN" ss -lnt "( sport = :${port} )"; then
+  # With CUBE_PROXY_BIND_ADDR only a listener on that address can collide with the proxy's own bind;
+  # a service on the node's public address (or a wildcard one, which fails loudly at start) is not
+  # a conflict for the data-plane ports. The admin server always binds its own address.
+  port_filter="( sport = :${port} )"
+  if [[ -n "${CUBE_PROXY_BIND_ADDR}" && "${override_var}" != "CUBE_PROXY_ADMIN_PORT" ]]; then
+    port_filter="( sport = :${port} and src ${CUBE_PROXY_BIND_ADDR} )"
+  fi
+  if command_output_contains_fixed_string "LISTEN" ss -lnt "${port_filter}"; then
     die "port ${port} is already in use; cube-proxy uses host networking and requires it to be free. Set ${override_var} to a free port (or stop the occupying process) and retry."
   fi
 done

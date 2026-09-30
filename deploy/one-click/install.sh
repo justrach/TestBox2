@@ -567,6 +567,9 @@ generate_cubemaster_config_ports() {
   local redis_db
   redis_db="$(one_click_patch_conf_redis_db "${cfg}")"
   log "CubeMaster redis db_no=${redis_db} (CUBE_EXTERNAL_REDIS_DB)"
+
+  # Extra exposed ports beyond the default 80 (CUBEMASTER_EXPOSED_PORTS="49983,8787").
+  one_click_patch_exposed_ports "${cfg}" "${CUBEMASTER_EXPOSED_PORTS:-}"
 }
 
 # When external MySQL/PostgreSQL/Redis is configured, patch CubeMaster and
