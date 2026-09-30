@@ -1544,13 +1544,21 @@ one_click_patch_conf_redis_db() {
 # Adds each port to CubeMaster's exposed_port_list unless it is already listed. A sandbox on another node
 # is only routable on the ports CubeMaster records as exposed (default: 80), so a deployment that reaches
 # guest services through the proxy lists those ports here (CUBEMASTER_EXPOSED_PORTS). Empty input is a no-op.
-one_click_patch_exposed_ports() {
-  local conf="$1" csv="${2:-}" port
+one_click_validate_exposed_ports() {
+  local csv="${1:-}" port
   [[ -n "${csv// /}" ]] || return 0
-  grep -q '^[[:space:]]*exposed_port_list:' "${conf}" || die "no exposed_port_list in ${conf}"
   for port in ${csv//,/ }; do
     [[ "${port}" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) \
       || die "CUBEMASTER_EXPOSED_PORTS: '${port}' is not a port (1-65535)"
+  done
+}
+
+one_click_patch_exposed_ports() {
+  local conf="$1" csv="${2:-}" port
+  [[ -n "${csv// /}" ]] || return 0
+  one_click_validate_exposed_ports "${csv}"
+  grep -q '^[[:space:]]*exposed_port_list:' "${conf}" || die "no exposed_port_list in ${conf}"
+  for port in ${csv//,/ }; do
     grep -Eq "^[[:space:]]+-[[:space:]]+\"${port}\"" "${conf}" && continue
     awk -v port="${port}" '
       { print }

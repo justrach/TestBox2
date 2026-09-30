@@ -305,6 +305,12 @@ fi
 # like CUBE_EXTERNAL_REDIS_DB=16 must fail here, not after toolbox is wiped.
 one_click_redis_db >/dev/null
 
+# Validate the proxy bind address and the extra exposed ports before anything is stopped or removed.
+if [[ -n "${CUBE_PROXY_BIND_ADDR:-}" && ! "${CUBE_PROXY_BIND_ADDR}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  die "CUBE_PROXY_BIND_ADDR must be an IPv4 address (got '${CUBE_PROXY_BIND_ADDR}')"
+fi
+one_click_validate_exposed_ports "${CUBEMASTER_EXPOSED_PORTS:-}"
+
 init_external_dep_defaults
 # Compute nodes never open the control-plane DB; skip driver/host validation
 # so a mirrored CUBE_DATABASE_DRIVER=postgres without local reachability works.
@@ -2160,6 +2166,15 @@ fi
 upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_EGRESS_ADMIN_PORT" "${CUBE_EGRESS_ADMIN_PORT}"
 if [[ -n "${CUBE_SANDBOX_CUBE_EGRESS_IMAGE:-}" ]]; then
   upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_SANDBOX_CUBE_EGRESS_IMAGE" "${CUBE_SANDBOX_CUBE_EGRESS_IMAGE}"
+fi
+# cube-proxy re-renders nginx.conf from this file on every (systemd) start, so the bind address must be
+# persisted here, not only honoured by this installer run. The exposed ports are recorded so the next
+# upgrade regenerates the same CubeMaster list.
+if [[ -n "${CUBE_PROXY_BIND_ADDR:-}" ]]; then
+  upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_PROXY_BIND_ADDR" "${CUBE_PROXY_BIND_ADDR}"
+fi
+if [[ -n "${CUBEMASTER_EXPOSED_PORTS:-}" ]]; then
+  upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBEMASTER_EXPOSED_PORTS" "${CUBEMASTER_EXPOSED_PORTS}"
 fi
 
 # Persist database driver + engine endpoints. CubeMaster and CubeTemplateCenter

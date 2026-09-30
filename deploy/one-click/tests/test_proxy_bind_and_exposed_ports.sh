@@ -104,7 +104,23 @@ test_the_proxy_script_validates_the_address_and_scopes_its_port_check() {
   grep -Fq 'CUBE_PROXY_BIND_ADDR' "${ONE_CLICK_DIR}/env.example" || fail "env.example does not document CUBE_PROXY_BIND_ADDR"
 }
 
+test_both_options_are_validated_early_and_persisted_into_the_runtime_env() {
+  local inst="${ONE_CLICK_DIR}/install.sh" env_file="${TMP_DIR}/runtime.env"
+  grep -Fq 'upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_PROXY_BIND_ADDR"' "${inst}" || fail "the bind address is not persisted (cube-proxy re-renders from the runtime env on every start)"
+  grep -Fq 'upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBEMASTER_EXPOSED_PORTS"' "${inst}" || fail "the exposed ports are not persisted"
+  local validate_line upsert_line
+  validate_line="$(grep -n 'one_click_validate_exposed_ports "${CUBEMASTER_EXPOSED_PORTS' "${inst}" | head -1 | cut -d: -f1)"
+  upsert_line="$(grep -n 'upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBEMASTER_EXPOSED_PORTS"' "${inst}" | head -1 | cut -d: -f1)"
+  [[ -n "${validate_line}" && -n "${upsert_line}" && "${validate_line}" -lt "${upsert_line}" ]] || fail "exposed ports must be validated before anything is written"
+  : > "${env_file}"
+  upsert_env_kv "${env_file}" "CUBE_PROXY_BIND_ADDR" "127.0.0.1"
+  upsert_env_kv "${env_file}" "CUBE_PROXY_BIND_ADDR" "127.0.0.1"
+  [[ "$(grep -c '^CUBE_PROXY_BIND_ADDR=127.0.0.1$' "${env_file}")" == 1 ]] || fail "upsert did not leave exactly one CUBE_PROXY_BIND_ADDR line"
+  if (one_click_validate_exposed_ports "80,abc") >/dev/null 2>&1; then fail "a bad port passed validation"; fi
+}
+
 test_exposed_ports_are_added_once_and_the_default_stays
+test_both_options_are_validated_early_and_persisted_into_the_runtime_env
 test_empty_input_changes_nothing
 test_bad_ports_are_refused_and_leave_the_file_alone
 test_proxy_template_binds_the_three_listeners_to_the_chosen_address
