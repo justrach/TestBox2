@@ -86,11 +86,21 @@ struct s3lvol_lvstore {
 	 * whoever actually wrote it. Releasing one we never acquired would clear
 	 * another process's claim -- the exact thing this is meant to prevent. */
 	bool                    owner_held;
+	size_t                  derive_inflight;
+	/* esnap clones whose bdev is not registered yet. The decouple quiesce
+	 * set waits for these, then refuses any further import of that export. */
+	size_t                  import_clone_inflight;
 
 	TAILQ_ENTRY(s3lvol_lvstore) link;
 };
 
 static TAILQ_HEAD(, s3lvol_lvstore) g_lvstores = TAILQ_HEAD_INITIALIZER(g_lvstores);
+
+/* Hot-prepare state. Declared here rather than beside the prepare chain below
+ * because s3lvol_lvstore_unload() guards on g_hot_prepare_active, and an unload
+ * can be requested at any point in the attach/prepare lifetime. */
+static bool g_hot_prepare_active;
+static bool g_hot_prepare_done;
 
 /* State carried across the create *or* attach chain. The lvstore is only
  * published in g_lvstores once blobstore is up.
@@ -144,10 +154,10 @@ struct lvs_setup_ctx {
  * Unloads the lvstore and then deletes the S3 objects it owned, as opposed to
  * unload, which keeps everything and expects a later attach.
  *
- * The object list is derived rather than listed: s3_list_objects() is still
- * -ENOTSUP, so the data objects come from walking the chunk map (which names
- * every chunk this lvstore has written) and the metadata objects are the four
- * fixed keys, plus one manifest per registered export.
+ * The object list is derived rather than listed: the data objects come from
+ * walking the chunk map (which names every chunk this lvstore has written)
+ * and the metadata objects are the four fixed keys, plus one manifest per
+ * registered export.
  *
  * What it does *not* cover is orphans -- an object whose mapping never made it
  * into the chunk map, e.g. a create-once delete that failed, or a flush that
@@ -208,6 +218,11 @@ struct lvs_destroy_ctx {
 	/* Set once the unload succeeded, which is what makes the deletes safe to
 	 * issue and the bstore entry safe to remove. */
 	bool                    unloaded;
+
+	/* The bs_dev the reap callback was registered on, kept so the failure path
+	 * can unregister it: the callback is armed before the unload and would
+	 * otherwise outlive this ctx, which the failure path frees. */
+	struct spdk_bs_dev     *bs_dev;
 
 	/* Set when a key could not be recorded. Kept apart from delete_status
 	 * because the object is not merely undeleted, it is unaccounted for: no
@@ -294,6 +309,15 @@ lvs_destroy_finish(struct lvs_destroy_ctx *ctx, int status)
 		SPDK_ERRLOG("lvstore '%s' not destroyed: the unload failed (%s); "
 			    "no object was deleted and the lvstore is still "
 			    "loaded\n", ctx->lvs_name, spdk_strerror(-status));
+
+		/* The reap callback was armed before the unload and still points at
+		 * this ctx, which is freed below. A refused unload leaves the lvstore
+		 * loaded, so a later one will run the reap path -- through freed
+		 * memory unless the callback is cleared here. The bs_dev outlives this
+		 * ctx, so clearing it is safe. */
+		if (ctx->bs_dev) {
+			s3_bs_dev_set_reap_cb(ctx->bs_dev, NULL, NULL);
+		}
 	} else if (ctx->delete_status != 0 || ctx->lost_keys) {
 		SPDK_WARNLOG("lvstore '%s' destroyed, but %s; the remaining "
 			     "objects need GC\n", ctx->lvs_name,
@@ -482,8 +506,10 @@ s3lvol_lvstore_destroy(struct s3lvol_lvstore *lvs,
 	}
 
 	/* The data objects come later, from the final chunk map. Registered before
-	 * the unload because that is what triggers it. */
+	 * the unload because that is what triggers it. Remembered on the ctx so the
+	 * failure path can unregister it again -- see lvs_destroy_finish(). */
 	if (lvs->bs_dev) {
+		ctx->bs_dev = lvs->bs_dev;
 		s3_bs_dev_set_reap_cb(lvs->bs_dev, lvs_destroy_reap, ctx);
 	}
 
@@ -908,7 +934,7 @@ lvs_create_start_blobstore(struct lvs_setup_ctx *ctx)
 	struct spdk_lvs_opts lvs_opts;
 	int rc;
 
-	rc = s3_bs_dev_create(&ctx->opts, NULL, NULL, lvs->client,
+	rc = s3_bs_dev_create(&ctx->opts, lvs->client,
 			      ctx->opts.capacity_bytes, &lvs->bs_dev);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to create bs_dev for '%s': %d\n", lvs->name, rc);
@@ -1204,8 +1230,7 @@ lvs_create_after_owner(struct lvs_setup_ctx *ctx)
  *
  * `<prefix>/meta/checkpoint` is the marker used because it is the only object with
  * a deterministic name that outlives a clean shutdown: data objects are uuid-named
- * (and s3_list_objects() is still -ENOTSUP, so they cannot be enumerated), and
- * meta/owner is by design transient.
+ * and cannot be enumerated, and meta/owner is by design transient.
  *
  * What this does not cover: an lvstore created and cleanly stopped before its first
  * checkpoint ever ran. Its prefix holds nothing but uuid-named data objects, and
@@ -1429,6 +1454,15 @@ static void
 lvs_attach_lvols_done(struct lvs_setup_ctx *ctx)
 {
 	struct s3lvol_lvstore *lvs = ctx->lvs;
+
+	/* Blobstore and lvol metadata have been read from the overlay, so the hold
+	 * taken for that load in lvs_attach_start_blobstore() has served its
+	 * purpose. It is left in place a little longer, through rcow_start's
+	 * restore of active namespaces and listeners: 32 S3 uploads on the owner
+	 * reactor can otherwise delay that I/O recovery path by seconds, and
+	 * rcow_start resumes on that real milestone. The fallback armed when the
+	 * hold was taken still covers direct RPC users and startup-script version
+	 * skew, so nothing is re-armed here. */
 
 	SPDK_NOTICELOG("lvstore '%s': %u lvol(s) exported as bdevs%s\n",
 		       lvs->name, ctx->lvols_ok,
@@ -1710,10 +1744,48 @@ lvs_attach_exports_loaded(void *cb_arg, int status)
 	spdk_lvs_load_ext(lvs->bs_dev, &lvs_opts, s3lvol_lvs_load_cb, ctx);
 }
 
+static void lvs_attach_blobstore_flusher_held(void *cb_arg, int status);
+
 static void
 lvs_attach_start_blobstore(struct lvs_setup_ctx *ctx)
 {
+	/* Hold uploads only from here on, i.e. for the blobstore load and through
+	 * to the lvol export. This is the phase the hold exists for: blobstore
+	 * reads metadata out of the overlay, and a flusher that PUT+deletes a
+	 * metadata chunk underneath it corrupts the load.
+	 *
+	 * The WAL replay that just finished is deliberately *not* covered. Uploads
+	 * during replay are safe -- replay goes through s3_overlay_write(), which
+	 * only writes overlay blocks and never reads blobstore metadata -- and
+	 * holding them would make peak overlay occupancy the size of the unflushed
+	 * WAL. With the pre-kill flush now skipped by default the WAL arrives at
+	 * this point as full as it can be, so an unbounded replay would mean
+	 * mallocing tens of GiB in a single attach.
+	 *
+	 * Arm the fallback in the same breath as taking the hold, not after the
+	 * lvols are exported: if blobstore's own metadata write is parked on WAL
+	 * backpressure or a full overlay, the only thing that can free space is the
+	 * flusher held here, and a timer armed later would never break that cycle. */
+	s3_bs_dev_schedule_flusher_resume(ctx->lvs->bs_dev,
+					  S3_FLUSHER_ATTACH_GRACE_US);
+	s3_bs_dev_suspend_flusher(ctx->lvs->bs_dev,
+				  S3_FLUSHER_NO_SUSPEND_TIMEOUT,
+				  lvs_attach_blobstore_flusher_held, ctx);
+}
+
+static void
+lvs_attach_blobstore_flusher_held(void *cb_arg, int status)
+{
+	struct lvs_setup_ctx *ctx = cb_arg;
 	int rc;
+
+	if (status != 0) {
+		SPDK_ERRLOG("Failed to hold the flusher for '%s' before the "
+			    "blobstore load: %s\n",
+			    ctx->lvs->name, spdk_strerror(-status));
+		lvs_setup_fail(ctx, status);
+		return;
+	}
 
 	/* Fetch the manifests *first*. blobstore asks for the parent of each esnap
 	 * clone synchronously while loading, and that can only be answered out of
@@ -1743,6 +1815,7 @@ lvs_attach_wal_replayed(void *cb_arg, int status)
 		       "dropped %" PRIu64 " unclosed batch(es)\n",
 		       ctx->lvs->name, st.replayed_entries,
 		       st.dropped_batches);
+	s3_bs_dev_log_overlay(ctx->lvs->bs_dev);
 
 	lvs_attach_start_blobstore(ctx);
 }
@@ -1772,6 +1845,10 @@ lvs_attach_journal_replayed(void *cb_arg, int status)
 		return;
 	}
 
+	/* Replay with the flusher running: replayed entries land in the overlay,
+	 * and the flusher draining them as they arrive is what keeps the peak
+	 * occupancy bounded. The hold is taken afterwards, for the blobstore load
+	 * -- see lvs_attach_start_blobstore(). */
 	s3_wal_replay(lvs->wal, (s3_wal_replay_cb)s3_bs_dev_wal_apply, lvs->bs_dev,
 		      lvs_attach_wal_replayed, ctx);
 }
@@ -1795,7 +1872,7 @@ lvs_attach_wal_opened(void *cb_arg, struct s3_wal *wal, int status)
 
 	lvs->wal = wal;
 
-	rc = s3_bs_dev_create(&ctx->opts, NULL, NULL, lvs->client,
+	rc = s3_bs_dev_create(&ctx->opts, lvs->client,
 			      ctx->opts.capacity_bytes, &lvs->bs_dev);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to create bs_dev for '%s': %d\n", lvs->name, rc);
@@ -2283,6 +2360,29 @@ s3lvol_lvstore_unload(struct s3lvol_lvstore *lvs,
 		return;
 	}
 
+	/* A hot prepare walks g_lvstores with a bare TAILQ_NEXT across asynchronous
+	 * boundaries, so an unload that freed its lvs mid-walk would leave that walk
+	 * on freed memory. Today it happens to survive -- the drain cancels the
+	 * pending suspend, which lands the prepare on its failure branch without
+	 * touching suspend_next again -- but that is an emergent property of the
+	 * cancel path, not something the walk guarantees, so refuse explicitly.
+	 *
+	 * Only `active`, not the sticky `done`: the hazard is the walk, which is
+	 * over once the prepare returns. A `done` prepare holds the flushers, but
+	 * unload is about to destroy the flusher anyway -- and refusing then would
+	 * leave rcow_stop.sh unable to shut down a node whose upgrade was abandoned.
+	 * The prepare is bounded now (see S3_FLUSHER_SUSPEND_TIMEOUT_US), so a caller
+	 * can retry. */
+	if (g_hot_prepare_active) {
+		SPDK_WARNLOG("lvstore '%s' cannot be unloaded while a hot prepare "
+			     "is walking the lvstore list; retry once it settles\n",
+			     lvs->name);
+		if (cb_fn) {
+			cb_fn(cb_arg, -EBUSY);
+		}
+		return;
+	}
+
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		if (cb_fn) {
@@ -2298,17 +2398,19 @@ s3lvol_lvstore_unload(struct s3lvol_lvstore *lvs,
 	 * internally, and this is the only signal for when that finished. */
 	s3_bs_dev_set_destroy_cb(lvs->bs_dev, lvs_unload_bs_dev_gone, ctx);
 
-	s3_bs_dev_drain(lvs->bs_dev, lvs_unload_drained, ctx);
+	s3_bs_dev_drain(lvs->bs_dev, 0, lvs_unload_drained, ctx);
 }
 
 /* Push everything acknowledged so far into S3 without unloading.
  *
  * Exists for testing: after this returns the overlay is empty, so a subsequent
  * read has to come from S3 rather than from RAM. That is the difference between
- * "the data is in the process" and "the data is in the object store". */
+ * "the data is in the process" and "the data is in the object store".
+ *
+ * timeout_us of 0 takes the flusher's default; see s3_bs_dev_drain(). */
 void
-s3lvol_lvstore_flush(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn,
-		     void *cb_arg)
+s3lvol_lvstore_flush(struct s3lvol_lvstore *lvs, uint64_t timeout_us,
+		     spdk_lvs_op_complete cb_fn, void *cb_arg)
 {
 	if (!lvs || !lvs->bs_dev) {
 		if (cb_fn) {
@@ -2317,7 +2419,31 @@ s3lvol_lvstore_flush(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn,
 		return;
 	}
 
-	s3_bs_dev_drain(lvs->bs_dev, (s3_bs_dev_cb)cb_fn, cb_arg);
+	/* A hot prepare holds every flusher and relies on that hold to declare
+	 * "all data-plane I/O reached the target" before the SIGKILL. A drain here
+	 * would clear the hold -- s3_flusher_drain supersedes an established hold
+	 * with no callback at all -- and the prepare would then finish reporting
+	 * success over a flusher that is running again. Refuse it the way unload
+	 * already does, and let the caller retry once the prepare settles.
+	 *
+	 * Both flags count. `active` covers a prepare still walking the lvstores;
+	 * `done` is the sticky success state, which lasts until the process is
+	 * killed or resume_subsystems clears it -- the whole point of it is that the
+	 * hold must survive a caller that gives up, so a drain must not be what
+	 * ends it.
+	 *
+	 * The teardown drain in s3_bs_dev_destroy() does not come through here, so
+	 * a stop is still able to make its last push. */
+	if (g_hot_prepare_active || g_hot_prepare_done) {
+		SPDK_WARNLOG("not draining lvstore '%s' while a hot prepare holds "
+			     "its flusher; retry once it settles\n", lvs->name);
+		if (cb_fn) {
+			cb_fn(cb_arg, -EBUSY);
+		}
+		return;
+	}
+
+	s3_bs_dev_drain(lvs->bs_dev, timeout_us, (s3_bs_dev_cb)cb_fn, cb_arg);
 }
 
 void
@@ -2332,6 +2458,234 @@ s3lvol_lvstore_checkpoint(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn
 	}
 
 	s3_bs_dev_checkpoint(lvs->bs_dev, (s3_bs_dev_cb)cb_fn, cb_arg);
+}
+
+struct lvs_hot_prepare_ctx {
+	struct s3lvol_lvstore *suspend_next;
+	spdk_lvs_op_complete cb_fn;
+	void *cb_arg;
+	int status;
+
+	/* Budget for holding each flusher, in microseconds; 0 means the flusher's
+	 * own default. The prepare is the one suspend with a caller waiting on a
+	 * stop budget, so it is the one that must be bounded. */
+	uint64_t suspend_timeout_us;
+};
+
+static void lvs_hot_prepare_finish(struct lvs_hot_prepare_ctx *ctx, int status);
+
+static void
+lvs_hot_prepare_finish(struct lvs_hot_prepare_ctx *ctx, int status)
+{
+	spdk_lvs_op_complete cb_fn = ctx->cb_fn;
+	void *cb_arg = ctx->cb_arg;
+
+	g_hot_prepare_active = false;
+	if (status == 0) {
+		g_hot_prepare_done = true;
+	}
+	free(ctx);
+	if (cb_fn) {
+		cb_fn(cb_arg, status);
+	}
+}
+
+static void
+lvs_hot_prepare_resumed(void *cb_arg, int status)
+{
+	struct lvs_hot_prepare_ctx *ctx = cb_arg;
+
+	if (status != 0) {
+		SPDK_ERRLOG("not every RCOW subsystem resumed after hot prepare "
+			    "failed: %s\n", spdk_strerror(-status));
+	}
+	lvs_hot_prepare_finish(ctx, ctx->status != 0 ? ctx->status : status);
+}
+
+static void
+lvs_hot_prepare_fail(struct lvs_hot_prepare_ctx *ctx, int status)
+{
+	struct s3lvol_lvstore *lvs;
+	int rc;
+
+	ctx->status = status;
+	TAILQ_FOREACH(lvs, &g_lvstores, link) {
+		s3_bs_dev_resume_flusher(lvs->bs_dev);
+	}
+	rc = s3lvol_nvmf_resume_all(lvs_hot_prepare_resumed, ctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("could not resume RCOW subsystems after hot prepare "
+			    "failed: %s\n", spdk_strerror(-rc));
+		lvs_hot_prepare_finish(ctx, status);
+	}
+}
+
+static void lvs_hot_prepare_suspend_next(struct lvs_hot_prepare_ctx *ctx);
+
+static void
+lvs_hot_prepare_flusher_suspended(void *cb_arg, int status)
+{
+	struct lvs_hot_prepare_ctx *ctx = cb_arg;
+
+	if (status != 0) {
+		SPDK_ERRLOG("failed to suspend flusher for '%s': %s\n",
+			    ctx->suspend_next->name, spdk_strerror(-status));
+		lvs_hot_prepare_fail(ctx, status);
+		return;
+	}
+
+	ctx->suspend_next = s3lvol_lvstore_next(ctx->suspend_next);
+	lvs_hot_prepare_suspend_next(ctx);
+}
+
+static void
+lvs_hot_prepare_suspend_next(struct lvs_hot_prepare_ctx *ctx)
+{
+	if (!ctx->suspend_next) {
+		/* Leave blobstore dirty. A live clean-sync can persist a used-blob
+		 * mask that the next clean load cannot open, and the replacement
+		 * then comes up short a volume. Dirty recovery is slower and proven. */
+		SPDK_NOTICELOG("hot prepare: namespaces paused and flushers held; "
+			       "blobstore stays dirty for the next attach\n");
+		lvs_hot_prepare_finish(ctx, 0);
+		return;
+	}
+
+	s3_bs_dev_suspend_flusher(ctx->suspend_next->bs_dev,
+				 ctx->suspend_timeout_us,
+				 lvs_hot_prepare_flusher_suspended, ctx);
+}
+
+static void
+lvs_hot_prepare_paused(void *cb_arg, int status)
+{
+	struct lvs_hot_prepare_ctx *ctx = cb_arg;
+
+	if (status != 0) {
+		/* pause_all has already resumed the subsystems it paused. */
+		lvs_hot_prepare_finish(ctx, status);
+		return;
+	}
+
+	ctx->suspend_next = s3lvol_lvstore_first();
+	lvs_hot_prepare_suspend_next(ctx);
+}
+
+void
+s3lvol_prepare_hot_upgrade(spdk_lvs_op_complete cb_fn, void *cb_arg,
+			   uint64_t suspend_timeout_us)
+{
+	struct lvs_hot_prepare_ctx *ctx;
+	struct s3lvol_lvstore *lvs;
+	int rc;
+
+	/* The successful state is intentionally sticky until process exit:
+	 * subsystems and flushers remain paused. A timed-out caller may retry the
+	 * RPC, and that retry must not enter rollback and resume data-plane I/O. */
+	if (g_hot_prepare_done) {
+		if (cb_fn) {
+			cb_fn(cb_arg, 0);
+		}
+		return;
+	}
+	if (g_hot_prepare_active) {
+		if (cb_fn) {
+			cb_fn(cb_arg, -EBUSY);
+		}
+		return;
+	}
+
+	TAILQ_FOREACH(lvs, &g_lvstores, link) {
+		if (!lvs->lvs || s3lvol_lvstore_decouple_pending(lvs)) {
+			if (cb_fn) {
+				cb_fn(cb_arg, -EBUSY);
+			}
+			return;
+		}
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->suspend_timeout_us = suspend_timeout_us;
+	g_hot_prepare_active = true;
+
+	rc = s3lvol_nvmf_pause_all(lvs_hot_prepare_paused, ctx);
+	if (rc != 0) {
+		lvs_hot_prepare_finish(ctx, rc);
+	}
+}
+
+void
+s3lvol_resume_flushers(void)
+{
+	struct s3lvol_lvstore *lvs;
+
+	TAILQ_FOREACH(lvs, &g_lvstores, link) {
+		s3_bs_dev_resume_flusher(lvs->bs_dev);
+	}
+}
+
+static void
+lvs_resume_subsystems_done(void *cb_arg, int status)
+{
+	if (status != 0) {
+		SPDK_ERRLOG("could not resume every RCOW subsystem: %s\n",
+			    spdk_strerror(-status));
+	}
+}
+
+int
+s3lvol_resume_subsystems(void)
+{
+	struct s3lvol_lvstore *lvs;
+	int rc;
+
+	/* The escape hatch for a hot prepare that succeeded but was never
+	 * followed by the SIGKILL: every RCOW subsystem is paused and every
+	 * flusher is held, and nothing else in the process would ever undo it.
+	 * rcow_resume_flushers is not enough -- it releases uploads but leaves the
+	 * namespaces paused.
+	 *
+	 * Clear the sticky flag so a *later* prepare can run again; under the
+	 * normal no-way-back assumption the retry would otherwise just re-report
+	 * success over a target that is no longer quiesced. Guarded on
+	 * g_hot_prepare_active so a resume cannot open a second prepare's window --
+	 * a prepare in flight is left alone rather than interleaved.
+	 *
+	 * That refusal is reported rather than swallowed: a caller that reads it as
+	 * success would tell an operator the node had been released while it is
+	 * still frozen, which is the one thing this function exists to prevent.
+	 * With the prepare's own flusher holds now bounded (see
+	 * S3_FLUSHER_SUSPEND_TIMEOUT_US) the refusal is transient -- it lasts only
+	 * as long as a prepare that is already unwinding. */
+	if (g_hot_prepare_active) {
+		SPDK_WARNLOG("a hot prepare is still in flight; not resuming RCOW "
+			     "subsystems under it\n");
+		return -EBUSY;
+	}
+	g_hot_prepare_done = false;
+
+	TAILQ_FOREACH(lvs, &g_lvstores, link) {
+		s3_bs_dev_resume_flusher(lvs->bs_dev);
+	}
+
+	/* Safe on a subsystem that was never paused: spdk_nvmf_subsystem_resume()
+	 * only undoes a pause, and reports success otherwise. */
+	rc = s3lvol_nvmf_resume_all(lvs_resume_subsystems_done, NULL);
+	if (rc != 0) {
+		SPDK_ERRLOG("could not resume RCOW subsystems: %s\n",
+			    spdk_strerror(-rc));
+		return rc;
+	}
+
+	return 0;
 }
 
 void
@@ -2478,6 +2832,8 @@ s3lvol_lvol_create(struct s3lvol_lvstore *lvs, const char *name,
  * So the snapshot is kept and the registration failure is reported honestly.
  * The data is intact; only a bdev is missing, and re-attaching the lvstore
  * registers it. */
+static void derive_inflight_put(struct s3lvol_lvstore *lvs);
+
 static void
 s3lvol_lvol_derive_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 {
@@ -2488,9 +2844,9 @@ s3lvol_lvol_derive_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 	struct s3lvol_lvstore *lvs = ctx->lvs;
 	int rc;
 
-	free(ctx);
-
 	if (lvolerrno != 0) {
+		derive_inflight_put(lvs);
+		free(ctx);
 		SPDK_ERRLOG("Failed to create snapshot/clone: %s\n",
 			    spdk_strerror(-lvolerrno));
 		if (cb_fn) {
@@ -2542,6 +2898,12 @@ s3lvol_lvol_derive_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 	}
 
 	rc = vbdev_s3lvol_bdev_register(lvol, lvs_name);
+	/* After registration. The decouple quiesce set treats a zero count as
+	 * "every descendant bdev is visible", so dropping it earlier lets that
+	 * set close while this bdev is still being registered. A failed
+	 * registration leaves no bdev, so there is nothing further to wait for. */
+	derive_inflight_put(lvs);
+	free(ctx);
 	if (rc != 0) {
 		SPDK_ERRLOG("lvol '%s' was created but its bdev could not be "
 			    "registered (%d). The data is intact -- re-attach the "
@@ -2603,6 +2965,15 @@ derive_check(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol, const char *nam
 		SPDK_ERRLOG("lvol '%s' is queued to be decoupled; a snapshot or "
 			    "clone would take its external snapshot while the "
 			    "decouple still reads through it\n", lvol->name);
+		return -EBUSY;
+	}
+	/* Set after the last cluster is copied and before the family is quiesced.
+	 * A descendant registered in that window is not in the quiesce set, and
+	 * clear_external_parent then destroys the esnap channel under it. */
+	if (s3lvol_lvol_import_finalizing(lvs, lvol)) {
+		SPDK_ERRLOG("lvol '%s' still reads an export whose decouple is "
+			    "detaching it; a snapshot or clone would miss the "
+			    "quiesce\n", lvol->name);
 		return -EBUSY;
 	}
 	return 0;
@@ -2724,14 +3095,19 @@ s3lvol_lvol_create_snapshot(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		return -ENOMEM;
 	}
 
+	/* Counted before the call. spdk_lvol_create_snapshot() is void and runs
+	 * the callback on every path, including its synchronous failures, so a
+	 * failure cannot leave the count raised. The callback drops it only
+	 * after the new bdev is registered. */
+	lvs->derive_inflight++;
 	spdk_lvol_create_snapshot(lvol, snapshot_name, s3lvol_lvol_derive_cb, ctx);
 	return 0;
 }
 
-int
-s3lvol_lvol_create_clone(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
-			 const char *clone_name,
-			 s3lvol_lvol_op_cb cb_fn, void *cb_arg)
+static int
+create_clone_common(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
+		    const char *clone_name,
+		    s3lvol_lvol_op_cb cb_fn, void *cb_arg)
 {
 	struct lvol_create_ctx *ctx;
 	int rc;
@@ -2757,8 +3133,62 @@ s3lvol_lvol_create_clone(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		return -ENOMEM;
 	}
 
+	/* Same pairing as create_snapshot: the callback always runs, and the
+	 * count covers bdev registration rather than just the blob operation. */
+	lvs->derive_inflight++;
 	spdk_lvol_create_clone(lvol, clone_name, s3lvol_lvol_derive_cb, ctx);
 	return 0;
+}
+
+int
+s3lvol_lvol_create_clone(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
+			 const char *clone_name,
+			 s3lvol_lvol_op_cb cb_fn, void *cb_arg)
+{
+	return create_clone_common(lvs, lvol, clone_name, cb_fn, cb_arg);
+}
+
+static void
+derive_inflight_put(struct s3lvol_lvstore *lvs)
+{
+	assert(lvs->derive_inflight > 0);
+	/* assert() is absent from a release build. A wrapped size_t would look
+	 * permanently busy to the decouple wait. */
+	if (lvs->derive_inflight == 0) {
+		SPDK_ERRLOG("lvstore '%s' derive count is already zero\n", lvs->name);
+		return;
+	}
+	lvs->derive_inflight--;
+}
+
+bool
+s3lvol_lvstore_derive_inflight(const struct s3lvol_lvstore *lvs)
+{
+	return lvs && lvs->derive_inflight != 0;
+}
+
+void
+s3lvol_lvstore_import_clone_begin(struct s3lvol_lvstore *lvs)
+{
+	lvs->import_clone_inflight++;
+}
+
+void
+s3lvol_lvstore_import_clone_end(struct s3lvol_lvstore *lvs)
+{
+	assert(lvs->import_clone_inflight > 0);
+	if (lvs->import_clone_inflight == 0) {
+		SPDK_ERRLOG("lvstore '%s' import-clone count is already zero\n",
+			    lvs->name);
+		return;
+	}
+	lvs->import_clone_inflight--;
+}
+
+bool
+s3lvol_lvstore_import_clone_inflight(const struct s3lvol_lvstore *lvs)
+{
+	return lvs && lvs->import_clone_inflight != 0;
 }
 
 /* ==========================================================================
@@ -3063,6 +3493,21 @@ s3lvol_lvol_destroy_impl(struct spdk_lvol *lvol,
 		destroy_mark_pending(lvol, S3LVOL_PENDING_DECOUPLE);
 		return -EBUSY;
 	}
+	/* action_in_progress covers only the volume being decoupled. The quiesce
+	 * set also names every other reader of that export, and it is walked
+	 * across reactor turns. A delete admitted here would unregister one of
+	 * those bdevs while the walk still has to quiesce it. A release-chain
+	 * continuation already passed this check and has revoked an export, so
+	 * it must finish; the quiesce walk re-resolves by name and will not
+	 * touch a bdev that continuation has already freed. */
+	if (!release_chain && owner &&
+	    s3lvol_lvol_import_finalizing(owner, lvol)) {
+		SPDK_ERRLOG("lvol '%s' still reads an export whose decouple is "
+			    "detaching it; it cannot be deleted until that "
+			    "finishes\n", lvol->name);
+		destroy_mark_pending(lvol, S3LVOL_PENDING_DECOUPLE);
+		return -EBUSY;
+	}
 	rc = snapshot_destroy_check_clones(lvol);
 	if (rc != 0) {
 		return rc;
@@ -3213,19 +3658,11 @@ s3lvol_lvol_destroy_impl(struct spdk_lvol *lvol,
 	}
 	spdk_uuid_copy(&ctx->lvol_uuid, &lvol->uuid);
 
-	/* Recorded now, for the same reason the owner is: after the destroy the blob
-	 * is gone and the esnap id with it. An id that is not a NUL-terminated uuid
-	 * string is not one of ours, so it is left empty rather than guessed at. */
-	if (lvol->blob && spdk_blob_is_esnap_clone(lvol->blob)) {
-		const void *esnap_id = NULL;
-		size_t id_len = 0;
-
-		if (spdk_blob_get_esnap_id(lvol->blob, &esnap_id, &id_len) == 0 &&
-		    id_len < sizeof(ctx->esnap_uuid)) {
-			memcpy(ctx->esnap_uuid, esnap_id, id_len);
-			ctx->esnap_uuid[id_len] = '\0';
-		}
-	}
+	/* Recorded now, for the same reason the owner is: after the destroy the
+	 * parent chain is gone. A clone reaches the export through its snapshot,
+	 * so the uuid has to come from that chain rather than only this blob. */
+	(void)s3lvol_lvol_import_uuid(lvol, ctx->esnap_uuid,
+				     sizeof(ctx->esnap_uuid));
 
 	/* Capture the cluster counts before the destroy: the blob must still be
 	 * open to read them, and is gone by the time s3lvol_lvol_destroyed()
@@ -3334,12 +3771,46 @@ s3lvol_lvstore_of_lvol(struct spdk_lvol *lvol)
  *      deleted depends on whether the blobstore passes unmap down to the
  *      bs_dev when releasing clusters (lvols are created with
  *      LVOL_CLEAR_WITH_UNMAP here, which suggests it does), but that chain is
- *      **unverified**. Guessing wrong orphans the objects, and reclaiming
- *      orphans relies on s3_gc.c, which does not exist yet -- i.e. paying
- *      storage forever.
+ *      **unverified**. Guessing wrong orphans the objects. Nothing scans the
+ *      prefix to reclaim them, so they are paid for forever.
  *
- * Reconsider lifting the guard once GC has landed and a real machine confirms
- * unmap propagates.
+ *      A scan that did exist would not be "delete every data object absent
+ *      from the chunk map". The live set is all four of these:
+ *
+ *        1. everything under <lvs>/meta/ -- super block, checkpoint, owner,
+ *           imports.json, exports.json
+ *        2. the unreclaimed segments under <lvs>/wal/
+ *        3. <lvs>/data/<uuid> present in the chunk map
+ *        4. when <lvs>/exports/<uuid>.json exists:
+ *             a. dense layout: everything under <lvs>/exports/<uuid>/
+ *             b. ref layout: every <lvs>/data/<uuid> that manifest names,
+ *                even after that uuid has left the chunk map
+ *
+ *      4b is the case intuition misses. A ref manifest names this lvstore's
+ *      objects, not copies of them. Deleting the exported snapshot merges its
+ *      clusters into the remaining clone; once that clone overwrites them,
+ *      create-once issues a new uuid and the old one leaves the chunk map,
+ *      while an importer still holds the old manifest text. The imports
+ *      registry caches that text and loads it on attach without re-GETting.
+ *      Deleting those objects by rule 3 alone makes the importer read zeroes,
+ *      and only a checksum can catch it.
+ *
+ *      Copying the objects into the export and rewriting the manifest into
+ *      dense form does not fix that. The importer cached the ref manifest,
+ *      and the export read path treats a parsed manifest as immutable, so the
+ *      rewrite would still point it at objects about to be deleted. Rule 4b
+ *      needs no copy and no refresh: a manifest that is still there keeps the
+ *      objects it names alive. The dense layout stays for cross-bucket and
+ *      cross-region exports, where the importer cannot read this bucket.
+ *
+ *      The scan also has no paged prefix list to start from. An explicit
+ *      snapshot delete releases that snapshot's ref exports internally once
+ *      no live lease remains, so a successful delete removes the manifest
+ *      before those objects can become orphans. Rule 4b remains the rule for
+ *      a crash or an incomplete state in which a live ref manifest outlived
+ *      its source snapshot.
+ *
+ * Reconsider lifting the guard once a real machine confirms unmap propagates.
  * ========================================================================== */
 
 struct lvol_resize_ctx {

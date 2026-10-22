@@ -226,6 +226,7 @@ struct s3_ctx {
 
 	struct s3_overlay *overlay;
 	struct s3_flusher *flusher;
+	struct spdk_poller *flusher_resume_poller;
 
 	/* Local device, for the checkpoint path: it owns the super block that
 	 * records checkpoint_gen / checkpoint_lsn, and its super block is also
@@ -953,6 +954,19 @@ s3_dest_fill_done(void *cb_arg, uint64_t bytes_read, int status)
 
 	fill->bytes_read = bytes_read;
 	fill->status = status;
+	/* -ENOENT is the flusher-overwrite 404 documented above (the "Which object
+	 * this GET is reading" block): finish treats it as a mapping reread, not a
+	 * failed GET. ERRLOG here would fire on every such race at the level
+	 * operators filter for faults. */
+	if (status != 0 && status != -ENOENT) {
+		char uuid_str[SPDK_UUID_STRING_LEN];
+
+		spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str), &fill->uuid);
+		SPDK_ERRLOG("dest fill chunk %" PRIu64 " uuid %s failed: %s "
+			    "(key=%s)\n",
+			    fill->chunk_index, uuid_str,
+			    spdk_strerror(-status), fill->key);
+	}
 	if (fill->token_held) {
 		fill->token_held = false;
 		s3_whole_get_token_release();
@@ -1256,7 +1270,6 @@ s3_chunk_read_submit(struct s3_chunk_io *cio)
 		s3_chunk_io_finish(cio, 0);
 		return 0;
 	}
-
 	rc = s3_chunk_map_lookup(ctx->chunk_map, cio->chunk_index, &uuid,
 				 &valid_bytes);
 	if (rc == -ENOENT) {
@@ -1649,6 +1662,25 @@ static void
 s3_chunk_io_finish(struct s3_chunk_io *cio, int status)
 {
 	struct s3_bs_io *bs_io = cio->bs_io;
+
+	if (status != 0) {
+		struct s3_ctx *ctx = bs_io->ctx;
+		uint32_t covered = 0;
+
+		/* overlay is owner-thread state, and this runs on the abort path too
+		 * (see s3_dest_fill_abort_bounce), which is off-owner by construction.
+		 * s3_overlay_covered_count() walks c->blocks[], which the owner may free
+		 * after storing NULL, so it must not be read from another thread. The
+		 * count is a diagnostic; skip it rather than reach into the overlay. */
+		if (ctx->overlay && ctx->owner_thread == spdk_get_thread()) {
+			covered = s3_overlay_covered_count(ctx->overlay, cio->lba,
+							   cio->nblocks);
+		}
+		SPDK_ERRLOG("chunk I/O failed: lba=%" PRIu64 " nblocks=%u "
+			    "chunk=%" PRIu64 " status=%s overlay_covered=%u/%u\n",
+			    cio->lba, cio->nblocks, cio->chunk_index,
+			    spdk_strerror(-status), covered, cio->nblocks);
+	}
 
 	if (status != 0 && bs_io->status == 0) {
 		bs_io->status = status;
@@ -2845,6 +2877,9 @@ s3_bs_dev_destroy(struct spdk_bs_dev *dev)
 	if (ctx->ckpt_poller) {
 		spdk_poller_unregister(&ctx->ckpt_poller);
 	}
+	if (ctx->flusher_resume_poller) {
+		spdk_poller_unregister(&ctx->flusher_resume_poller);
+	}
 
 	/* blobstore guarantees none of its own I/O is outstanding here ("once all
 	 * references to it during unload callback context have been completed").
@@ -3056,6 +3091,7 @@ ingest_try_finish_end(struct s3_ctx *ctx)
 	}
 
 	ctx->bs_dev.copy = NULL;
+	ctx->bs_dev.copy_on_materialize_only = false;
 	ctx->ingest = NULL;
 	cb = in->end_cb;
 	arg = in->end_arg;
@@ -3347,6 +3383,7 @@ s3_bs_dev_ingest_begin(struct spdk_bs_dev *bs_dev, const char *src_endpoint,
 	in->src_fn = src_fn;
 	in->src_arg = src_arg;
 	ctx->ingest = in;
+	ctx->bs_dev.copy_on_materialize_only = true;
 	ctx->bs_dev.copy = s3_bs_dev_copy;
 	return 0;
 }
@@ -3825,8 +3862,6 @@ s3_flush_upload(void *vctx, const struct s3_overlay_flush_view *view,
 
 int
 s3_bs_dev_create(const struct s3_lvs_opts *opts,
-		 struct spdk_bdev_desc *wal_desc,
-		 struct spdk_bdev_desc *cache_desc,
 		 struct s3_client *client,
 		 uint64_t capacity_bytes,
 		 struct spdk_bs_dev **out)
@@ -3835,11 +3870,6 @@ s3_bs_dev_create(const struct s3_lvs_opts *opts,
 	uint32_t chunk_size;
 	uint64_t blockcnt;
 	int rc;
-
-	/* The direct-to-S3 path has no WAL / cache yet. The parameters are
-	 * accepted but unused to keep the interface stable. */
-	(void)wal_desc;
-	(void)cache_desc;
 
 	if (!opts || !client || !out) {
 		return -EINVAL;
@@ -3949,12 +3979,6 @@ s3_bs_dev_create(const struct s3_lvs_opts *opts,
 	return 0;
 }
 
-struct s3_ctx *
-s3_bs_dev_get_ctx(struct spdk_bs_dev *bs_dev)
-{
-	return (struct s3_ctx *)bs_dev;
-}
-
 /* ==========================================================================
  * WAL attachment
  * ========================================================================== */
@@ -3997,6 +4021,27 @@ s3_bs_dev_attach_wal(struct spdk_bs_dev *bs_dev, struct s3_wal *wal,
 		       ctx->prefix);
 
 	return 0;
+}
+
+void
+s3_bs_dev_log_overlay(struct spdk_bs_dev *bs_dev)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	struct s3_overlay_stats st = {0};
+
+	if (!ctx || !ctx->overlay) {
+		SPDK_NOTICELOG("overlay: none\n");
+		return;
+	}
+
+	s3_overlay_get_stats(ctx->overlay, &st);
+	SPDK_NOTICELOG("overlay: %" PRIu64 " bytes in %" PRIu64 " live chunks, "
+		       "writes=%" PRIu64 " blocks_written=%" PRIu64
+		       " blocks_dropped=%" PRIu64 " peak_bytes=%" PRIu64 "\n",
+		       s3_overlay_get_bytes(ctx->overlay),
+		       s3_overlay_get_live_chunks(ctx->overlay),
+		       st.writes, st.blocks_written, st.blocks_dropped,
+		       st.peak_bytes);
 }
 
 int
@@ -4100,7 +4145,8 @@ s3_bs_dev_set_reap_cb(struct spdk_bs_dev *bs_dev, s3_bs_dev_reap_cb cb_fn,
 }
 
 void
-s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_arg)
+s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, uint64_t timeout_us,
+		s3_bs_dev_cb cb_fn, void *cb_arg)
 {
 	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
 
@@ -4114,7 +4160,63 @@ s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_arg)
 
 	assert(ctx->owner_thread == NULL || ctx->owner_thread == spdk_get_thread());
 
-	s3_flusher_drain(ctx->flusher, 0, cb_fn, cb_arg);
+	s3_flusher_drain(ctx->flusher, timeout_us, cb_fn, cb_arg);
+}
+
+void
+s3_bs_dev_suspend_flusher(struct spdk_bs_dev *bs_dev, uint64_t timeout_us,
+			  s3_bs_dev_cb cb_fn, void *cb_arg)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	if (!ctx || !ctx->flusher) {
+		if (cb_fn) {
+			cb_fn(cb_arg, 0);
+		}
+		return;
+	}
+	s3_flusher_suspend(ctx->flusher, timeout_us, cb_fn, cb_arg);
+}
+
+void
+s3_bs_dev_resume_flusher(struct spdk_bs_dev *bs_dev)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	if (ctx && ctx->flusher) {
+		if (ctx->flusher_resume_poller) {
+			spdk_poller_unregister(&ctx->flusher_resume_poller);
+		}
+		s3_flusher_resume(ctx->flusher);
+	}
+}
+
+static int
+s3_bs_dev_resume_flusher_poller(void *arg)
+{
+	struct s3_ctx *ctx = arg;
+
+	spdk_poller_unregister(&ctx->flusher_resume_poller);
+	s3_flusher_resume(ctx->flusher);
+	return SPDK_POLLER_BUSY;
+}
+
+void
+s3_bs_dev_schedule_flusher_resume(struct spdk_bs_dev *bs_dev, uint64_t delay_us)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	if (!ctx || !ctx->flusher) {
+		return;
+	}
+	if (ctx->flusher_resume_poller) {
+		spdk_poller_unregister(&ctx->flusher_resume_poller);
+	}
+	ctx->flusher_resume_poller = SPDK_POLLER_REGISTER(
+		s3_bs_dev_resume_flusher_poller, ctx, delay_us);
+	if (!ctx->flusher_resume_poller) {
+		s3_flusher_resume(ctx->flusher);
+	}
 }
 
 int
@@ -4643,12 +4745,3 @@ s3_bs_dev_get_stats(struct spdk_bs_dev *bs_dev, struct s3_bs_dev_stats *out)
 	}
 }
 
-void
-s3_bs_dev_kick_flusher(struct spdk_bs_dev *bs_dev)
-{
-	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
-
-	if (ctx && ctx->flusher) {
-		s3_flusher_kick(ctx->flusher);
-	}
-}

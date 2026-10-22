@@ -889,7 +889,7 @@ setup_env() {
 	TENCENTCLOUD_USE_CFS="${TENCENTCLOUD_USE_CFS:-false}"
 	export TF_VAR_use_tcr="$TENCENTCLOUD_USE_TCR"
 	export TF_VAR_use_cfs="$TENCENTCLOUD_USE_CFS"
-	CUBE_IMAGE_TAG="${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.7.2}"
+	CUBE_IMAGE_TAG="${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.7.3}"
 	export TF_VAR_image_tag="$CUBE_IMAGE_TAG"
 	export TF_VAR_image_registry="${TENCENTCLOUD_IMAGE_REGISTRY:-cube-sandbox-cn.tencentcloudcr.com}"
 	export TF_VAR_image_namespace="${TENCENTCLOUD_IMAGE_NAMESPACE:-cube-sandbox}"
@@ -1588,7 +1588,7 @@ build_and_push_images() {
 	reg=$(terraform output -raw tcr_registry_name 2>/dev/null || echo "")
 	ns=$(terraform output -raw tcr_namespace 2>/dev/null || echo "")
 	user=$(terraform output -raw tcr_token_user 2>/dev/null || echo "")
-	tag="${CUBE_IMAGE_TAG:-v0.7.2}"
+	tag="${CUBE_IMAGE_TAG:-v0.7.3}"
 
 	if [ -z "$js_pub_ip" ] || [ -z "$reg" ] || [ -z "$ns" ]; then
 		echo -e "  ${RED}✗ Missing jumpserver / TCR info; cannot build images${NC}"
@@ -1699,7 +1699,7 @@ tcr_build_and_push() {
 	# The image tag was already resolved earlier (env / saved selection /
 	# prompt_deployment_env / default), so don't ask again — just remind which tag
 	# will be built & pushed.
-	echo -e "  ${GREEN}✓ Image tag to build & push: ${CUBE_IMAGE_TAG:-v0.7.2}${NC}"
+	echo -e "  ${GREEN}✓ Image tag to build & push: ${CUBE_IMAGE_TAG:-v0.7.3}${NC}"
 	echo ""
 
 	# Pre-pull the base images the build needs from the in-VPC TCR mirror first
@@ -1952,7 +1952,7 @@ prompt_deployment_env() {
 	select_env TENCENTCLOUD_CUBE_DB "Cube database name" "cube_mvp"
 	select_env TENCENTCLOUD_CUBE_USER "Cube database user" "cube"
 	select_env_secret TENCENTCLOUD_CUBE_PASSWORD "Cube database password" "cube_pass"
-	select_env TENCENTCLOUD_CUBE_IMAGE_TAG "Cube component image tag" "v0.7.2" "dev"
+	select_env TENCENTCLOUD_CUBE_IMAGE_TAG "Cube component image tag" "v0.7.3" "dev"
 
 	# Ask whether to print verbose terraform logs (defaults to off). Runs before
 	# setup_env so the resolved value feeds VERBOSE. An explicit
@@ -3490,7 +3490,7 @@ step6_replace_kernel() {
 	local key_file js_public_ip
 	key_file="${TENCENTCLOUD_SSH_PRIVATE_KEY_PATH:-$SSH_PRI_KEY}"
 	js_public_ip=$(terraform output -raw jumpserver_public_ip 2>/dev/null || echo "")
-	local pvm_kernel_url="${TENCENTCLOUD_PVM_KERNEL_RPM_URL:-https://mirrors.opencloudos.tech/opencloudos/9.6/extras/x86_64/os/Packages/kernel-core-6.6.69-1.2.cubesandbox.oc9.x86_64.rpm}"
+	local pvm_kernel_url="${TENCENTCLOUD_PVM_KERNEL_RPM_URL:-https://mirrors.opencloudos.tech/opencloudos/9.6/extras/x86_64/os/Packages/kernel-core-6.6.117-45.16.cubesandbox.oc9.x86_64.rpm}"
 	local rpm_name
 	rpm_name=$(basename "$pvm_kernel_url")
 	local rpm_file="/tmp/${rpm_name}"
@@ -4385,7 +4385,7 @@ TENCENTCLOUD_CUBE_DB='${TENCENTCLOUD_CUBE_DB:-cube_mvp}'
 TENCENTCLOUD_CUBE_USER='${TENCENTCLOUD_CUBE_USER:-cube}'
 TENCENTCLOUD_CUBE_PASSWORD='${TENCENTCLOUD_CUBE_PASSWORD:-}'
 TENCENTCLOUD_CUBELET_NODE_STATUS_UPDATE_FREQUENCY='${CUBELET_NODE_STATUS_UPDATE_FREQUENCY:-${TENCENTCLOUD_CUBELET_NODE_STATUS_UPDATE_FREQUENCY:-1s}}'
-TENCENTCLOUD_CUBE_IMAGE_TAG='${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.7.2}'
+TENCENTCLOUD_CUBE_IMAGE_TAG='${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.7.3}'
 TENCENTCLOUD_IMAGE_REGISTRY='${TF_VAR_image_registry:-${TENCENTCLOUD_IMAGE_REGISTRY:-cube-sandbox-cn.tencentcloudcr.com}}'
 TENCENTCLOUD_IMAGE_NAMESPACE='${TF_VAR_image_namespace:-${TENCENTCLOUD_IMAGE_NAMESPACE:-cube-sandbox}}'
 TENCENTCLOUD_CUBEMASTER_IMAGE='${TF_VAR_cubemaster_image:-${TENCENTCLOUD_CUBEMASTER_IMAGE:-}}'
@@ -4608,7 +4608,7 @@ write_resolved_tfvars_file() {
 		--argjson enable_public_network "$(_bool_json "${TF_VAR_enable_public_network:-${TENCENTCLOUD_ENABLE_PUBLIC_NETWORK:-false}}")" \
 		--argjson use_tcr "$(_bool_json "${TF_VAR_use_tcr:-${TENCENTCLOUD_USE_TCR:-false}}")" \
 		--argjson use_cfs "$(_bool_json "${TF_VAR_use_cfs:-${TENCENTCLOUD_USE_CFS:-false}}")" \
-		--arg image_tag "${TF_VAR_image_tag:-${CUBE_IMAGE_TAG:-${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.7.2}}}" \
+		--arg image_tag "${TF_VAR_image_tag:-${CUBE_IMAGE_TAG:-${TENCENTCLOUD_CUBE_IMAGE_TAG:-v0.7.3}}}" \
 		--arg image_registry "${TF_VAR_image_registry:-${TENCENTCLOUD_IMAGE_REGISTRY:-cube-sandbox-cn.tencentcloudcr.com}}" \
 		--arg image_namespace "${TF_VAR_image_namespace:-${TENCENTCLOUD_IMAGE_NAMESPACE:-cube-sandbox}}" \
 		--arg cubemaster_image "${TF_VAR_cubemaster_image:-${TENCENTCLOUD_CUBEMASTER_IMAGE:-}}" \

@@ -15,7 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 WORKTREE_ROOT="${REPO_ROOT}"
 
-VERSION="${VERSION:-v0.7.2}"
+VERSION="${VERSION:-v0.7.3}"
 IMAGE_TAG="${IMAGE_TAG:-${VERSION}}"
 REGISTRY="${REGISTRY:-cube-sandbox-int.tencentcloudcr.com/cube-sandbox}"
 # SOURCE_REF pins the CubeMaster / CubeAPI / CubeOps / pkgs/cubedb / CubeProxy /
@@ -54,8 +54,8 @@ ONE_CLICK_ARCH="${ONE_CLICK_ARCH:-amd64}"
 # Explicit ONE_CLICK_URL / PVM_KERNEL_*_URL overrides still win.
 MIRROR="${MIRROR:-}"
 ONE_CLICK_ARTIFACT="${ONE_CLICK_ARTIFACT:-cube-sandbox-one-click-${VERSION}-${ONE_CLICK_ARCH}.tar.gz}"
-PVM_KERNEL_RPM_ARTIFACT="${PVM_KERNEL_RPM_ARTIFACT:-kernel-6.6.69_opencloudos9.cubesandbox.pvm.host_gb85200d80fa2-1.x86_64.rpm}"
-PVM_KERNEL_DEB_ARTIFACT="${PVM_KERNEL_DEB_ARTIFACT:-linux-image-6.6.69-opencloudos9.cubesandbox.pvm.host-gb85200d80fa2_6.6.69-gb85200d80fa2-1_amd64.deb}"
+PVM_KERNEL_RPM_ARTIFACT="${PVM_KERNEL_RPM_ARTIFACT:-kernel-6.6.117_opencloudos9.cubesandbox.pvm.host_gbc75224fca7e-1.x86_64.rpm}"
+PVM_KERNEL_DEB_ARTIFACT="${PVM_KERNEL_DEB_ARTIFACT:-linux-image-6.6.117-opencloudos9.cubesandbox.pvm.host-gbc75224fca7e_6.6.117-gbc75224fca7e-1_amd64.deb}"
 case "${MIRROR}" in
   cn|CN|cnb|CNB)
     RELEASE_DOWNLOAD_BASE="https://cnb.cool/CubeSandbox/CubeSandbox/-/releases/download/${VERSION}"
@@ -258,9 +258,9 @@ Examples:
   SOURCE_REF="" IMAGE_TAG=dev $0 cube-shim
   CUBE_KERNEL_VMLINUX=/path/vmlinux CUBE_KERNEL_PVM_VMLINUX=/path/vmlinux-pvm \\
     IMAGE_TAG=dev $0 cube-kernel
-  IMAGE_TAG=v0.7.2 $0 cube-kernel
+  IMAGE_TAG=v0.7.3 $0 cube-kernel
   CUBE_GUEST_IMAGE_DIR=/path/to/cube-image IMAGE_TAG=dev $0 cube-guest
-  IMAGE_TAG=v0.7.2 $0 cube-guest
+  IMAGE_TAG=v0.7.3 $0 cube-guest
   SOURCE_REF="" IMAGE_TAG=dev $0 cube-api
   SOURCE_REF="" IMAGE_TAG=dev $0 cube-ops
 

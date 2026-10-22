@@ -216,6 +216,11 @@ uint32_t s3_overlay_apply(struct s3_overlay *ov, uint64_t lba, uint32_t nblocks,
  */
 bool s3_overlay_covers(struct s3_overlay *ov, uint64_t lba, uint32_t nblocks);
 
+/* How many blocks of the range are present. Feeds the overlay_covered field of
+ * the chunk-I/O failure log in s3_chunk_io_finish(); not used to decide reads. */
+uint32_t s3_overlay_covered_count(struct s3_overlay *ov, uint64_t lba,
+				  uint32_t nblocks);
+
 /**
  * True when this chunk has a published overlay entry (dirty blocks, or a flush
  * still holding the struct). Safe on any thread: it is an acquire load of the

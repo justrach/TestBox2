@@ -960,6 +960,7 @@ int from_cube(struct __sk_buff *skb)
 	struct nat_session *sess;
 	struct session_key pmkey = {};
 	struct mvm_meta *mvm_meta;
+	__be32 vm_ip;
 	struct ethhdr *l2;
 	struct iphdr *l3;
 	struct tcphdr *l4;
@@ -984,6 +985,9 @@ int from_cube(struct __sk_buff *skb)
 	mvm_meta = bpf_map_lookup_elem(&ifindex_to_mvmmeta, &ifindex);
 	if (!mvm_meta)
 		return TC_ACT_SHOT;
+	/* Spill the sandbox address before later map lookups invalidate mvm_meta.
+	 * Port-mapping session keys use this address, not the shared inner IP. */
+	vm_ip = mvm_meta->ip;
 
 	ret = pull_headers(skb, &l2, &l3);
 	if (ret != TC_ACT_OK)
@@ -1039,12 +1043,25 @@ int from_cube(struct __sk_buff *skb)
 			 * mvm_meta->version is stale (the sandbox was rolled back); reset
 			 * the guest side so the application unblocks. A miss forwards
 			 * statelessly (today's behaviour). port_mapping sessions have no
-			 * ingress entry. */
-			port_mapping_key(&pmkey, l3->daddr, l4->dest, l4->source);
+			 * ingress entry. The key uses the sandbox-assigned address: the
+			 * shared mvm_inner_ip cannot tell two sandboxes apart. */
+			port_mapping_key(&pmkey, vm_ip, l3->daddr, l4->dest, l4->source);
 			sess = bpf_map_lookup_elem(&egress_sessions, &pmkey);
 			if (sess && session_is_stale(sess)) {
 				bpf_map_delete_elem(&egress_sessions, &pmkey);
 				return tcp_send_reset(skb, skb->ingress_ifindex, mvm_inner_ip);
+			}
+
+			if (sess) {
+				/* Port mapping conntrack orientation: the guest VM server is
+				 * IP_CT_DIR_REPLY, while the outside client is IP_CT_DIR_ORIGINAL. */
+				bool syn = l4->syn;
+				bool ack = l4->ack;
+				bool fin = l4->fin;
+				bool rst = l4->rst;
+				__u64 now = bpf_ktime_get_ns();
+
+				update_session(IP_CT_DIR_REPLY, sess, now, syn, ack, fin, rst);
 			}
 
 			err = snat_tcp(skb, ifindex, l2, l3, l4, l4->source, *host_port);

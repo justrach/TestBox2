@@ -157,8 +157,49 @@ void s3lvol_lvstore_destroy(struct s3lvol_lvstore *lvs,
 void s3lvol_lvstore_checkpoint(struct s3lvol_lvstore *lvs,
 			       spdk_lvs_op_complete cb_fn, void *cb_arg);
 
-void s3lvol_lvstore_flush(struct s3lvol_lvstore *lvs,
+void s3lvol_lvstore_flush(struct s3lvol_lvstore *lvs, uint64_t timeout_us,
 			  spdk_lvs_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Quiesce exported I/O for every loaded lvstore.
+ *
+ * Pause every RCOW NVMf subsystem and hold the flushers. Blobstore is left
+ * dirty on purpose: a live clean-sync can persist a used-blob mask that a later
+ * clean load cannot open, and the replacement then comes up short a volume.
+ * The next attach recovers from the dirty super. On success the subsystems
+ * stay paused; the caller must terminate the process immediately. On failure
+ * they are resumed first.
+ *
+ * \param suspend_timeout_us Budget for holding each flusher; 0 takes the
+ *                           flusher's default. A hold that times out fails the
+ *                           prepare and unwinds it, rather than leaving every
+ *                           namespace paused with nothing able to undo it.
+ */
+void s3lvol_prepare_hot_upgrade(spdk_lvs_op_complete cb_fn, void *cb_arg,
+				uint64_t suspend_timeout_us);
+
+/**
+ * Resume background upload on every loaded lvstore.
+ *
+ * rcow_start calls this after active namespaces and listeners are restored;
+ * attach also keeps a short fallback timer for callers that do not use the
+ * startup script.
+ */
+void s3lvol_resume_flushers(void);
+
+/**
+ * Undo a hot prepare that will not be followed by the kill: resume every RCOW
+ * subsystem and release the flushers. Clears the sticky "prepare succeeded"
+ * flag so a later prepare can run again.
+ *
+ * This is the only way back for the two windows between a successful prepare
+ * and the SIGKILL (an unreadable target binary, or a kill that does not land),
+ * where the target would otherwise keep running with a frozen data plane.
+ *
+ * \return 0 on success, -EBUSY while a prepare is still in flight (the call was
+ *         a no-op, so the caller must not report the node as released).
+ */
+int s3lvol_resume_subsystems(void);
 
 /**
  * Snapshot the write-path counters (WAL, overlay, flusher).
@@ -244,11 +285,6 @@ int rcow_namespace_add(const char *name, const struct s3_target *target);
  */
 const struct s3_target *rcow_namespace_to_target(const char *name);
 
-typedef void (*rcow_ns_iter_fn)(const char *name, const struct s3_target *target,
-				void *ctx);
-
-void rcow_namespace_for_each(rcow_ns_iter_fn fn, void *ctx);
-
 /* ==========================================================================
  * State files
  *
@@ -313,12 +349,24 @@ const char *s3lvol_statefile_path(const char *env_name, const char *fallback);
  * \param status 0, or a negative errno
  */
 typedef void (*s3lvol_nvmf_op_cb)(void *cb_arg, uint32_t nsid, int status);
+typedef void (*s3lvol_nvmf_state_cb)(void *cb_arg, int status);
 
 /** Build the NQN of subsystem \c index. */
 void s3lvol_nvmf_subsys_nqn(uint32_t index, char *out, size_t out_len);
 
 /** True when that subsystem has been created on the target. */
 bool s3lvol_nvmf_subsys_exists(uint32_t index);
+
+/**
+ * Pause every RCOW subsystem and quiesce all of its namespaces.
+ *
+ * Successful subsystems remain paused. If any pause fails, subsystems already
+ * paused by this call are resumed before the error is reported.
+ */
+int s3lvol_nvmf_pause_all(s3lvol_nvmf_state_cb cb_fn, void *cb_arg);
+
+/** Resume every RCOW subsystem previously paused for a hot upgrade. */
+int s3lvol_nvmf_resume_all(s3lvol_nvmf_state_cb cb_fn, void *cb_arg);
 
 /**
  * Expose \c bdev_name as namespace \c nsid of \c nqn.
@@ -1039,17 +1087,19 @@ struct s3lvol_import_opts {
  *    directly by blobstore.
  *
  * 2. Anything else -- another node's export, another bucket, or a snapshot that
- *    is gone or has been replaced -- is an esnap clone that reads through to the
- *    export. Metadata only: nothing is transferred, the clone reads through for
- *    what it has not written and copies on first write, which is what makes
- *    resuming a volume on another node a matter of one manifest fetch.
+ *    is gone or has been replaced -- is an esnap clone of that export. Each
+ *    import is its own clone. Metadata only: nothing is transferred before the
+ *    import answers. `opts->decouple` copies that clone's clusters out of the
+ *    export; a later import of the same export does the same for itself.
  *
  * In case 2 the manifest is recorded in this lvstore's own registry in S3
  * *before* the clone exists, because the reverse order can leave a clone that no
- * later attach can open. Case 1 writes no registry entry at all.
+ * later attach can open. One entry per (lvstore, export uuid) covers every
+ * clone of that export. Case 1 writes no registry entry at all.
  *
- * `opts->decouple` applies to case 2 only. In case 1 there is no export to
- * decouple from, and it is logged and ignored rather than failed.
+ * `opts->decouple` applies to case 2 only and targets the clone just created.
+ * In case 1 there is no export to decouple from, and it is logged and ignored
+ * rather than failed.
  *
  * The rcow_import_lvol RPC reports which happened in a `mode` field
  * ("local_clone" or "esnap"), read back off the resulting blob. A caller tracking
@@ -1120,6 +1170,22 @@ int s3lvol_lvol_decouple(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
  * states retain raw lvol/lvstore pointers, so the lvstore must not be unloaded
  * until they have left their respective lists. */
 bool s3lvol_lvstore_decouple_pending(const struct s3lvol_lvstore *lvs);
+bool s3lvol_lvstore_derive_inflight(const struct s3lvol_lvstore *lvs);
+
+/* An esnap clone of an import has been submitted and its bdev is not registered
+ * yet. Paired around spdk_lvol_create_esnap_clone(), whose non-zero return does
+ * not run the callback. The decouple quiesce set waits on the same condition
+ * as a snapshot or clone. */
+void s3lvol_lvstore_import_clone_begin(struct s3lvol_lvstore *lvs);
+void s3lvol_lvstore_import_clone_end(struct s3lvol_lvstore *lvs);
+bool s3lvol_lvstore_import_clone_inflight(const struct s3lvol_lvstore *lvs);
+
+/* True while a decouple of the export `lvol` reads has finished copying and is
+ * detaching the external parent. derive_check() refuses a snapshot or clone
+ * for that interval, a new import of that export is refused, and delete of a
+ * volume that still reads it is refused too, so the family quiesce set cannot
+ * grow or lose a member after it is closed. */
+bool s3lvol_lvol_import_finalizing(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol);
 
 /* Drop a volume from the decouple queue because it is being deleted.
  *
@@ -1382,6 +1448,9 @@ struct s3lvol_import *s3lvol_import_first(struct s3lvol_lvstore *lvs);
 struct s3lvol_import *s3lvol_import_next(struct s3lvol_import *prev);
 const struct s3_export_manifest *s3lvol_import_get_manifest(
 	const struct s3lvol_import *imp);
+bool s3lvol_lvol_reads_import(struct spdk_lvol *lvol);
+int s3lvol_lvol_import_uuid(struct spdk_lvol *lvol, char *uuid_out,
+			    size_t uuid_out_len);
 
 /**
  * Select host readahead for an lvol which may ultimately read from an import.

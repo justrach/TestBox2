@@ -54,11 +54,29 @@ struct s3_flusher {
 
 	struct spdk_poller *poller;
 
-	/* Set by destroy/drain so no new upload is started. */
+	/* Set only by destroy so no new upload is started. */
 	bool                        stopping;
+
+	/* Reversible scheduling gate used by attach and hot prepare. */
+	bool                        suspended;
+	bool                        resume_pending;
 
 	s3_flusher_cb drain_cb;
 	void *drain_arg;
+	s3_flusher_cb suspend_cb;
+	void *suspend_arg;
+
+	/* Tick at which a suspend gives up waiting for uploads, or 0 for "no
+	 * deadline". A hot prepare sets one so a single slow upload cannot hold the
+	 * whole stop open; attach leaves it 0 because its own resume fallback
+	 * already bounds the hold, and failing an attach on a slow upload would be
+	 * worse than waiting. */
+	uint64_t suspend_deadline;
+
+	/* The suspend passed suspend_deadline with uploads still in flight: the
+	 * hold is abandoned and the callback reports -ETIMEDOUT. Cleared with the
+	 * suspend itself. */
+	bool                        suspend_expired;
 
 	/* Tick at which a drain gives up on dirty data. */
 	uint64_t drain_deadline;
@@ -88,6 +106,7 @@ struct flush_req {
 };
 
 static void flusher_check_drain(struct s3_flusher *f);
+static void flusher_check_suspend(struct s3_flusher *f);
 
 /* ==========================================================================
  * WAL truncation
@@ -117,6 +136,7 @@ flusher_super_synced(void *cb_arg, int status)
 	 * every upload completion also re-check, but there is no reason to wait for
 	 * the next one when the very state the drain was waiting on just changed. */
 	flusher_check_drain(f);
+	flusher_check_suspend(f);
 }
 
 /* Report progress to the WAL so it can release segments.
@@ -146,9 +166,18 @@ flusher_advance_wal(struct s3_flusher *f)
 	if (safe_seq <= f->truncated_seq) {
 		return;
 	}
-	f->truncated_seq = safe_seq;
 
-	s3_wal_truncate_to_seq(f->wal, safe_seq);
+	/* Only memo the request once the truncation has actually released
+	 * something. s3_wal_truncate_to_seq() declines while a replay is in flight,
+	 * and it is called on every flusher tick during one -- memoising the
+	 * argument instead would mark this safe_seq done without releasing a byte,
+	 * and the next tick, computing the same value, would return above and never
+	 * ask again. The segments would stay pinned until some later write moved
+	 * safe_seq past them. */
+	if (!s3_wal_truncate_to_seq(f->wal, safe_seq)) {
+		return;
+	}
+	f->truncated_seq = safe_seq;
 
 	/* Persisting matters: the WAL may now reuse those segments, and replay
 	 * starts from the position recorded in the super. If that position still
@@ -197,6 +226,7 @@ flusher_upload_done(void *cb_arg, int status)
 	}
 
 	s3_flusher_kick(f);
+	flusher_check_suspend(f);
 }
 
 static void
@@ -250,17 +280,17 @@ s3_flusher_kick(struct s3_flusher *f)
 	 * default hold-back age (45s), so honouring the policy here would make
 	 * every unload, checkpoint and export time out instead of flushing.
 	 *
-	 * A backpressured WAL, because the log is only truncated once the data has
-	 * reached S3 (flusher_advance_wal below). Holding a chunk back therefore
-	 * holds on to log space, and the WAL refusing writes is a worse outcome
-	 * than an early upload. In the shipped configuration the overlay's own
-	 * high water mark is reached long first -- 4 GiB of RAM against 32 GiB of
-	 * log -- so this is the guard for a configuration where it is not. */
-	force = (f->drain_cb != NULL) || s3_wal_is_backpressured(f->wal);
+	 * A WAL that is already half full, because the log is only truncated once
+	 * the data has reached S3 (flusher_advance_wal below). Holding a chunk
+	 * back therefore holds on to log space. Waiting for true backpressure
+	 * (85%) is too late on a small WAL: 4K random never fills a chunk, the
+	 * overlay's 45 s age has not expired, and writes hit the cliff with the
+	 * flusher still idle. Half full is still a buffer, not a refusal. */
+	force = (f->drain_cb != NULL) || s3_wal_should_force_flush(f->wal);
 
 	/* An expired drain starts no further round either: refilling would push the
 	 * moment it can report as far away as the writes keep coming. */
-	while (!f->stopping && !f->drain_expired &&
+	while (!f->stopping && !f->suspended && !f->drain_expired &&
 	       f->in_flight < f->max_concurrent) {
 		uint64_t chunk_index;
 
@@ -282,13 +312,15 @@ flusher_poll(void *arg)
 
 	if (f->in_flight == 0 && !s3_overlay_has_dirty(f->overlay)) {
 		flusher_check_drain(f);
+		flusher_check_suspend(f);
 		return SPDK_POLLER_IDLE;
 	}
 
-	/* A drain blocked on an unreachable S3 only makes progress through its
-	 * deadline, so it has to be re-checked on every tick, not just when an
-	 * upload completes. */
+	/* A drain or a suspend blocked on an unreachable S3 only makes progress
+	 * through its deadline, so both have to be re-checked on every tick, not
+	 * just when an upload completes. */
 	flusher_check_drain(f);
+	flusher_check_suspend(f);
 
 	s3_flusher_kick(f);
 	return SPDK_POLLER_BUSY;
@@ -369,7 +401,7 @@ s3_flusher_drain(struct s3_flusher *f, uint64_t timeout_us,
 		}
 		return;
 	}
-	if (f->drain_cb) {
+	if (f->drain_cb || f->stopping) {
 		/* One drain at a time. A second caller is told -EBUSY rather than
 		 * queued: the drain already running is the one it wanted, so waiting
 		 * for it and asking again gets the same answer as a waiter list
@@ -379,6 +411,31 @@ s3_flusher_drain(struct s3_flusher *f, uint64_t timeout_us,
 			cb_fn(cb_arg, -EBUSY);
 		}
 		return;
+	}
+	/* A drain supersedes an established scheduling hold: it explicitly asks
+	 * for dirty data to be uploaded and has its own completion boundary. */
+	f->suspended = false;
+
+	/* And a *pending* suspend, symmetrically. A suspend whose callback has not
+	 * fired means uploads are in flight -- flusher_check_suspend() clears
+	 * suspend_cb the moment in_flight reaches zero -- which is the one state
+	 * s3_flusher_destroy() cannot proceed in: it asserts in_flight == 0 and,
+	 * with asserts off, leaks the flusher and frees the bs_dev under live
+	 * uploads. Refusing here instead (the old -EBUSY) left the drain to be
+	 * retried while the caller's destroy gave up, so a stop/unload landing in
+	 * the one-round-trip window between s3_flusher_suspend() and its callback
+	 * could tear the bs_dev down underneath it. Cancelling the suspend lets the
+	 * drain provide the in_flight == 0 boundary the caller actually needs. The
+	 * hold never took effect, so the caller is told rather than left to assume
+	 * it did. */
+	if (f->suspend_cb) {
+		s3_flusher_cb suspend_cb = f->suspend_cb;
+		void *suspend_arg = f->suspend_arg;
+
+		f->suspend_cb = NULL;
+		f->suspend_arg = NULL;
+		f->resume_pending = false;
+		suspend_cb(suspend_arg, -ECANCELED);
 	}
 
 	if (timeout_us == 0) {
@@ -392,6 +449,122 @@ s3_flusher_drain(struct s3_flusher *f, uint64_t timeout_us,
 	f->drain_expired = false;
 
 	/* Push everything through rather than waiting for the poller tick. */
+	s3_flusher_kick(f);
+}
+
+static void
+flusher_check_suspend(struct s3_flusher *f)
+{
+	s3_flusher_cb cb_fn;
+	void *cb_arg;
+	bool resume;
+	int status = 0;
+
+	if (!f->suspend_cb) {
+		return;
+	}
+
+	/* The deadline is read before the gates below, for the same reason
+	 * flusher_check_drain() reads its own there: the gates wait on uploads, and
+	 * a workload that keeps writing never lets them idle, so a suspend that only
+	 * looked at the clock once idle would never look at it at all. */
+	if (!f->suspend_expired && f->suspend_deadline != 0 &&
+	    spdk_get_ticks() >= f->suspend_deadline) {
+		f->suspend_expired = true;
+		SPDK_WARNLOG("Flusher suspend timed out with uploads still in "
+			     "flight; the hold is abandoned. The data is durable in "
+			     "the log and is replayed on the next attach\n");
+	}
+
+	/* Uploads already running are always waited for: their completions touch
+	 * the flusher, so cutting them loose would be a use-after-free. An expired
+	 * suspend does not change that -- -ETIMEDOUT is reported once the last one
+	 * lands, exactly as a drain reports. */
+	if (f->in_flight != 0) {
+		return;
+	}
+
+	/* A super-sync is waited for even past the deadline, for the same lifetime
+	 * reason as the uploads above: its completion writes into the flusher and
+	 * would race a later s3_wal_close()'s own super-sync for the shared buffer.
+	 * It is one slot and cannot be extended, so it cannot hold the suspend open
+	 * the way a stream of uploads can. */
+	if (f->super_sync_active) {
+		return;
+	}
+
+	status = f->suspend_expired ? -ETIMEDOUT : 0;
+
+	cb_fn = f->suspend_cb;
+	cb_arg = f->suspend_arg;
+	f->suspend_cb = NULL;
+	f->suspend_arg = NULL;
+	f->suspend_expired = false;
+	resume = f->resume_pending;
+	f->resume_pending = false;
+
+	if (resume && status == 0) {
+		/* The hold completed, but a resume arrived while it was still pending,
+		 * so it is released again here. Report that instead of success: the
+		 * contract is "status 0 means uploads are held", and they are not.
+		 * Same reason and same code as a drain cancelling a pending suspend.
+		 * An expiry keeps -ETIMEDOUT, which says more about why there is no
+		 * hold. */
+		status = -ECANCELED;
+	}
+
+	/* Only a hold that completed with nobody releasing it leaves uploads
+	 * gated. Every other outcome -- expired, cancelled, or released by an
+	 * earlier resume -- means the caller must not treat them as held. */
+	f->suspended = (status == 0);
+	cb_fn(cb_arg, status);
+	if (!f->suspended) {
+		s3_flusher_kick(f);
+	}
+}
+
+void
+s3_flusher_suspend(struct s3_flusher *f, uint64_t timeout_us,
+		   s3_flusher_cb cb_fn, void *cb_arg)
+{
+	if (!f || !cb_fn) {
+		if (cb_fn) {
+			cb_fn(cb_arg, -EINVAL);
+		}
+		return;
+	}
+	if (f->drain_cb || f->suspend_cb || f->suspended || f->stopping) {
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+
+	if (timeout_us == 0) {
+		timeout_us = S3_FLUSHER_SUSPEND_TIMEOUT_US;
+	}
+
+	/* Stop scheduling before waiting: existing uploads and their final WAL
+	 * super update may complete, but no new upload can enter the gap. */
+	f->suspended = true;
+	f->suspend_cb = cb_fn;
+	f->suspend_arg = cb_arg;
+	f->suspend_expired = false;
+	f->suspend_deadline = timeout_us == S3_FLUSHER_NO_SUSPEND_TIMEOUT ?
+			      0 : spdk_get_ticks() +
+			      (timeout_us * spdk_get_ticks_hz()) / 1000000;
+	flusher_check_suspend(f);
+}
+
+void
+s3_flusher_resume(struct s3_flusher *f)
+{
+	if (!f || !f->suspended || f->stopping) {
+		return;
+	}
+	if (f->suspend_cb) {
+		f->resume_pending = true;
+		return;
+	}
+	f->suspended = false;
 	s3_flusher_kick(f);
 }
 

@@ -117,6 +117,14 @@
 #define S3_WAL_BACKPRESSURE_ON_PCT  85
 #define S3_WAL_BACKPRESSURE_OFF_PCT 65
 
+/* Occupancy at which the flusher ignores overlay hold-back and starts draining.
+ *
+ * Backpressure (85%) is too late for a small WAL: 4K random never fills a 1 MiB
+ * chunk, overlay holds for 45 s, and a 512 MiB log hits 85% first. Forcing at
+ * half full keeps the log a buffer instead of a cliff, without changing when
+ * writes are actually refused. */
+#define S3_WAL_FLUSH_FORCE_PCT 50
+
 enum s3_wal_entry_type {
 	S3_WAL_WRITE        = 0,
 	S3_WAL_WRITE_ZEROES = 1,
@@ -264,15 +272,6 @@ void s3_wal_append_unmap(struct s3_wal *wal, uint64_t lba, uint32_t nblocks,
 			 s3_wal_cb cb_fn, void *cb_arg);
 
 /**
- * Append a checkpoint barrier and report the seq it was given.
- *
- * Recovery uses the barrier to pin down "everything before this was already
- * checkpointed", which makes the replay window precise instead of conservative.
- */
-void s3_wal_append_barrier(struct s3_wal *wal, uint64_t *out_seq,
-			   s3_wal_cb cb_fn, void *cb_arg);
-
-/**
  * Replay from the last checkpoint position.
  *
  * \c apply_fn is called once per accepted entry, in seq order, synchronously.
@@ -302,8 +301,13 @@ void s3_wal_replay(struct s3_wal *wal, s3_wal_replay_cb apply_fn, void *apply_ar
  * *The caller must persist the super before relying on the space being reusable
  * across a crash*, otherwise recovery would still scan from the old position,
  * which by then holds bytes from a later lap.
+ *
+ * \return true if any segment was actually released. It is false while a WAL
+ *         replay is in flight, and false when nothing was eligible -- so a
+ *         caller that memos the truncation it asked for must key off this, not
+ *         off \c safe_seq, or it will skip the retry that would have done it.
  */
-void s3_wal_truncate_to_seq(struct s3_wal *wal, uint64_t safe_seq);
+bool s3_wal_truncate_to_seq(struct s3_wal *wal, uint64_t safe_seq);
 
 /**
  * Persist the current ring positions into the super (alternating A/B slots).
@@ -314,12 +318,11 @@ void s3_wal_truncate_to_seq(struct s3_wal *wal, uint64_t safe_seq);
 void s3_wal_sync_super(struct s3_wal *wal, uint64_t ckpt_seq,
 		       s3_wal_cb cb_fn, void *cb_arg);
 
-/* Backpressure is on: callers should stop submitting and retry later (W5). */
-bool s3_wal_is_backpressured(const struct s3_wal *wal);
+/* The log is at least S3_WAL_FLUSH_FORCE_PCT full. The flusher should ignore
+ * overlay hold-back so occupancy falls before writes have to be refused. */
+bool s3_wal_should_force_flush(const struct s3_wal *wal);
 
-uint64_t s3_wal_get_used_bytes(const struct s3_wal *wal);
 uint64_t s3_wal_get_next_seq(const struct s3_wal *wal);
-uint64_t s3_wal_get_epoch(const struct s3_wal *wal);
 
 struct s3_wal_stats {
 	uint64_t appends;

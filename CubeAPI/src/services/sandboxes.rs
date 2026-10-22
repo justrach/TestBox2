@@ -35,6 +35,9 @@ const ENV_VAR_NAME_MAX_LEN: usize = 256;
 const ENV_VAR_VALUE_MAX_LEN: usize = 4096;
 const MASK_REQUEST_HOST_MAX_LEN: usize = 512;
 const MASK_REQUEST_HOST_PORT_PLACEHOLDER: &str = "${PORT}";
+const MCP_MAX_SERVERS: usize = 64;
+const MCP_SERVER_NAME_MAX_LEN: usize = 128;
+const MCP_GITHUB_PREFIX: &str = "github/";
 
 /// Environment variable names that may compromise sandbox isolation if injected
 /// at the runtime level (loader overrides, language runtime paths).
@@ -164,12 +167,16 @@ impl SandboxService {
             metadata,
             distribution_scope,
             env_vars,
+            mcp,
             volume_mounts,
             backend,
             ..
         } = body;
         if let Some(env_vars) = env_vars.as_ref() {
             validate_env_vars(env_vars)?;
+        }
+        if let Some(mcp) = mcp.as_ref() {
+            validate_mcp_config(mcp)?;
         }
         if let Some(mounts) = volume_mounts.as_ref() {
             validate_unique_volume_mount_names(mounts)?;
@@ -277,9 +284,17 @@ impl SandboxService {
             .cubemaster
             .create_sandbox(&req)
             .await
-            .map_err(params_error_or_internal)?;
+            .map_err(|e| map_create_cubemaster_err(e, &template_id))?;
 
-        resp.ret.into_result().map_err(internal_error)?;
+        // Belt-and-suspenders: parse_response already flattens every non-success
+        // ret_code into CubeMasterError::Api on the transport path above, so the
+        // envelope here is necessarily a success and into_result() is a no-op today.
+        // It is kept only so the mapping stays correct if parse_response is ever
+        // relaxed to pass a non-success envelope through; the functional 130404/409
+        // mapping lives on the transport error above.
+        resp.ret
+            .into_result()
+            .map_err(|e| map_create_cubemaster_err(e, &template_id))?;
 
         let envd_version = envd_version_from_annotations(&resp.ext_info);
         Ok(self.sandbox_response(
@@ -747,6 +762,104 @@ fn validate_env_vars(env_vars: &HashMap<String, String>) -> AppResult<()> {
     Ok(())
 }
 
+/// Validate the E2B-compatible `mcp` option: an object keyed by MCP server
+/// name whose values are per-server configuration objects. The gateway inside
+/// the sandbox owns the server catalog, so built-in server names and their
+/// properties are not checked here; only the GitHub / custom-command shape
+/// (`runCmd`, `installCmd`, `envs`) is.
+fn validate_mcp_config(mcp: &serde_json::Value) -> AppResult<()> {
+    let bad = |msg: String| Err(AppError::BadRequest(msg));
+    let servers = match mcp {
+        serde_json::Value::Null => return Ok(()),
+        serde_json::Value::Object(servers) => servers,
+        _ => return bad("mcp must be an object keyed by MCP server name".to_string()),
+    };
+    if servers.len() > MCP_MAX_SERVERS {
+        return bad(format!(
+            "mcp configures {} servers; at most {MCP_MAX_SERVERS} are allowed",
+            servers.len()
+        ));
+    }
+    let no_config = serde_json::Map::new();
+    for (name, config) in servers {
+        if name.is_empty() || name.len() > MCP_SERVER_NAME_MAX_LEN {
+            return bad(format!("invalid mcp server name length: {name:?}"));
+        }
+        if name.chars().any(char::is_control) {
+            return bad(format!(
+                "mcp server name contains control characters: {name:?}"
+            ));
+        }
+        let config = match config {
+            // The gateway treats null as {}, so it gets the same checks.
+            serde_json::Value::Null => &no_config,
+            serde_json::Value::Object(config) => config,
+            _ => {
+                return bad(format!(
+                    "mcp server {name:?} configuration must be an object"
+                ))
+            }
+        };
+        let is_github = name.starts_with(MCP_GITHUB_PREFIX);
+        if is_github {
+            let parts: Vec<&str> = name[MCP_GITHUB_PREFIX.len()..].split('/').collect();
+            let valid_part = |p: &&str| {
+                !p.is_empty()
+                    && *p != "."
+                    && *p != ".."
+                    && p.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+            };
+            if parts.len() != 2 || !parts.iter().all(valid_part) {
+                return bad(format!(
+                    "mcp server {name:?} must be named github/<owner>/<repo>"
+                ));
+            }
+        }
+        if !is_github && !config.contains_key("runCmd") {
+            continue;
+        }
+        match config.get("runCmd") {
+            Some(serde_json::Value::String(cmd)) if !cmd.trim().is_empty() => {}
+            _ => {
+                return bad(format!(
+                    "mcp server {name:?} requires a non-empty string runCmd"
+                ))
+            }
+        }
+        if let Some(install) = config.get("installCmd") {
+            if !install.is_string() {
+                return bad(format!("mcp server {name:?} installCmd must be a string"));
+            }
+        }
+        if let Some(envs) = config.get("envs") {
+            let Some(envs) = envs.as_object() else {
+                return bad(format!("mcp server {name:?} envs must be an object"));
+            };
+            for (key, value) in envs {
+                let bytes = key.as_bytes();
+                let valid_name = bytes
+                    .first()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+                    && bytes
+                        .iter()
+                        .all(|b| b.is_ascii_alphanumeric() || *b == b'_');
+                if !valid_name {
+                    return bad(format!(
+                        "mcp server {name:?} env var name must match [a-zA-Z_][a-zA-Z0-9_]*: {key:?}"
+                    ));
+                }
+                if !value.is_string() {
+                    return bad(format!(
+                        "mcp server {name:?} env var {key:?} must be a string"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Each volume (`volumeMounts[].name`) may be mounted at most once per sandbox.
 fn validate_unique_volume_mount_names(mounts: &[SandboxVolumeMount]) -> AppResult<()> {
     let mut seen = HashSet::with_capacity(mounts.len());
@@ -777,6 +890,54 @@ fn params_error_or_internal(e: CubeMasterError) -> AppError {
         AppError::BadRequest(e.to_string())
     } else {
         internal_error(e)
+    }
+}
+
+// parse_response raises CubeMasterError::Api before the create envelope is
+// visible, so business codes must be classified here rather than by the typed
+// ret.into_result() check further down (which, for the same reason, never
+// observes a non-success ret_code). create_sandbox applies this mapper on both
+// the transport error and the into_result() envelope path as belt-and-suspenders.
+// Restoring from a deleted / tombstoned snapshot returns 130404: it must surface
+// as 404 so the SDK raises TemplateNotFoundError, not a generic 500 that clients
+// would keep retrying and that would charge a client-caused not-found against the
+// server error-rate SLI. The only reachable create-time 130404 is a template /
+// snapshot lookup miss: CubeMaster maps just templatecenter.ErrTemplateNotFound to
+// 130404 (sandbox_create.go), and every other create-phase failure is downgraded to
+// 130400 or surfaces as ErrorCode_Unknown (-1) → 500. In particular an unresolvable
+// volume is a plain error that ret.FromError turns into -1, never 130404, so a
+// create 404 always names a template/snapshot.
+fn map_create_cubemaster_err(e: CubeMasterError, template_id: &str) -> AppError {
+    match e {
+        CubeMasterError::Api { ret_code, ret_msg } if ret_code == RET_CODE_NOT_FOUND => {
+            // Name the missing template/snapshot the client sent (mirroring the delete
+            // path's "sandbox {id} not found"), then append CubeMaster's reason when it
+            // relayed one. The backend reason ("failed to get template param from store:
+            // template not found") never carries the requested id, so prefixing lets an
+            // SDK-version-neutral classifier that keys off the message (the e2e e2b
+            // adapter) identify the resource, while keeping "template" in the message so
+            // the SDK substring classifier still raises TemplateNotFoundError.
+            let detail = if ret_msg.trim().is_empty() {
+                format!("template {} not found", template_id)
+            } else {
+                format!("template {} not found: {}", template_id, ret_msg)
+            };
+            AppError::NotFound(detail)
+        }
+        // A create-time 130409 is not necessarily about the template: the run phase
+        // relays Cubelet's ret_code verbatim and Cubelet also defines Conflict=130409.
+        // A non-blank ret_msg is relayed as-is; the blank fallback names the requested
+        // template/snapshot id only as the create request's subject, not as a claim
+        // that the template itself is the conflicting resource.
+        CubeMasterError::Api { ret_code, ret_msg } if ret_code == RET_CODE_CONFLICT => {
+            let detail = if ret_msg.trim().is_empty() {
+                format!("template {} conflict", template_id)
+            } else {
+                ret_msg
+            };
+            AppError::Conflict(detail)
+        }
+        other => params_error_or_internal(other),
     }
 }
 
@@ -1363,6 +1524,123 @@ mod tests {
         assert_bad_request(err, reason);
     }
 
+    // Restoring from a snapshot that was deleted/tombstoned makes CubeMaster fail
+    // getTemplateParam with 130404 ("template not found"). That must surface as a
+    // 404 so the SDK raises TemplateNotFoundError, not a generic 500 that clients
+    // would keep retrying and that would charge a client-caused not-found against
+    // the server error-rate SLI. Regression for the sdk_compat lifecycle contract
+    // test_delete_referenced_snapshot_retires_new_use_but_keeps_runtime_alive.
+    #[tokio::test]
+    async fn create_sandbox_maps_cubemaster_not_found_to_not_found() {
+        let reason = "failed to get template param from store: template not found";
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox",
+            post(move || async move { ret_envelope(130404, reason) }),
+        ))
+        .await;
+
+        let err = service
+            .create_sandbox(probe_sandbox())
+            .await
+            .expect_err("restoring a deleted snapshot must not succeed");
+        match err {
+            AppError::NotFound(ref message) => {
+                // The 404 body prefixes the requested template/snapshot id (mirroring the
+                // delete path) and appends CubeMaster's reason. The reason already carries
+                // "template not found", so the SDKs still classify it as
+                // TemplateNotFoundError.
+                assert_eq!(*message, format!("template tpl-1 not found: {reason}"));
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    // The only reachable create-time 130404 is a template/snapshot lookup miss, and
+    // CubeMaster's reason never names the id the client sent
+    // ("failed to get template param from store: template not found"). The 404 body
+    // must therefore prefix the requested id — mirroring the delete path's
+    // "sandbox {id} not found" — so an SDK-version-neutral classifier keyed off the
+    // message (the e2e e2b adapter) can identify the missing resource, while the
+    // relayed reason keeps "template" in the message for the SDK substring classifier.
+    #[tokio::test]
+    async fn create_sandbox_not_found_names_requested_resource() {
+        let reason = "failed to get template param from store: template not found";
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox",
+            post(move || async move { ret_envelope(130404, reason) }),
+        ))
+        .await;
+
+        let err = service
+            .create_sandbox(probe_sandbox())
+            .await
+            .expect_err("restoring a deleted snapshot must not succeed");
+        match err {
+            AppError::NotFound(ref message) => {
+                assert!(
+                    message.contains("tpl-1"),
+                    "the 404 body must name the requested resource, got {message:?}"
+                );
+                assert!(
+                    message.contains(reason),
+                    "the backend reason must be relayed, got {message:?}"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    // A template in a conflicting state (130409) must surface as 409, mirroring
+    // the delete/update paths, instead of a generic 500. The conflict arm returns
+    // the backend reason verbatim so the client sees why creation was refused.
+    #[tokio::test]
+    async fn create_sandbox_maps_cubemaster_conflict_to_conflict() {
+        let reason = "template is still building";
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox",
+            post(move || async move { ret_envelope(130409, reason) }),
+        ))
+        .await;
+
+        let err = service
+            .create_sandbox(probe_sandbox())
+            .await
+            .expect_err("a conflicting template must not create a sandbox");
+        match err {
+            AppError::Conflict(ref message) => assert_eq!(message, reason),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        assert_eq!(err.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    // When CubeMaster returns an empty ret_msg, both branches must fall back to a
+    // synthesized detail that still names the template, rather than an empty body.
+    #[tokio::test]
+    async fn create_sandbox_synthesizes_detail_when_cubemaster_message_is_blank() {
+        for (ret_code, expected) in [
+            (130404, "template tpl-1 not found"),
+            (130409, "template tpl-1 conflict"),
+        ] {
+            let service = spawn_fake_cubemaster(Router::new().route(
+                "/cube/sandbox",
+                post(move || async move { ret_envelope(ret_code, "   ") }),
+            ))
+            .await;
+
+            let err = service
+                .create_sandbox(probe_sandbox())
+                .await
+                .expect_err("a rejected create must not succeed");
+            let message = match err {
+                AppError::NotFound(m) | AppError::Conflict(m) => m,
+                other => panic!("ret_code {ret_code} expected NotFound/Conflict, got {other:?}"),
+            };
+            assert_eq!(message, expected, "ret_code {ret_code} fallback detail");
+        }
+    }
+
     #[tokio::test]
     async fn set_timeout_maps_cubemaster_params_error_to_bad_request() {
         let reason = "timeout must be positive";
@@ -1416,6 +1694,102 @@ mod tests {
             .refresh("sbx-1", 1 << 30)
             .await
             .expect_err("rejected refresh should not succeed");
+        assert_bad_request(err, reason);
+    }
+
+    #[tokio::test]
+    async fn list_sandboxes_maps_cubemaster_params_error_to_bad_request() {
+        let reason = "limit is out of range";
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox/list",
+            post(move || async move { ret_envelope(130400, reason) }),
+        ))
+        .await;
+
+        let err = service
+            .list(None, None, i32::MAX)
+            .await
+            .expect_err("rejected list should not succeed");
+        assert_bad_request(err, reason);
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_maps_cubemaster_params_error_to_bad_request() {
+        let reason = "invalid sandbox id";
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox/info",
+            get(move || async move { ret_envelope(130400, reason) }),
+        ))
+        .await;
+
+        let err = service
+            .get_sandbox("../invalid")
+            .await
+            .expect_err("rejected detail request should not succeed");
+        assert_bad_request(err, reason);
+    }
+
+    #[tokio::test]
+    async fn kill_sandbox_maps_cubemaster_params_error_to_bad_request() {
+        let reason = "invalid delete filter";
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox",
+            delete(move || async move { ret_envelope(130400, reason) }),
+        ))
+        .await;
+
+        let err = service
+            .kill_sandbox("../invalid")
+            .await
+            .expect_err("rejected delete should not succeed");
+        assert_bad_request(err, reason);
+    }
+
+    #[tokio::test]
+    async fn get_logs_maps_cubemaster_params_error_to_bad_request() {
+        let reason = "log limit is out of range";
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox/logs",
+            post(move || async move { ret_envelope(130400, reason) }),
+        ))
+        .await;
+
+        let err = service
+            .get_logs("sbx-1", None, i32::MAX)
+            .await
+            .expect_err("rejected logs request should not succeed");
+        assert_bad_request(err, reason);
+    }
+
+    #[tokio::test]
+    async fn update_network_maps_cubemaster_params_error_to_bad_request() {
+        let reason = "network policy is invalid";
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox/network",
+            post(move || async move { ret_envelope(130400, reason) }),
+        ))
+        .await;
+
+        let err = service
+            .update_network("sbx-1", None, None)
+            .await
+            .expect_err("rejected network update should not succeed");
+        assert_bad_request(err, reason);
+    }
+
+    #[tokio::test]
+    async fn pause_sandbox_maps_cubemaster_params_error_to_bad_request() {
+        let reason = "sandbox id is invalid";
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox/update",
+            post(move || async move { ret_envelope(130400, reason) }),
+        ))
+        .await;
+
+        let err = service
+            .pause_sandbox("../invalid")
+            .await
+            .expect_err("rejected lifecycle update should not succeed");
         assert_bad_request(err, reason);
     }
 
@@ -3211,6 +3585,123 @@ mod tests {
             ("TAB_OK".to_string(), "hello\tworld".to_string()),
         ]))
         .expect("valid env var names should be accepted");
+    }
+
+    #[test]
+    fn mcp_config_accepts_e2b_shapes() {
+        for config in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"duckduckgo": {}, "arxiv": {"storagePath": "/"}, "time": null}),
+            serde_json::json!({"futureServer": {"anyOption": [1, 2, {"nested": true}]}}),
+            serde_json::json!({
+                "github/acme/weather-mcp": {
+                    "installCmd": "npm install",
+                    "runCmd": "npm run start",
+                    "envs": {"API_TOKEN": "secret", "_X": ""}
+                }
+            }),
+            serde_json::json!({"local-tools": {"runCmd": "python3 /opt/server.py"}}),
+        ] {
+            super::validate_mcp_config(&config)
+                .unwrap_or_else(|e| panic!("{config} should be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn mcp_config_rejects_invalid_shapes() {
+        let too_many: serde_json::Map<String, Value> = (0..=super::MCP_MAX_SERVERS)
+            .map(|i| (format!("s{i}"), serde_json::json!({})))
+            .collect();
+        for (config, expected) in [
+            (serde_json::json!(["duckduckgo"]), "must be an object keyed"),
+            (serde_json::json!("duckduckgo"), "must be an object keyed"),
+            (
+                serde_json::json!({"duckduckgo": true}),
+                "configuration must be an object",
+            ),
+            (serde_json::json!({"": {}}), "invalid mcp server name"),
+            (serde_json::json!({"bad\nname": {}}), "control characters"),
+            (Value::Object(too_many), "at most"),
+            (
+                serde_json::json!({"github/acme": {"runCmd": "x"}}),
+                "github/<owner>/<repo>",
+            ),
+            (
+                serde_json::json!({"github/../repo": {"runCmd": "x"}}),
+                "github/<owner>/<repo>",
+            ),
+            (
+                serde_json::json!({"github/a/b/c": {"runCmd": "x"}}),
+                "github/<owner>/<repo>",
+            ),
+            (
+                serde_json::json!({"github/acme": null}),
+                "github/<owner>/<repo>",
+            ),
+            (
+                serde_json::json!({"github/a/b": {}}),
+                "non-empty string runCmd",
+            ),
+            (
+                serde_json::json!({"github/a/b": null}),
+                "non-empty string runCmd",
+            ),
+            (
+                serde_json::json!({"github/a/b": {"runCmd": " "}}),
+                "non-empty string runCmd",
+            ),
+            (
+                serde_json::json!({"custom": {"runCmd": 1}}),
+                "non-empty string runCmd",
+            ),
+            (
+                serde_json::json!({"github/a/b": {"runCmd": "x", "installCmd": ["npm"]}}),
+                "installCmd must be a string",
+            ),
+            (
+                serde_json::json!({"github/a/b": {"runCmd": "x", "envs": ["A=1"]}}),
+                "envs must be an object",
+            ),
+            (
+                serde_json::json!({"github/a/b": {"runCmd": "x", "envs": {"A-B": "1"}}}),
+                "env var name must match",
+            ),
+            (
+                serde_json::json!({"github/a/b": {"runCmd": "x", "envs": {"A": 1}}}),
+                "must be a string",
+            ),
+        ] {
+            let err = super::validate_mcp_config(&config)
+                .expect_err(&format!("{config} should be rejected"));
+            assert!(
+                matches!(err, AppError::BadRequest(ref m) if m.contains(expected)),
+                "{config}: expected BadRequest containing {expected:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_invalid_mcp_before_calling_cubemaster() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox",
+            post(move || {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { ret_envelope(0, "ok") }
+            }),
+        ))
+        .await;
+
+        let mut body = probe_sandbox();
+        body.mcp = Some(serde_json::json!([1, 2]));
+        let err = service
+            .create_sandbox(body)
+            .await
+            .expect_err("invalid mcp should be rejected");
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

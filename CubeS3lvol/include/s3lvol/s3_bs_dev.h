@@ -52,26 +52,16 @@ typedef void (*s3_bs_dev_cb)(void *cb_arg, int status);
  *     the create-time value, or the cluster count rebuilt by spdk_bs_load
  *     conflicts with the size recorded in the super block.
  * Internally sets base.blocklen = 4096, base.blockcnt = capacity / 4096, with
- * blockcnt rounded down to cluster_size alignment.
+ * blockcnt rounded down to cluster_size alignment. The WAL and cache are
+ * attached afterwards; this call only builds the S3-backed device.
  *
- * \param wal_desc    the opened WAL bdev descriptor
- * \param cache_desc  the opened cache bdev descriptor; same as wal_desc for
- *                    the single-bdev layout
  * \param out         the resulting bs_dev, ready to pass to spdk_lvs_init /
  *                    spdk_lvs_load_ext
  */
 int s3_bs_dev_create(const struct s3_lvs_opts *opts,
-		     struct spdk_bdev_desc *wal_desc,
-		     struct spdk_bdev_desc *cache_desc,
 		     struct s3_client *client,
 		     uint64_t capacity_bytes,
 		     struct spdk_bs_dev **out);
-
-/**
- * Retrieve the internal context from a bs_dev (for flusher / checkpoint / GC
- * and other submodules).
- */
-struct s3_ctx *s3_bs_dev_get_ctx(struct spdk_bs_dev *bs_dev);
 
 /* ==========================================================================
  * WAL write path
@@ -176,6 +166,10 @@ void s3_bs_dev_set_reap_cb(struct spdk_bs_dev *bs_dev, s3_bs_dev_reap_cb cb_fn,
 int s3_bs_dev_wal_apply(struct spdk_bs_dev *bs_dev,
 			const struct s3_wal_entry_hdr *hdr, const void *payload);
 
+/** Overlay occupancy at the moment WAL replay completes (not after it has
+ *  drained), for attach diagnostics. */
+void s3_bs_dev_log_overlay(struct spdk_bs_dev *bs_dev);
+
 /**
  * Wait until everything acknowledged so far has reached S3 (INV2).
  *
@@ -183,14 +177,42 @@ int s3_bs_dev_wal_apply(struct spdk_bs_dev *bs_dev,
  * while blobstore is still up, but it is not sufficient on its own: unloading
  * writes more metadata, which destroy() then has to flush. Without a WAL this
  * completes immediately, since a finished write is already in S3.
+ *
+ * \param timeout_us 0 selects S3_FLUSHER_DRAIN_TIMEOUT_US. A caller that is
+ *                   about to pause I/O for the length of this call wants a
+ *                   shorter one: a workload that keeps writing never lets the
+ *                   overlay go clean, so the drain runs to its deadline and the
+ *                   whole of it is added to the pause.
  */
-void s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_arg);
+void s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, uint64_t timeout_us,
+		     s3_bs_dev_cb cb_fn, void *cb_arg);
 
 /**
- * Nudge the flusher. Only useful for tests and for shutdown paths that want to
- * start uploads without waiting for the next tick.
+ * Stop background uploads after current uploads have completed.
+ *
+ * \param timeout_us 0 selects S3_FLUSHER_SUSPEND_TIMEOUT_US;
+ *                   S3_FLUSHER_NO_SUSPEND_TIMEOUT waits without one. The
+ *                   callback reports 0 only when uploads are actually held;
+ *                   -ETIMEDOUT (deadline passed) and -ECANCELED (released again
+ *                   by an early resume or a drain) both mean they are not, so
+ *                   the caller must not treat either as a hold.
  */
-void s3_bs_dev_kick_flusher(struct spdk_bs_dev *bs_dev);
+void s3_bs_dev_suspend_flusher(struct spdk_bs_dev *bs_dev, uint64_t timeout_us,
+			       s3_bs_dev_cb cb_fn, void *cb_arg);
+
+/** Re-enable a flusher suspended by s3_bs_dev_suspend_flusher(). */
+void s3_bs_dev_resume_flusher(struct spdk_bs_dev *bs_dev);
+
+/**
+ * Schedule s3_flusher_resume() to run after \c delay_us, replacing any resume
+ * already scheduled.
+ *
+ * Does not care whether the flusher is suspended: attach calls it just before
+ * taking its hold, so the grace runs from when the hold is taken rather than
+ * from when it completes. Resuming directly cancels the pending grace.
+ */
+void s3_bs_dev_schedule_flusher_resume(struct spdk_bs_dev *bs_dev,
+				       uint64_t delay_us);
 
 /* ==========================================================================
  * Chunk map persistence

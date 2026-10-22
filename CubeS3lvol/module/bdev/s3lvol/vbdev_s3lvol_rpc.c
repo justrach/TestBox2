@@ -844,12 +844,11 @@ rpc_derive_lvol_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 	}
 
 	if (ctx->cancelled_decouple) {
-		/* The caller asked for this volume to be decoupled -- by default,
-		 * without naming it -- and that is not going to happen now: the
-		 * snapshot holds the external parent, so the chain keeps reading the
-		 * source export, and this node keeps renewing its lease. In the reply
-		 * so Cubelet does not have to scrape logs, and here so a post-mortem
-		 * can find the same fact. */
+		/* An import asked for this volume to be decoupled, and that is not
+		 * going to happen now: the snapshot holds the external parent, so the
+		 * chain keeps reading the source export, and this node keeps renewing
+		 * its lease. In the reply so Cubelet does not have to scrape logs, and
+		 * here so a post-mortem can find the same fact. */
 		SPDK_NOTICELOG("%s '%s' from '%s' completed; decouple of the source "
 			       "was cancelled\n", op, lvol->name, ctx->from);
 	} else {
@@ -1521,17 +1520,37 @@ SPDK_RPC_REGISTER("rcow_delete_lvstore", rpc_rcow_delete_lvstore,
  * empty, so any subsequent read has to come from S3. Without it a verify pass
  * could be satisfied entirely out of RAM and would prove nothing about the
  * objects actually written.
+ *
+ * timeout_ms is for the one caller that is not a test: rcow_upgrade.sh, which
+ * pauses I/O for as long as this call takes. A workload that keeps writing never
+ * lets the overlay go clean, so the drain runs to its deadline no matter how
+ * long that is, and every second of it is a second of paused I/O for a flush
+ * that ends in -ETIMEDOUT anyway. Omitted, the flusher's own 30 s applies.
  * ========================================================================== */
+
+struct rpc_lvstore_flush {
+	char *lvs_name;
+	uint64_t timeout_ms;
+};
+
+/* A drain deadline larger than this is refused rather than silently wrapped by
+ * the ms-to-us conversion below. One hour is far past any real drain. */
+#define RCOW_FLUSH_TIMEOUT_MS_MAX (60ULL * 60 * 1000)
+
+static const struct spdk_json_object_decoder rpc_lvstore_flush_decoders[] = {
+	{"lvs_name", offsetof(struct rpc_lvstore_flush, lvs_name), spdk_json_decode_string, false},
+	{"timeout_ms", offsetof(struct rpc_lvstore_flush, timeout_ms), spdk_json_decode_uint64, true},
+};
 
 static void
 rpc_rcow_flush_lvstore(struct spdk_jsonrpc_request *request,
 			      const struct spdk_json_val *params)
 {
-	struct rpc_lvstore_name req = {0};
+	struct rpc_lvstore_flush req = {0};
 	struct s3lvol_lvstore *lvs;
 
-	if (spdk_json_decode_object(params, rpc_lvstore_name_decoders,
-				    SPDK_COUNTOF(rpc_lvstore_name_decoders), &req)) {
+	if (spdk_json_decode_object(params, rpc_lvstore_flush_decoders,
+				    SPDK_COUNTOF(rpc_lvstore_flush_decoders), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid parameters");
 		goto cleanup;
@@ -1545,7 +1564,19 @@ rpc_rcow_flush_lvstore(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	s3lvol_lvstore_flush(lvs, rpc_lvstore_op_cb, request);
+	/* Bound the conversion below. timeout_ms is caller-supplied and the
+	 * multiplication would wrap a uint64_t, silently turning "a very long
+	 * drain" into a short one. Well past any real drain, and still under the
+	 * wrap point. */
+	if (req.timeout_ms > RCOW_FLUSH_TIMEOUT_MS_MAX) {
+		spdk_jsonrpc_send_error_response_fmt(request,
+						     SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "timeout_ms %" PRIu64 " exceeds the maximum of %" PRIu64,
+						     req.timeout_ms, (uint64_t)RCOW_FLUSH_TIMEOUT_MS_MAX);
+		goto cleanup;
+	}
+
+	s3lvol_lvstore_flush(lvs, req.timeout_ms * 1000, rpc_lvstore_op_cb, request);
 
 cleanup:
 	free(req.lvs_name);
@@ -1598,6 +1629,120 @@ cleanup:
 }
 SPDK_RPC_REGISTER("rcow_checkpoint_lvstore",
 		  rpc_rcow_checkpoint_lvstore, SPDK_RPC_RUNTIME)
+
+/* ==========================================================================
+ * rcow_prepare_hot_upgrade
+ *
+ * Quiesce every RCOW namespace and hold the flushers. Blobstore stays dirty so
+ * the replacement attach recovers it instead of taking a clean-load shortcut.
+ * The subsystems deliberately remain paused: rcow_upgrade.sh invokes this as
+ * its final online operation and SIGKILLs the process immediately afterwards,
+ * preserving the host namespace layout.
+ * ========================================================================== */
+
+struct rpc_rcow_prepare_hot_upgrade {
+	uint64_t suspend_timeout_ms;
+};
+
+static const struct spdk_json_object_decoder rpc_prepare_hot_upgrade_decoders[] = {
+	{"suspend_timeout_ms", offsetof(struct rpc_rcow_prepare_hot_upgrade, suspend_timeout_ms),
+	 spdk_json_decode_uint64, true},
+};
+
+static void
+rpc_rcow_prepare_hot_upgrade(struct spdk_jsonrpc_request *request,
+			     const struct spdk_json_val *params)
+{
+	struct rpc_rcow_prepare_hot_upgrade req = {0};
+
+	if (params != NULL && spdk_json_decode_object(params,
+						     rpc_prepare_hot_upgrade_decoders,
+						     SPDK_COUNTOF(rpc_prepare_hot_upgrade_decoders),
+						     &req)) {
+		spdk_jsonrpc_send_error_response(request,
+						 SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		return;
+	}
+
+	/* Milliseconds on the wire, microseconds in the hold. 0 means "the
+	 * flusher's own default", which is what a caller that does not care
+	 * sends; the startup script passes its own budget so the prepare cannot
+	 * outlive the stop it is part of.
+	 *
+	 * Bounded for the same reason rcow_flush_lvstore's timeout_ms is: the
+	 * multiplication would wrap a uint64_t, and a wrapped budget turns "hold
+	 * for a very long time" into "fail immediately" -- the prepare then
+	 * unwinds and reports a timeout with nothing in the log to say why. */
+	if (req.suspend_timeout_ms > RCOW_FLUSH_TIMEOUT_MS_MAX) {
+		spdk_jsonrpc_send_error_response_fmt(request,
+						     SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "suspend_timeout_ms %" PRIu64 " exceeds the maximum of %" PRIu64,
+						     req.suspend_timeout_ms,
+						     (uint64_t)RCOW_FLUSH_TIMEOUT_MS_MAX);
+		return;
+	}
+
+	s3lvol_prepare_hot_upgrade(rpc_lvstore_op_cb, request,
+				   req.suspend_timeout_ms * 1000);
+}
+SPDK_RPC_REGISTER("rcow_prepare_hot_upgrade",
+		  rpc_rcow_prepare_hot_upgrade, SPDK_RPC_RUNTIME)
+
+static void
+rpc_rcow_resume_flushers(struct spdk_jsonrpc_request *request,
+			 const struct spdk_json_val *params)
+{
+	if (params != NULL && spdk_json_decode_object(params, NULL, 0, NULL)) {
+		spdk_jsonrpc_send_error_response(request,
+						 SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "This method takes no parameters");
+		return;
+	}
+
+	s3lvol_resume_flushers();
+	/* The two-key envelope, like rcow_resume_subsystems: spdk_jsonrpc_send_bool_response
+	 * writes bool_value alone, and test/tools/s3lvol_rpc.py only unwraps a result
+	 * carrying both keys -- a bool-only reply reaches the script as a raw result
+	 * and exits 0. */
+	rpc_lvol_write_response(request, true, "");
+}
+SPDK_RPC_REGISTER("rcow_resume_flushers",
+		  rpc_rcow_resume_flushers, SPDK_RPC_RUNTIME)
+
+/* ==========================================================================
+ * rcow_resume_subsystems
+ *
+ * Release a hot prepare that will not be followed by the kill. rcow_upgrade.sh
+ * calls this on the failure paths that sit between a successful prepare and the
+ * SIGKILL, where the target is quiesced but nothing else would ever resume it.
+ * Unlike rcow_resume_flushers this also lifts the namespace pause.
+ * ========================================================================== */
+static void
+rpc_rcow_resume_subsystems(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	int rc;
+
+	if (params != NULL && spdk_json_decode_object(params, NULL, 0, NULL)) {
+		spdk_jsonrpc_send_error_response(request,
+						 SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "This method takes no parameters");
+		return;
+	}
+
+	/* The status travels in the envelope, both keys, so the caller can tell a
+	 * resume from a refusal. Not spdk_jsonrpc_send_bool_response(): it writes
+	 * bool_value alone, and test/tools/s3lvol_rpc.py only unwraps a result that
+	 * carries *both* keys -- a bool-only reply would reach the script as a raw
+	 * result and exit 0, which is exactly the false success this is fixing. */
+	rc = s3lvol_resume_subsystems();
+	rpc_lvol_write_response(request, rc == 0,
+				rc == 0 ? "" : "a hot prepare is still in flight; "
+				"the subsystems were not resumed");
+}
+SPDK_RPC_REGISTER("rcow_resume_subsystems",
+		  rpc_rcow_resume_subsystems, SPDK_RPC_RUNTIME)
 
 /* ==========================================================================
  * rcow_add_s3_config
@@ -2262,9 +2407,10 @@ struct rpc_import_lvol {
 	 * volume reading through to the export until somebody asks. The import still
 	 * answers as soon as the volume is usable.
 	 *
-	 * On by default. A volume left reading through keeps a lease renewed at the
-	 * source, so a source-side snapshot delete is deferred. Reading through is
-	 * the explicit opt-out from eager materialisation. */
+	 * Off by default. An omitted flag leaves the volume reading through, which
+	 * renews a lease at the source, so a source-side snapshot delete stays
+	 * deferred until that reader is gone. decouple:true is the request to
+	 * materialise this volume alone. */
 	bool  decouple;
 };
 
@@ -2355,9 +2501,11 @@ rpc_import_lvol_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 	 *
 	 * Additive, so anything reading bool_value/string_value is unaffected.
 	 *
-	 * Read off the blob rather than passed down from the decision: this cannot
-	 * disagree with what was actually built. */
-	mode = spdk_blob_is_esnap_clone(lvol->blob) ? "esnap" : "local_clone";
+	 * Taken from the parent chain, not from the flag the caller passed.
+	 * "esnap" means this volume, or a snapshot it was cloned from, still
+	 * reads the export. A local clone of a snapshot that does not is
+	 * "local_clone". */
+	mode = s3lvol_lvol_reads_import(lvol) ? "esnap" : "local_clone";
 
 	SPDK_NOTICELOG("rcow_import_lvol '%s' from export %s completed (%s)\n",
 		       lvol->name, ctx->export_uuid, mode);
@@ -2376,10 +2524,10 @@ static void
 rpc_rcow_import_lvol(struct spdk_jsonrpc_request *request,
 			    const struct spdk_json_val *params)
 {
-	/* decouple defaults to true; the decoder writes the field only when the
-	 * call says so, so an absent flag keeps the default while an explicit false
-	 * overrides it. */
-	struct rpc_import_lvol req = { .decouple = true };
+	/* decouple defaults to false; the decoder writes the field only when the
+	 * call says so, so an absent flag keeps the volume reading through the
+	 * export while an explicit true starts the background copy. */
+	struct rpc_import_lvol req = { .decouple = false };
 	struct rpc_import_ctx *ctx;
 	struct s3lvol_import_opts opts = {0};
 	struct s3lvol_lvstore *lvs;
@@ -2693,7 +2841,7 @@ SPDK_RPC_REGISTER("rcow_materialise_export", rpc_rcow_materialise_export,
  *
  * Both lists come from the in-memory registries, as a JSON array in
  * string_value; see the note on rpc_json_buf. There is no listing of what a
- * *bucket* holds -- that needs s3_list_objects(), which is still -ENOTSUP.
+ * *bucket* holds.
  *
  * rcow_get_exports is the source side: every reference (and dense) export this
  * node still owes. The uuid is what
