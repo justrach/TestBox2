@@ -7,7 +7,7 @@ use crate::coredump::{
     CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
 };
 use crate::migration::{memory_blob_to_path, url_to_path};
-use crate::pagemap_anon::filter_memory_ranges_by_pagemap_anon;
+use crate::pagemap_anon::{filter_memory_ranges_by_pagemap_anon, host_page_size};
 use crate::soft_dirty::{
     clear_soft_dirty, filter_memory_ranges_by_anon_and_soft_dirty, probe_soft_dirty_support,
 };
@@ -191,6 +191,12 @@ const MPOL_MF_MOVE: u32 = 1 << 1;
 // Reserve 1 MiB for platform MMIO devices (e.g. ACPI control devices)
 const PLATFORM_DEVICE_AREA_SIZE: u64 = 1 << 20;
 
+// KVM's dirty log and vm-memory's AtomicBitmap both size their bitmaps with one
+// bit per host page (via sysconf(_SC_PAGESIZE)), so interpreting those bitmaps
+// must use the same granularity: 4 KiB on x86_64, 64 KiB on some ARM64 hosts.
+// This reuses `pagemap_anon::host_page_size()` (cached, probed once) so the
+// whole crate shares a single source of truth for the host page size.
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct HotPlugState {
     base: u64,
@@ -272,6 +278,13 @@ struct ArchMemRegion {
 pub struct MemoryManager {
     boot_guest_memory: GuestMemoryMmap,
     guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
+    // device_memory is a superset of guest_memory: it contains all RAM regions
+    // plus device-backed regions (e.g. virtio-pmem, virtio-fs DAX window,
+    // ivshmem). Use this view for any virtio backend that may need to
+    // dereference a GPA pointing into device-mapped host memory; use
+    // guest_memory for snapshot, migration, coredump and firmware-loading
+    // paths.
+    device_memory: GuestMemoryAtomic<GuestMemoryMmap>,
     next_memory_slot: u32,
     start_of_device_area: GuestAddress,
     end_of_device_area: GuestAddress,
@@ -1199,6 +1212,13 @@ impl MemoryManager {
         };
 
         let guest_memory = GuestMemoryAtomic::new(guest_memory);
+        // device_memory starts as an independent container holding the same
+        // RAM regions as guest_memory. Region Arcs are shared (no extra mmap),
+        // but the two containers evolve independently afterwards: RAM changes
+        // are double-written via add_region(), while device-backed regions
+        // (PMEM/SHM/...) are inserted into device_memory only via
+        // add_device_region().
+        let device_memory = GuestMemoryAtomic::new(guest_memory.memory().deref().clone());
 
         // Both MMIO and PIO address spaces start at address 0.
         let allocator = Arc::new(Mutex::new(
@@ -1252,6 +1272,7 @@ impl MemoryManager {
         let mut memory_manager = MemoryManager {
             boot_guest_memory,
             guest_memory,
+            device_memory,
             next_memory_slot,
             start_of_device_area,
             end_of_device_area,
@@ -1575,14 +1596,72 @@ impl MemoryManager {
     }
 
     // Update the GuestMemoryMmap with the new range
+    //
+    // RAM changes must be double-written: first into device_memory so any
+    // virtio backend activation immediately sees the new region, then into
+    // guest_memory (the RAM-only view used by snapshot/coredump/migration).
+    // The two containers are independent (see constructor); region Arcs are
+    // shared, so this only clones a small Vec and bumps refcounts.
     fn add_region(&mut self, region: Arc<GuestRegionMmap>) -> Result<(), Error> {
-        let guest_memory = self
+        // 1) Update device_memory first.
+        let new_device_memory = self
+            .device_memory
+            .memory()
+            .insert_region(Arc::clone(&region))
+            .map_err(Error::GuestMemory)?;
+        self.device_memory
+            .lock()
+            .unwrap()
+            .replace(new_device_memory);
+
+        // 2) Update guest_memory (RAM view).
+        let new_guest_memory = self
             .guest_memory
             .memory()
             .insert_region(region)
             .map_err(Error::GuestMemory)?;
-        self.guest_memory.lock().unwrap().replace(guest_memory);
+        self.guest_memory.lock().unwrap().replace(new_guest_memory);
 
+        Ok(())
+    }
+
+    /// Insert a device-backed region (e.g. virtio-pmem, virtio-fs DAX
+    /// window, ivshmem) into the device_memory view ONLY. The region will
+    /// NOT be visible through guest_memory(), so it does not affect
+    /// snapshot, migration, coredump, or firmware-loading paths.
+    pub fn add_device_region(&mut self, region: Arc<GuestRegionMmap>) -> Result<(), Error> {
+        let new_device_memory = self
+            .device_memory
+            .memory()
+            .insert_region(region)
+            .map_err(Error::GuestMemory)?;
+        self.device_memory
+            .lock()
+            .unwrap()
+            .replace(new_device_memory);
+        Ok(())
+    }
+
+    /// Remove a previously inserted device-backed region from device_memory.
+    /// `start_addr`/`size` must match the region exactly (vm-memory requires
+    /// an exact-size match, otherwise it returns `InvalidGuestRegion`).
+    /// Use this in the unmap path of dynamically-mapped device segments
+    /// (e.g. ivshmem unmap_region) so device_memory does not retain a dead
+    /// reference to a region whose KVM slot has just been removed.
+    pub fn remove_device_region(
+        &mut self,
+        start_addr: GuestAddress,
+        size: GuestUsize,
+    ) -> Result<(), Error> {
+        let (new_device_memory, _removed) = self
+            .device_memory
+            .memory()
+            .remove_region(start_addr, size)
+            .map_err(Error::GuestMemory)?;
+        self.device_memory
+            .lock()
+            .unwrap()
+            .replace(new_device_memory);
         Ok(())
     }
 
@@ -1671,7 +1750,11 @@ impl MemoryManager {
 
         let start_addr = MemoryManager::start_addr(self.guest_memory.memory().last_addr(), true)?;
 
-        if start_addr.checked_add(size.try_into().unwrap()).unwrap() >= self.end_of_ram_area {
+        if start_addr
+            .checked_add((size - 1).try_into().unwrap())
+            .unwrap()
+            > self.end_of_ram_area
+        {
             return Err(Error::InsufficientHotplugRam);
         }
 
@@ -1702,6 +1785,13 @@ impl MemoryManager {
 
     pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
         self.guest_memory.clone()
+    }
+
+    /// Return the device-memory view: RAM + device-backed regions.
+    /// Use this for any virtio/DMA backend that may need to access GPAs
+    /// pointing into device-mapped host memory (e.g. PMEM).
+    pub fn device_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
+        self.device_memory.clone()
     }
 
     pub fn boot_guest_memory(&self) -> GuestMemoryMmap {
@@ -2306,7 +2396,8 @@ impl MemoryManager {
 
         let guest_memory = self.guest_memory.memory();
 
-        // Use pagemap + kpageflags to filter memory ranges, keeping only anonymous pages (CoW)
+        // Classify CoW anonymous pages from pagemap bit 61 (`PM_FILE`): a page
+        // is saved when it is swapped, or present without `PM_FILE`.
         let (filtered_ranges, stats) =
             filter_memory_ranges_by_pagemap_anon(&guest_memory, &self.snapshot_memory_ranges)
                 .map_err(|e| {
@@ -3005,7 +3096,8 @@ impl Transportable for MemoryManager {
                     .map(|(x, y)| x | y)
                     .collect();
 
-                let sub_table = MemoryRangeTable::from_bitmap(dirty_bitmap, range.gpa, 4096);
+                let sub_table =
+                    MemoryRangeTable::from_bitmap(dirty_bitmap, range.gpa, host_page_size());
 
                 if !sub_table.regions().is_empty() {
                     for r in sub_table.regions() {
@@ -3095,7 +3187,7 @@ impl Migratable for MemoryManager {
                 .map(|(x, y)| x | y)
                 .collect();
 
-            let sub_table = MemoryRangeTable::from_bitmap(dirty_bitmap, r.gpa, 4096);
+            let sub_table = MemoryRangeTable::from_bitmap(dirty_bitmap, r.gpa, host_page_size());
 
             if sub_table.regions().is_empty() {
                 info!("Dirty Memory Range Table is empty");

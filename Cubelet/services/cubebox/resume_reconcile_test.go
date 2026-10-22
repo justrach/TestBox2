@@ -18,8 +18,21 @@ import (
 )
 
 type fakeCubeboxAPI struct {
-	cb      *cubeboxstore.CubeBox
-	syncIDs []string
+	cb            *cubeboxstore.CubeBox
+	list          []*cubeboxstore.CubeBox
+	getCalls      int
+	saveCalls     int
+	getHook       func(call int)
+	syncIDs       []string
+	syncSnapshots []fakeCubeboxSyncSnapshot
+	syncErr       error
+	saveErr       error
+}
+
+type fakeCubeboxSyncSnapshot struct {
+	pausedAt          int64
+	startedAt         int64
+	userMarkedDeleted bool
 }
 
 func (f *fakeCubeboxAPI) Init(ctx context.Context) error {
@@ -27,8 +40,13 @@ func (f *fakeCubeboxAPI) Init(ctx context.Context) error {
 }
 
 func (f *fakeCubeboxAPI) Get(ctx context.Context, id string) (*cubeboxstore.CubeBox, error) {
-	if f.cb != nil && f.cb.ID == id {
-		return f.cb, nil
+	cb := f.cb
+	f.getCalls++
+	if f.getHook != nil {
+		f.getHook(f.getCalls)
+	}
+	if cb != nil && cb.ID == id {
+		return cb, nil
 	}
 	return nil, nil
 }
@@ -45,6 +63,9 @@ func (f *fakeCubeboxAPI) FindContainerOfCubebox(ctx context.Context, id string) 
 }
 
 func (f *fakeCubeboxAPI) List() []*cubeboxstore.CubeBox {
+	if f.list != nil {
+		return f.list
+	}
 	if f.cb == nil {
 		return nil
 	}
@@ -52,17 +73,33 @@ func (f *fakeCubeboxAPI) List() []*cubeboxstore.CubeBox {
 }
 
 func (f *fakeCubeboxAPI) Save(ctx context.Context, info *cubeboxstore.CubeBox, opts ...cubes.UpdateCubeboxOpt) error {
+	f.saveCalls++
+	if f.saveErr != nil {
+		return f.saveErr
+	}
 	f.cb = info
 	return nil
 }
 
 func (f *fakeCubeboxAPI) SyncByID(ctx context.Context, id string, opts ...cubes.UpdateCubeboxOpt) error {
 	f.syncIDs = append(f.syncIDs, id)
-	return nil
+	if f.cb != nil && f.cb.GetStatus() != nil {
+		status := f.cb.GetStatus().Get()
+		f.syncSnapshots = append(f.syncSnapshots, fakeCubeboxSyncSnapshot{
+			pausedAt:          status.PausedAt,
+			startedAt:         status.StartedAt,
+			userMarkedDeleted: f.cb.UserMarkDeletedTime != nil,
+		})
+	}
+	return f.syncErr
 }
 
 func (f *fakeCubeboxAPI) Delete(ctx context.Context, opt *cubes.DeleteOption) error {
 	return nil
+}
+
+func (f *fakeCubeboxAPI) IsImageInUse(imageID string) (bool, error) {
+	return false, nil
 }
 
 func TestConvergeResumeStateAfterOpaqueRestoreClearsPauseStateAndInvalidatesBindings(t *testing.T) {
@@ -92,6 +129,7 @@ func TestConvergeResumeStateAfterOpaqueRestoreClearsPauseStateAndInvalidatesBind
 		got := cntr.Status.Get()
 		assert.Equal(t, int64(0), got.PausedAt, "PausedAt must be cleared for %s", id)
 		assert.Equal(t, int64(0), got.PausingAt, "PausingAt must be cleared for %s", id)
+		assert.NotZero(t, got.StartedAt, "resumed %s must have a running marker", id)
 	}
 	assert.Equal(t, runtimeSnapshotBindingInvalidID, cb.Labels[constants.MasterAnnotationRuntimeSnapshotID])
 	assert.Equal(t, runtimeSnapshotBindingInvalidID, cb.Labels[constants.MasterAnnotationRuntimeRestoreSnapshotID])
@@ -118,6 +156,7 @@ func TestHandleEventTaskResumedConvergesOpaqueRestoreBindings(t *testing.T) {
 	got := cb.GetStatus().Get()
 	assert.Equal(t, int64(0), got.PausedAt, "TaskResumed must clear PausedAt")
 	assert.Equal(t, int64(0), got.PausingAt, "TaskResumed must clear PausingAt")
+	assert.NotZero(t, got.StartedAt, "TaskResumed must restore a running marker")
 	assert.Equal(t, runtimeSnapshotBindingInvalidID, cb.Labels[constants.MasterAnnotationRuntimeSnapshotID])
 	assert.Equal(t, runtimeSnapshotBindingInvalidID, cb.Labels[constants.MasterAnnotationRuntimeRestoreSnapshotID])
 	assert.NotEmpty(t, cb.Labels[constants.MasterAnnotationRuntimeSnapshotAttachedAt], "TaskResumed must stamp attached_at")

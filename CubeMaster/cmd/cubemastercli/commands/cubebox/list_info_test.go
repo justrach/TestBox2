@@ -92,6 +92,24 @@ func TestBuildListRequestOldUsesQueryParameters(t *testing.T) {
 	}
 }
 
+func TestStatusWithPauseState(t *testing.T) {
+	cases := []struct {
+		status      int32
+		pauseStatus string
+		want        string
+	}{
+		{5, "", "paused"},
+		{5, "READY", "paused"},
+		{5, "DELETE_FAILED", "paused(delete_failed)"},
+		{1, "", "running"},
+	}
+	for _, tc := range cases {
+		if got := statusWithPauseState(tc.status, tc.pauseStatus); got != tc.want {
+			t.Fatalf("statusWithPauseState(%d, %q)=%q, want %q", tc.status, tc.pauseStatus, got, tc.want)
+		}
+	}
+}
+
 func TestBuildListSummaryAll(t *testing.T) {
 	req := &types.ListCubeSandboxReq{StartIdx: 1, Size: 2}
 	rsp := &types.ListCubeSandboxRes{
@@ -135,6 +153,32 @@ func TestParseListFiltersSkipsInvalidEntries(t *testing.T) {
 	}
 	if len(normalized) != 2 || normalized[0] != "user=alice" || normalized[1] != "team=dev" {
 		t.Fatalf("normalized filters=%v", normalized)
+	}
+}
+
+func TestPrintSandboxInfoBlockIncludesVolumeMounts(t *testing.T) {
+	var buf bytes.Buffer
+	w := tabwriter.NewWriter(&buf, 4, 8, 4, ' ', 0)
+	printSandboxInfoBlock(w, &types.SandboxData{
+		SandboxID: "sb-1",
+		VolumeMounts: []*types.VolumeMountInfo{{
+			Name:          "hostdir-0",
+			ContainerPath: "/mnt/data",
+			Readonly:      true,
+		}},
+	})
+	if err := w.Flush(); err != nil {
+		t.Fatalf("flush writer error=%v", err)
+	}
+
+	output := buf.String()
+	for _, want := range []string{"VOLUME_MOUNTS", "hostdir-0", "/mnt/data", "true"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output=%q, missing %q", output, want)
+		}
+	}
+	if strings.Contains(output, "HOST_PATH") || strings.Contains(output, "/tmp/data") {
+		t.Fatalf("output=%q unexpectedly includes hostPath", output)
 	}
 }
 

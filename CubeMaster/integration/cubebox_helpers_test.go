@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	cubeboxv1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 func testGetCreateCubeSandboxReq() *types.CreateCubeSandboxReq {
@@ -24,7 +24,7 @@ func testGetCreateCubeSandboxReq() *types.CreateCubeSandboxReq {
 		Request: &types.Request{
 			RequestID: uuid.New().String(),
 		},
-		Timeout:      30,
+		Timeout:      types.TimeoutPtr(30),
 		InstanceType: "cubebox",
 		Volumes: []*types.Volume{
 			{
@@ -88,7 +88,12 @@ func testCreateSandboxByReq(reqC *types.CreateCubeSandboxReq) (rsp *types.Create
 			RetMsg:  errorcode.ErrorCode_Success.String(),
 		},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(reqC.Timeout+3)*time.Second)
+	// Idle TTL is not a valid HTTP deadline; use a fixed test timeout instead.
+	timeoutSec := 30
+	if reqC.Timeout != nil && *reqC.Timeout > 0 {
+		timeoutSec = *reqC.Timeout + 3
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
 	reqC.RequestID = uuid.New().String()

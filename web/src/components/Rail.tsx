@@ -11,21 +11,24 @@ import {
   Network,
   Activity,
   Bot,
-  KeyRound,
   Settings,
   Store,
+  Layers,
+  Archive,
   Github,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useControlPlaneVersion } from '@/hooks/useControlPlaneVersion';
 
 const NAV_ITEMS = [
   { to: '/', icon: LayoutDashboard, key: 'overview' },
   { to: '/sandboxes', icon: Boxes, key: 'sandboxes' },
   { to: '/templates', icon: Package, key: 'templates' },
   { to: '/nodes', icon: Server, key: 'nodes' },
+  { to: '/versions', icon: Layers, key: 'versions' },
+  { to: '/warehouse', icon: Archive, key: 'warehouse' },
   { to: '/network', icon: Network, key: 'network' },
   { to: '/observability', icon: Activity, key: 'observability' },
-  { to: '/keys', icon: KeyRound, key: 'apiKeys' },
   { to: '/store', icon: Store, key: 'store' },
   { to: '/agenthub', icon: Bot, key: 'agentHub' },
   { to: '/settings', icon: Settings, key: 'settings' },
@@ -34,6 +37,7 @@ const NAV_ITEMS = [
 export function Rail() {
   const loc = useLocation();
   const { t } = useTranslation('nav');
+  const version = useControlPlaneVersion();
 
   return (
     <aside className="fixed inset-y-0 left-0 z-20 flex w-[68px] flex-col items-center justify-between border-r border-border/60 bg-background/60 py-4 backdrop-blur-xl">
@@ -52,7 +56,7 @@ export function Rail() {
               className={cn(
                 'group relative flex h-10 w-10 items-center justify-center rounded-lg text-muted-foreground transition-all duration-150 ease-cube',
                 'hover:bg-muted hover:text-foreground',
-                active && 'bg-primary/15 text-primary ring-1 ring-primary/30'
+                active && 'bg-primary/15 text-primary ring-1 ring-primary/30',
               )}
             >
               <Icon size={18} strokeWidth={1.75} />
@@ -75,7 +79,7 @@ export function Rail() {
             GitHub
           </span>
         </a>
-        <div className="text-xs tracking-wider text-muted-foreground/70 text-num">v{__APP_VERSION__}</div>
+        <div className="text-xs tracking-wider text-muted-foreground/70 text-num">v{version}</div>
       </div>
     </aside>
   );

@@ -12,8 +12,7 @@
 #   /data/log/CubeAPI/                 cube-api rotated daily logs
 #   /data/log/CubeShim/                CubeShim request/stat logs
 #   /data/log/CubeVmm/                 VMM logs
-#   /data/log/network-agent/           network-agent request logs
-#   cube-proxy (Docker)                error.log and access.log via docker exec
+#   /data/log/cube-proxy/              cube-proxy access/error logs
 #   dmesg                              kernel ring buffer
 #   process/env snapshot               ps, ports, mounts, cgroup, cpuinfo, …
 #   config files                       with secrets redacted
@@ -24,7 +23,7 @@
 # Options:
 #   --module <name>     Collect only the specified module(s); repeat for multiple.
 #                       Module names: cubemaster cubelet cube-api cubeshim
-#                       cubevmm network-agent cube-proxy runtime dmesg env configs
+#                       cubevmm cube-proxy runtime dmesg env configs
 #                       Default: all modules
 #   --lines <n>         Tail N lines per log file (default: 2000)
 #   --all-lines         Collect entire log files (may be very large)
@@ -49,8 +48,7 @@ Log sources:
   /data/log/CubeAPI/                 cube-api rotated daily logs
   /data/log/CubeShim/                CubeShim request/stat logs
   /data/log/CubeVmm/                 VMM logs
-  /data/log/network-agent/           network-agent request logs
-  cube-proxy (Docker)                error.log and access.log via docker exec
+  /data/log/cube-proxy/              cube-proxy access/error logs
   dmesg                              Full kernel ring buffer + filtered views
   env                                Process list, ports, mounts, cgroup, cpuinfo, ...
   configs                            Config files with secrets redacted
@@ -59,7 +57,7 @@ Options:
   --module <name>   Collect only the specified module. Repeat to select multiple.
                     Available modules:
                       cubemaster  cubelet  cube-api  cubeshim  cubevmm
-                      network-agent  cube-proxy  runtime  dmesg  env  configs
+                      cube-proxy  runtime  dmesg  env  configs
                     Default: all modules
   --lines <n>       Tail N lines per log file (default: 2000)
   --all-lines       Copy entire log files without truncation.
@@ -70,7 +68,6 @@ Options:
   --help            Show this help message and exit
 
 Environment variables:
-  ONE_CLICK_TOOLBOX_ROOT   Installation root (default: /usr/local/services/cubetoolbox)
   ONE_CLICK_LOG_DIR        Runtime log directory (default: /var/log/cube-sandbox-one-click)
   ONE_CLICK_RUNTIME_DIR    PID file directory (default: /var/run/cube-sandbox-one-click)
   CUBE_DATA_LOG_DIR        Structured log root (default: /data/log)
@@ -96,7 +93,7 @@ EOF
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-TOOLBOX_ROOT="${ONE_CLICK_TOOLBOX_ROOT:-/usr/local/services/cubetoolbox}"
+TOOLBOX_ROOT="/usr/local/services/cubetoolbox"
 RUNTIME_LOG_DIR="${ONE_CLICK_LOG_DIR:-/var/log/cube-sandbox-one-click}"
 RUNTIME_PID_DIR="${ONE_CLICK_RUNTIME_DIR:-/var/run/cube-sandbox-one-click}"
 DATA_LOG_DIR="${CUBE_DATA_LOG_DIR:-/data/log}"
@@ -133,7 +130,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # If no --module given, collect everything
-_ALL_MODULES=(cubemaster cubelet cube-api cubeshim cubevmm network-agent cube-proxy runtime dmesg env configs)
+_ALL_MODULES=(cubemaster cubelet cube-api cubeshim cubevmm cube-proxy runtime dmesg env configs)
 if [[ "${#SELECTED_MODULES[@]}" -eq 0 ]]; then
   SELECTED_MODULES=("${_ALL_MODULES[@]}")
 fi
@@ -245,71 +242,13 @@ collect_cubevmm() {
   _collect_data_log_dir "${DATA_LOG_DIR}/CubeVmm" "${dest}"
 }
 
-collect_network_agent() {
-  _info "── network-agent ──"
-  local dest="${OUT_DIR}/network-agent"
-  mkdir -p "${dest}"
-  _collect_data_log_dir "${DATA_LOG_DIR}/network-agent" "${dest}"
-  _collect_log "${RUNTIME_LOG_DIR}/network-agent.log" "${dest}"
-}
+
 
 collect_cube_proxy() {
   _info "── cube-proxy ──"
   local dest="${OUT_DIR}/cube-proxy"
   mkdir -p "${dest}"
-
-  # cube-proxy runs inside a Docker container; its logs are not on the host
-  # filesystem. Find the running container by image name (cube-proxy:one-click
-  # as shipped by the one-click installer) and extract via docker exec.
-  if ! command -v docker >/dev/null 2>&1; then
-    _warn "docker not found — cannot collect cube-proxy container logs"
-    return
-  fi
-
-  # Locate the cube-proxy container by exact name 'cube-proxy'.
-  # docker --filter name= does prefix/substring matching, so we must verify
-  # the exact name from the output to avoid matching 'cube-proxy-coredns'.
-  local cid
-  cid="$(docker ps --filter 'name=cube-proxy' --filter 'status=running' \
-           --format '{{.Names}}\t{{.ID}}' 2>/dev/null \
-         | awk '$1=="cube-proxy" {print $2}' | head -1)"
-  if [[ -z "${cid}" ]]; then
-    # Fall back: match by image name pattern cube-proxy:*
-    cid="$(docker ps --filter 'status=running' \
-             --format '{{.Image}}\t{{.ID}}' 2>/dev/null \
-           | awk '$1~/^cube-proxy:/ {print $2}' | head -1)"
-  fi
-  if [[ -z "${cid}" ]]; then
-    _warn "cube-proxy container not running — cannot collect its logs"
-    return
-  fi
-  _info "cube-proxy container: ${cid}"
-
-  local -a log_paths=(
-    /data/log/cube-proxy/error.log
-    /data/log/cube-proxy/access.log
-  )
-
-  for log_path in "${log_paths[@]}"; do
-    local base; base="$(basename "${log_path}")"
-    local out_file="${dest}/${base}"
-    # Use '[ -f ... ]' via sh -c to avoid relying on the 'test' binary
-    # which may not be present in the container's PATH.
-    if docker exec "${cid}" sh -c "[ -f '${log_path}' ]" 2>/dev/null; then
-      if [[ "${ALL_LINES}" -eq 1 ]]; then
-        docker exec "${cid}" cat "${log_path}" > "${out_file}" 2>/dev/null \
-          && _info "docker exec ${cid} cat ${log_path}" \
-          || _warn "could not read ${log_path} from container ${cid}"
-      else
-        docker exec "${cid}" sh -c "tail -n ${TAIL_LINES} ${log_path}" \
-          > "${out_file}" 2>/dev/null \
-          && _info "docker exec ${cid} tail -${TAIL_LINES} ${log_path}" \
-          || _warn "could not tail ${log_path} from container ${cid}"
-      fi
-    else
-      _warn "${log_path} not found inside container ${cid}"
-    fi
-  done
+  _collect_data_log_dir "${DATA_LOG_DIR}/cube-proxy" "${dest}"
 }
 
 collect_runtime() {
@@ -326,7 +265,7 @@ collect_runtime() {
 
   # Process snapshot
   _capture "ps_cube" "${dest}/ps-cube.txt" \
-    bash -c 'ps auxww | grep -E "cube|cubelet|cubemaster|network-agent|containerd-shim" | grep -v grep || true'
+    bash -c 'ps auxww | grep -E "cube|cubelet|cubemaster|containerd-shim" | grep -v grep || true'
   _capture "ports"   "${dest}/ports.txt"   ss -tlnp
 
   {
@@ -433,7 +372,6 @@ main() {
   _module_selected "cube-api"      && collect_cube_api
   _module_selected "cubeshim"      && collect_cubeshim
   _module_selected "cubevmm"       && collect_cubevmm
-  _module_selected "network-agent" && collect_network_agent
   _module_selected "cube-proxy"    && collect_cube_proxy
   _module_selected "runtime"       && collect_runtime
   _module_selected "dmesg"         && collect_dmesg

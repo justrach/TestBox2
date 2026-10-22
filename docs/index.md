@@ -1,28 +1,15 @@
 ---
 layout: home
+logo3d: true
 
 hero:
   name: "Cube Sandbox"
-  text: "Empowering your AI Agents."
-  tagline: "Instant, Concurrent, Secure & Lightweight Sandbox for AI Agents."
+  text: "Empowering your AI&nbsp;Agents."
+  tagline: "Instant, Concurrent, Secure & Lightweight Sandbox Service for AI Agents"
   actions:
     - theme: brand
       text: Quick Start
       link: /guide/quickstart
-
-features:
-  - title: "⚡ Ultra-fast Startup"
-    details: Resource pooling and snapshot cloning skip all cold-start overhead. Sandbox creation faster than a blink.
-  - title: "🔒 Hardware Isolation"
-    details: Every sandbox runs a dedicated OS kernel in its own MicroVM.
-  - title: "🔌 E2B SDK Compatible"
-    details: Drop-in replacement for E2B Cloud. Switch by changing one environment variable — zero client code changes.
-  - title: "📦 High-density Deployment"
-    details: MB-level per-sandbox overhead enables thousands of instances per server via kernel sharing and Copy-on-Write.
-  - title: "🛡️ Network Security"
-    details: eBPF-based CubeVS enforces strict inter-sandbox isolation and fine-grained egress filtering at the kernel level.
-  - title: "📸 State Management"
-    details: "Create checkpoints on running sandboxes, roll back to any saved state, or fork into parallel exploration environments at millisecond granularity."
 ---
 
 ## Get Started

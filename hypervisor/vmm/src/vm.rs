@@ -24,6 +24,7 @@ use crate::gdb::{Debuggable, DebuggableError, GdbRequestPayload, GdbResponsePayl
 use crate::memory_manager::{
     Error as MemoryManagerError, MemoryManager, MemoryManagerSnapshotData,
 };
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::migration::get_vm_snapshot;
 #[cfg(feature = "guest_debug")]
 use crate::migration::url_to_file;
@@ -2481,6 +2482,12 @@ impl Vm {
 
     pub fn memory_manager_data(&self) -> MemoryManagerSnapshotData {
         self.memory_manager.lock().unwrap().snapshot_data()
+    }
+
+    /// Reference the pause path holds past the Vm drop, deferring the
+    /// guest memory unmap and the KVM fd close past the pause reply.
+    pub(crate) fn memory_manager(&self) -> Arc<Mutex<MemoryManager>> {
+        self.memory_manager.clone()
     }
 
     #[cfg(feature = "guest_debug")]

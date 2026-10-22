@@ -9,10 +9,10 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubehost/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/apis/shimapi/shimtypes"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/virtiofs"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 func (cb *CubeBox) DeepCopy() *CubeBox {
@@ -21,18 +21,19 @@ func (cb *CubeBox) DeepCopy() *CubeBox {
 	}
 
 	copied := &CubeBox{
-		Metadata:           cb.Metadata.DeepCopy(),
-		Namespace:          cb.Namespace,
-		AppID:              cb.AppID,
-		IP:                 cb.IP,
-		CGroupPath:         cb.CGroupPath,
-		FirstContainerName: cb.FirstContainerName,
-		NumaNode:           cb.NumaNode,
-		Queues:             cb.Queues,
-		Endpoint:           cb.Endpoint,
-		Version:            cb.Version,
-		RequestSource:      cb.RequestSource,
-		UserDeleteMark:     cb.UserDeleteMark.DeepCopy(),
+		Metadata:                               cb.Metadata.DeepCopy(),
+		Namespace:                              cb.Namespace,
+		AppID:                                  cb.AppID,
+		IP:                                     cb.IP,
+		CGroupPath:                             cb.CGroupPath,
+		FirstContainerName:                     cb.FirstContainerName,
+		NumaNode:                               cb.NumaNode,
+		Queues:                                 cb.Queues,
+		Endpoint:                               cb.Endpoint,
+		Version:                                cb.Version,
+		RequestSource:                          cb.RequestSource,
+		UserDeleteMark:                         cb.UserDeleteMark.DeepCopy(),
+		HostMetricsBaselineMissingAtAssignment: cb.HostMetricsBaselineMissingAtAssignment,
 	}
 
 	if cb.PortMappings != nil {
@@ -40,6 +41,23 @@ func (cb *CubeBox) DeepCopy() *CubeBox {
 		for i, pm := range cb.PortMappings {
 			if pm != nil {
 				copied.PortMappings[i] = proto.Clone(pm).(*cubebox.PortMapping)
+			}
+		}
+	}
+
+	copied.NetworkType = cb.NetworkType
+	copied.RuntimeHandler = cb.RuntimeHandler
+	if cb.ExposedPorts != nil {
+		copied.ExposedPorts = append([]int64(nil), cb.ExposedPorts...)
+	}
+	if cb.CubeNetworkConfig != nil {
+		copied.CubeNetworkConfig = proto.Clone(cb.CubeNetworkConfig).(*cubebox.CubeNetworkConfig)
+	}
+	if cb.Volumes != nil {
+		copied.Volumes = make([]*cubebox.Volume, len(cb.Volumes))
+		for i, v := range cb.Volumes {
+			if v != nil {
+				copied.Volumes[i] = proto.Clone(v).(*cubebox.Volume)
 			}
 		}
 	}
@@ -99,9 +117,13 @@ func (cb *CubeBox) DeepCopy() *CubeBox {
 		copied.Status = cb.Status.DeepCopy()
 	}
 
-	if cb.LocalRunTemplate != nil {
-		templateCopy := *cb.LocalRunTemplate
-		copied.LocalRunTemplate = &templateCopy
+	copied.LocalRunTemplate = cb.LocalRunTemplate.Clone()
+
+	if cb.ComponentVersions != nil {
+		copied.ComponentVersions = make(map[string]string, len(cb.ComponentVersions))
+		for k, v := range cb.ComponentVersions {
+			copied.ComponentVersions[k] = v
+		}
 	}
 
 	if cb.ImageReferences != nil {
@@ -110,6 +132,9 @@ func (cb *CubeBox) DeepCopy() *CubeBox {
 			copied.ImageReferences[k] = v.DeepCopy()
 		}
 	}
+
+	copied.HostMetricsBaseline = cb.HostMetricsBaselineCopy()
+	copied.GuestMetricsEpoch = cb.GuestMetricsEpochCopy()
 
 	return copied
 }

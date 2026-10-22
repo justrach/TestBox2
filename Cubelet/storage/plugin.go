@@ -5,6 +5,7 @@
 package storage
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -21,21 +22,35 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubecow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/cubes"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	volpkg "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/volume"
+	volbinary "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/volume/binary"
+	volrpc "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/volume/rpc"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 var cowLookPath = exec.LookPath
 var initCowEngine = initCowEngineWithConfig
+var initS3CowEngine = initS3CowEngineWithConfig
 
 // StorageBackendCow is the canonical value of `storage_backend` for the
 // cubecow (reflink-only copy-on-write) backend. cubelet refuses to boot
 // when `storage_backend` is set to anything else under this build.
 const StorageBackendCow = "cubecow"
 
-// cowBackendReflink is the only backend `kind` cubecow now supports.
-// It is forwarded verbatim into the cubecow inline JSON payload and
-// matches the `BackendKind::Reflink` variant on the Rust side.
-const cowBackendReflink = "reflink"
+// cubecow backend.kind values. Cubelet starts one handle per kind
+// (xfs=reflink, s3=s3). Each handle gets its own JSON; cubecow selects
+// the engine from that handle's config. The S3 engine itself lives in
+// cubecow (someone else's PR); Cubelet only wraps two handles.
+const (
+	cowBackendReflink = "reflink"
+	cowBackendS3      = "s3"
+)
+
+// defaultVolumePluginBaseDir is the fallback parent directory that
+// plugin_volume Attach must mount volumes under when Config.VolumePluginBaseDir
+// is not set in TOML.
+const defaultVolumePluginBaseDir = "/data/cube-shared/volume"
 
 // reflinkExt4InitCommands lists the external commands the **cubelet
 // upper layers** need when they initialise an ext4 default-medium
@@ -94,17 +109,43 @@ type Config struct {
 	// than the 3s default; this knob lets operators bump it without
 	// recompiling.
 	CmdTimeout tomlext.Duration `toml:"cmd_timeout"`
+
+	// VolumePlugins lists external volume plugin configurations.
+	// Built-in plugins are registered in code and do not need entries here.
+	//
+	// Example:
+	//   [[plugins."io.cubelet.internal.v1.storage".volume_plugins]]
+	//     name        = "nfs"
+	//     type        = "binary"
+	//     binary_path = "/usr/local/bin/cube-volume-nfs"
+	VolumePlugins []volpkg.PluginConfig `toml:"volume_plugins"`
+
+	// VolumePluginBaseDir is the parent directory that every plugin_volume
+	// Attach must mount its volume under. Cubelet passes this path to the
+	// plugin (AttachRequest.VolumeBaseDir / --volume-base-dir) and rejects any
+	// attach whose returned host_path is not located inside it. Defaults to
+	// defaultVolumePluginBaseDir ("/data/cube-shared/volume") when empty.
+	VolumePluginBaseDir string `toml:"volume_plugin_base_dir"`
 }
 
-// CowInlineConfig mirrors the cubecow `AppConfig` schema. cubecow is
-// reflink-only and cubelet always owns the cubecow init payload
-// (there is no external cubecow.toml fallback), so the only thing
-// users can tune through TOML is the `[log]` block. The reflink
-// backend's `root_dir` is derived from `data_path` and stamped onto
-// `Backend.Reflink` in PrepareCowInlineConfig.
+// CowInlineConfig mirrors the cubecow `AppConfig` schema. Cubelet owns
+// the cubecow init payload and starts one handle per backend.kind.
+// Users may tune `[log]` and `[cow.s3]` (s3lvol enable / socket); reflink
+// `root_dir` and s3 `state_dir` are derived from `data_path`.
 type CowInlineConfig struct {
 	Log     CowLogConfig     `toml:"log"`
 	Backend CowBackendConfig `toml:"-"`
+	S3      CowS3UserConfig  `toml:"s3"`
+}
+
+// CowS3UserConfig is the operator-facing `[cow.s3]` block.
+type CowS3UserConfig struct {
+	Enable             bool    `toml:"enable"`
+	SocketPath         *string `toml:"socket_path"`
+	StateDir           *string `toml:"state_dir"`
+	RPCTimeoutMS       *uint64 `toml:"rpc_timeout_ms"`
+	RPCConnectBudgetMS *uint64 `toml:"rpc_connect_budget_ms"`
+	SizePolicy         *string `toml:"size_policy"`
 }
 
 type CowLogConfig struct {
@@ -119,6 +160,17 @@ type CowLogConfig struct {
 type CowBackendConfig struct {
 	Kind    string `toml:"-"`
 	Reflink CowReflinkBackendConfig
+	S3      CowS3BackendConfig
+}
+
+// CowS3BackendConfig is the `[backend.s3]` payload stamped onto the
+// S3 cubecow handle.
+type CowS3BackendConfig struct {
+	SocketPath         *string
+	StateDir           *string
+	RPCTimeoutMS       *uint64
+	RPCConnectBudgetMS *uint64
+	SizePolicy         *string
 }
 
 // CowReflinkBackendConfig is the `[backend.reflink]` payload.
@@ -133,11 +185,22 @@ func (c *Config) BuildCowInitJSON() ([]byte, error) {
 	if c == nil {
 		return nil, fmt.Errorf("nil storage config")
 	}
+	return c.buildCowInitJSON(c.Cow.Backend)
+}
+
+func (c *Config) BuildS3CowInitJSON() ([]byte, error) {
+	if c == nil {
+		return nil, fmt.Errorf("nil storage config")
+	}
+	return c.buildCowInitJSON(c.s3BackendConfig())
+}
+
+func (c *Config) buildCowInitJSON(backend CowBackendConfig) ([]byte, error) {
 	payload := map[string]any{}
 	if logBlock := c.Cow.Log.toMap(); len(logBlock) > 0 {
 		payload["log"] = logBlock
 	}
-	if backendBlock := c.Cow.Backend.toMap(); len(backendBlock) > 0 {
+	if backendBlock := backend.toMap(); len(backendBlock) > 0 {
 		payload["backend"] = backendBlock
 	}
 	return json.Marshal(payload)
@@ -165,19 +228,13 @@ func (c *Config) cowReflinkRootDir() (string, error) {
 	return defaultReflinkAutoRootDir(c.DataPath), nil
 }
 
-// defaultReflinkAutoRootDir picks `<data_path-base>/cubecow-reflink/`
-// when no explicit `root_dir` is provided. It strips the
-// `<plugin>.<id>` storage suffix from `dataPath` so reflink files
-// share the same physical filesystem as the rest of cubelet's
-// persistent state instead of accidentally landing on the OS disk
-// under cubecow's library-level fallback.
+// defaultReflinkAutoRootDir is the cubecow reflink pool: <work>/xfs/objects.
 func defaultReflinkAutoRootDir(dataPath string) string {
-	storageDir := fmt.Sprintf("%v.%v", constants.InternalPlugin, constants.StorageID)
-	baseDir := filepath.Clean(dataPath)
-	if filepath.Base(baseDir) == storageDir {
-		baseDir = filepath.Dir(baseDir)
+	work := stripStoragePluginDataDir(filepath.Clean(dataPath))
+	if work == "" || work == "." {
+		work = filepath.Join(constants.CubeConfigBasePath, "storage")
 	}
-	return filepath.Join(baseDir, "cubecow-reflink")
+	return filepath.Join(work, cow.BackendXFS, SnapshotObjectsDir)
 }
 
 func (c *Config) cowStartupCommands() []string {
@@ -215,7 +272,67 @@ func initCowEngineWithConfig(cfg *Config) (*cubecow.Engine, string, error) {
 		return nil, "", err
 	}
 	engine, err := cubecow.InitWithoutLoggingFromJSON(string(payload))
-	return engine, "inline storage.cow config", err
+	return engine, "inline storage.cow reflink handle", err
+}
+
+func initS3CowEngineWithConfig(cfg *Config) (*cubecow.Engine, string, error) {
+	if cfg == nil {
+		return nil, "", fmt.Errorf("nil storage config")
+	}
+	payload, err := cfg.BuildS3CowInitJSON()
+	if err != nil {
+		return nil, "", err
+	}
+	engine, err := cubecow.InitWithoutLoggingFromJSON(string(payload))
+	return engine, "inline storage.cow s3 handle", err
+}
+
+// s3lvolConfigured reports whether the operator opted into CubeS3lvol by
+// setting [cow.s3] enable = true. socket_path only names the RPC socket;
+// a default path in config.toml is not an opt-in.
+func (c *Config) s3lvolConfigured() bool {
+	return c != nil && c.Cow.S3.Enable
+}
+
+func (c *Config) s3BackendConfig() CowBackendConfig {
+	socket := defaultS3SocketPath
+	if c != nil && c.Cow.S3.SocketPath != nil && strings.TrimSpace(*c.Cow.S3.SocketPath) != "" {
+		socket = strings.TrimSpace(*c.Cow.S3.SocketPath)
+	}
+	stateDir := defaultS3AutoStateDir("")
+	if c != nil {
+		stateDir = defaultS3AutoStateDir(c.DataPath)
+		if c.Cow.S3.StateDir != nil && strings.TrimSpace(*c.Cow.S3.StateDir) != "" {
+			stateDir = strings.TrimSpace(*c.Cow.S3.StateDir)
+		}
+	}
+	out := CowBackendConfig{
+		Kind: cowBackendS3,
+		S3: CowS3BackendConfig{
+			SocketPath: &socket,
+			StateDir:   &stateDir,
+		},
+	}
+	if c != nil && c.Cow.S3.RPCTimeoutMS != nil {
+		out.S3.RPCTimeoutMS = c.Cow.S3.RPCTimeoutMS
+	}
+	if c != nil && c.Cow.S3.RPCConnectBudgetMS != nil {
+		out.S3.RPCConnectBudgetMS = c.Cow.S3.RPCConnectBudgetMS
+	}
+	if c != nil && c.Cow.S3.SizePolicy != nil && strings.TrimSpace(*c.Cow.S3.SizePolicy) != "" {
+		out.S3.SizePolicy = c.Cow.S3.SizePolicy
+	}
+	return out
+}
+
+const defaultS3SocketPath = "/var/run/s3lvol.sock"
+
+func defaultS3AutoStateDir(dataPath string) string {
+	work := stripStoragePluginDataDir(filepath.Clean(dataPath))
+	if work == "" || work == "." {
+		work = filepath.Join(constants.CubeConfigBasePath, "storage")
+	}
+	return filepath.Join(work, cow.BackendS3)
 }
 
 func (c CowLogConfig) toMap() map[string]any {
@@ -235,6 +352,19 @@ func (c CowBackendConfig) toMap() map[string]any {
 	if sub := c.Reflink.toMap(); len(sub) > 0 {
 		m["reflink"] = sub
 	}
+	if sub := c.S3.toMap(); len(sub) > 0 {
+		m["s3"] = sub
+	}
+	return m
+}
+
+func (c CowS3BackendConfig) toMap() map[string]any {
+	m := map[string]any{}
+	setIfNotNil(m, "socket_path", c.SocketPath)
+	setIfNotNil(m, "state_dir", c.StateDir)
+	setIfNotNil(m, "rpc_timeout_ms", c.RPCTimeoutMS)
+	setIfNotNil(m, "rpc_connect_budget_ms", c.RPCConnectBudgetMS)
+	setIfNotNil(m, "size_policy", c.SizePolicy)
 	return m
 }
 
@@ -274,6 +404,9 @@ func init() {
 			if localStorage.config.PoolType == "" {
 				localStorage.config.PoolType = cp_type
 			}
+			if localStorage.config.VolumePluginBaseDir == "" {
+				localStorage.config.VolumePluginBaseDir = defaultVolumePluginBaseDir
+			}
 			if localStorage.config.CmdTimeout == 0 {
 				localStorage.config.CmdTimeout = tomlext.FromStdTime(defaultCmdTimeout)
 			}
@@ -296,7 +429,7 @@ func init() {
 					return nil, err
 				}
 				localStorage.cowEngine = eng
-				CubeLog.Infof("cubecow engine initialized from %s", initSource)
+				CubeLog.Infof("cubecow xfs handle initialized from %s", initSource)
 			}
 
 			cubeboxAPIObj, err := ic.GetByID(constants.CubeStorePlugin, constants.CubeboxID.ID())
@@ -307,12 +440,28 @@ func init() {
 			CubeLog.Debugf("%v init config:%+v",
 				fmt.Sprintf("%v.%v", constants.InternalPlugin, constants.StorageID), localStorage.config)
 
+			// Register catalog roots before storage init: init starts the S3
+			// retry loop, whose metadata step enumerates local packages and
+			// would silently find none with the roots still unset.
+			SetSnapshotCatalogRootsFor(cow.BackendXFS, catalogKindRoots(cow.BackendXFS)...)
+			SetSnapshotCatalogRootsFor(cow.BackendS3, catalogKindRoots(cow.BackendS3)...)
+
 			if err := localStorage.init(ic); err != nil {
 				CubeLog.Errorf("plugin %s init fail:%v", constants.StorageID, err)
 				return nil, err
 			}
 
-			SetSnapshotCatalogRoots(constants.DefaultSnapshotDir)
+			// initialise external volume plugins declared in TOML
+			if err := initVolumePlugins(ic.Context, localStorage.config); err != nil {
+				CubeLog.Errorf("volume plugin init fail: %v", err)
+				return nil, err
+			}
+
+			// S3 cubecow + metadata base: only when [cow.s3] enable is
+			// true. Background retry so cubelet does not depend on s3lvol
+			// being up at startup; S3 requests fail with ErrS3NotReady
+			// until the loop succeeds.
+			localStorage.startS3CowInitLoop(ic.Context)
 
 			return localStorage, nil
 		},
@@ -337,4 +486,108 @@ func checkPoolType(c *Config) {
 			return
 		}
 	}
+}
+
+// collectLiveSandboxIDs reads all StorageInfo entries from the local DB and
+// returns the set of sandbox IDs that are currently persisted.
+// collectLiveSandboxIDs returns the set of sandbox IDs that are currently
+// alive according to the in-memory cubebox store.  This is authoritative:
+// if a sandbox has been destroyed, its entry is gone from the store even if
+// a stale StorageInfo record remains in the DB.
+//
+// Falls back to reading all StorageInfo entries from the DB if cubeboxAPI
+// is not available (e.g. during early init).
+func collectLiveSandboxIDs() (map[string]struct{}, error) {
+	if api := localStorage.cubeboxAPI; api != nil {
+		boxes := api.List()
+		live := make(map[string]struct{}, len(boxes))
+		for _, b := range boxes {
+			if b != nil {
+				live[b.SandboxID] = struct{}{}
+			}
+		}
+		return live, nil
+	}
+	// Fallback: use storage DB (may include stale entries from failed destroys).
+	all, err := localStorage.readAllFileInfo()
+	if err != nil {
+		return nil, fmt.Errorf("readAllFileInfo: %w", err)
+	}
+	live := make(map[string]struct{}, len(all))
+	for k := range all {
+		if k == stubKeyName {
+			continue
+		}
+		live[k] = struct{}{}
+	}
+	return live, nil
+}
+
+// initVolumePlugins registers binary and RPC plugins declared in TOML config,
+// attaches the persistent RefCountStore from localStorage to the global Manager,
+// runs a recovery pass to reconcile ref-counts against live sandboxes, and
+// then calls InitAll so every registered plugin receives its PluginConfig.
+func initVolumePlugins(ctx context.Context, cfg *Config) error {
+	mgr := volpkg.Global()
+	cfgByName := make(map[string]volpkg.PluginConfig, len(cfg.VolumePlugins))
+	seen := make(map[string]volpkg.PluginType, len(cfg.VolumePlugins))
+
+	for _, pc := range cfg.VolumePlugins {
+		if pc.Name == "" {
+			return fmt.Errorf("volume_plugins entry has empty name")
+		}
+		if prev, dup := seen[pc.Name]; dup {
+			return fmt.Errorf(
+				"volume plugin %q: duplicate driver name (already declared as type %q); "+
+					"each plugin must have a unique name because the SDK selects plugins by driver only",
+				pc.Name, prev,
+			)
+		}
+		seen[pc.Name] = pc.Type
+		cfgByName[pc.Name] = pc
+
+		if pc.Type == volpkg.PluginTypeBuiltin {
+			continue
+		}
+		switch pc.Type {
+		case volpkg.PluginTypeBinary:
+			mgr.Register(volbinary.New(pc.Name))
+		case volpkg.PluginTypeRPC:
+			mgr.Register(volrpc.New(pc.Name))
+		default:
+			return fmt.Errorf("volume plugin %q: unknown type %q (want builtin|binary|rpc)", pc.Name, pc.Type)
+		}
+	}
+
+	if localStorage.rcStore != nil {
+		mgr.SetRefCountStore(localStorage.rcStore)
+
+		liveIDs, err := collectLiveSandboxIDs()
+		if err != nil {
+			CubeLog.Warnf("[plugin_volume] refcount recovery: collect live sandboxes: %v", err)
+		} else {
+			res, err := localStorage.rcStore.RecoverRefCounts(liveIDs)
+			if err != nil {
+				CubeLog.Warnf("[plugin_volume] refcount recovery: %v", err)
+			} else {
+				CubeLog.Infof("[plugin_volume] refcount recovery: scanned=%d stale_removed=%d records_deleted=%d",
+					res.RecordsScanned, res.StaleRefsRemoved, res.RecordsDeleted)
+			}
+		}
+	}
+
+	if err := mgr.InitAll(ctx, cfgByName); err != nil {
+		return err
+	}
+	for _, pc := range cfg.VolumePlugins {
+		switch pc.Type {
+		case volpkg.PluginTypeBuiltin:
+			continue
+		case volpkg.PluginTypeBinary:
+			CubeLog.Infof("[plugin_volume] initialized binary plugin %q at %s", pc.Name, pc.BinaryPath)
+		case volpkg.PluginTypeRPC:
+			CubeLog.Infof("[plugin_volume] initialized rpc plugin %q at %s", pc.Name, pc.SocketPath)
+		}
+	}
+	return nil
 }

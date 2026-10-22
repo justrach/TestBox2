@@ -1,4 +1,9 @@
-FROM cube-sandbox-image.tencentcloudcr.com/opensource/openresty:1.21.4.1-6-alpine-fat
+# Base image is overridable at build time (e.g. to point at a private registry
+# mirror or a pinned @sha256 digest). CubeProxy/Makefile and the release
+# workflow pass CUBE_PROXY_BASE_IMAGE; the default below keeps
+# `docker build CubeProxy/` working standalone.
+ARG CUBE_PROXY_BASE_IMAGE=cube-sandbox-image.tencentcloudcr.com/opensource/openresty:1.21.4.1-6-alpine-fat
+FROM ${CUBE_PROXY_BASE_IMAGE}
 
 LABEL maintainer="staryxchen <staryxchen@tencent.com>"
 
@@ -11,12 +16,13 @@ RUN sed -i 's#https\?://dl-cdn.alpinelinux.org#http://mirrors.tencent.com#g' /et
 
 WORKDIR /usr/local/openresty/nginx/
 COPY lua/ /usr/local/openresty/nginx/lua/
+COPY conf/includes/ /usr/local/openresty/nginx/conf/includes/
 COPY nginx.conf /usr/local/openresty/nginx/conf/nginx.conf
 COPY rotate_nginx_log.sh /usr/local/openresty/nginx/sbin/rotate_nginx_log.sh
 COPY root /etc/crontabs/root
 COPY start.sh /usr/local/openresty/nginx/sbin/start.sh
 
-EXPOSE 8080 8081
+EXPOSE 8080 8081 9090
 
 STOPSIGNAL SIGQUIT
 

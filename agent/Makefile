@@ -20,10 +20,11 @@ UID = $(shell id -u)
 GID = $(shell id -g)
 PWD = $(shell pwd)
 
-VERSION := $(shell git describe --abbrev=0 --tags 2>/dev/null || echo "0.0.0")
-COMMIT_NO := $(shell git rev-parse HEAD 2>/dev/null || true)
-COMMIT := $(if $(shell git status --porcelain --untracked-files=no 2>/dev/null || true),${COMMIT_NO}-dirty,${COMMIT_NO})
+VERSION := $(if $(strip $(CUBE_VERSION)),$(CUBE_VERSION),$(shell git describe --abbrev=0 --tags --match 'v*' 2>/dev/null || echo "0.0.0-dev"))
+COMMIT_NO := $(if $(strip $(CUBE_COMMIT)),$(CUBE_COMMIT),$(shell git rev-parse HEAD 2>/dev/null || true))
+COMMIT := $(if $(strip $(CUBE_COMMIT)),$(CUBE_COMMIT),$(if $(shell git status --porcelain --untracked-files=no 2>/dev/null || true),${COMMIT_NO}-dirty,${COMMIT_NO}))
 COMMIT_MSG = $(if $(COMMIT),$(COMMIT),unknown)
+BUILD_TIME := $(if $(strip $(CUBE_BUILD_TIME)),$(CUBE_BUILD_TIME),$(shell date -u +'%Y-%m-%dT%H:%M:%SZ'))
 
 export VERSION_COMMIT := $(if $(COMMIT),$(COMMIT),$(VERSION))
 
@@ -48,26 +49,51 @@ endif
 ##VAR BUILD_TYPE=release|debug type of rust build
 BUILD_TYPE = release
 
-##VAR MUSL=yes|no build a fully static x86_64-unknown-linux-musl binary
+##VAR MUSL=yes|no build a fully static native musl binary
 MUSL := yes
+HOST_ARCH := $(shell uname -m | sed 's/^arm64$$/aarch64/')
 
 EXTRA_RUSTFLAGS :=
 CARGO_TARGET_FLAG :=
 
 ifeq ($(MUSL),yes)
-    TRIPLE = x86_64-unknown-linux-musl
+    TRIPLE ?= $(HOST_ARCH)-unknown-linux-musl
     CARGO_TARGET_FLAG := --target $(TRIPLE)
     # +crt-static: statically link libc/crt
     # -lpthread: required by libunwind in musl builds (pthread_rwlock_*)
-    override EXTRA_RUSTFLAGS += -C target-feature=+crt-static -C link-arg=-lpthread
-    # Static libseccomp: container image puts it at /usr/local/lib64/libseccomp/lib,
-    # fall back to pkg-config / common system paths for local builds
-    export LIBSECCOMP_LINK_TYPE := static
-    export LIBSECCOMP_LIB_PATH := $(or \
+    # -lm: keeps libseccomp/libm references (for example pow) resolved by musl libm
+    override EXTRA_RUSTFLAGS += -C target-feature=+crt-static -C relocation-model=static -C link-arg=-static -C link-arg=-lpthread -C link-arg=-lm
+    # Keep cargo on the musl linker even when the host default cc points at glibc.
+    ifeq ($(TRIPLE),x86_64-unknown-linux-musl)
+        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER ?= musl-gcc
+    endif
+    ifeq ($(TRIPLE),aarch64-unknown-linux-musl)
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER ?= musl-gcc
+    endif
+    # Static libseccomp must be built with musl as well. Do not fall back to
+    # pkg-config or /usr/lib/*-linux-gnu here: those paths often resolve to
+    # glibc archives, producing a binary that fails as PID 1 in the guest.
+    MUSL_LIBSECCOMP_LIB_PATH := $(or \
+        $(LIBSECCOMP_LIB_PATH), \
         $(shell test -f /usr/local/lib64/libseccomp/lib/libseccomp.a && echo /usr/local/lib64/libseccomp/lib), \
-        $(shell pkg-config --variable=libdir libseccomp 2>/dev/null), \
-        $(shell find /usr/lib64 /usr/lib /usr/local/lib64 /usr/local/lib -name "libseccomp.a" -exec dirname {} \; 2>/dev/null | head -1), \
-        /usr/lib64)
+        $(shell test -f /usr/lib/$(HOST_ARCH)-linux-musl/libseccomp.a && echo /usr/lib/$(HOST_ARCH)-linux-musl), \
+        $(shell test -f /usr/lib/$(TRIPLE)/libseccomp.a && echo /usr/lib/$(TRIPLE)))
+    ifeq ($(SECCOMP),yes)
+        ifeq ($(strip $(MUSL_LIBSECCOMP_LIB_PATH)),)
+            $(error MUSL=yes SECCOMP=yes requires a musl-built static libseccomp.a. Run 'make builder-image && make agent', or set LIBSECCOMP_LIB_PATH=/path/to/musl/libseccomp/lib)
+        endif
+        ifneq ($(findstring linux-gnu,$(MUSL_LIBSECCOMP_LIB_PATH)),)
+            $(error LIBSECCOMP_LIB_PATH=$(MUSL_LIBSECCOMP_LIB_PATH) looks like a glibc libdir. Use the builder image or a musl-built static libseccomp.a)
+        endif
+        ifneq ($(filter /usr/lib /usr/lib64,$(MUSL_LIBSECCOMP_LIB_PATH)),)
+            $(error LIBSECCOMP_LIB_PATH=$(MUSL_LIBSECCOMP_LIB_PATH) is too broad for a musl static build. Point it at a musl-specific libseccomp directory)
+        endif
+        ifeq ($(wildcard $(MUSL_LIBSECCOMP_LIB_PATH)/libseccomp.a),)
+            $(error LIBSECCOMP_LIB_PATH=$(MUSL_LIBSECCOMP_LIB_PATH) does not contain libseccomp.a)
+        endif
+        export LIBSECCOMP_LINK_TYPE := static
+        export LIBSECCOMP_LIB_PATH := $(MUSL_LIBSECCOMP_LIB_PATH)
+    endif
 endif
 
 CWD := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -88,7 +114,7 @@ AGENT_NAME = $(TARGET)
 API_VERSION = 0.0.1
 AGENT_VERSION = $(VERSION)
 
-GENERATED_REPLACEMENTS = AGENT_NAME AGENT_VERSION API_VERSION BINDIR COMMIT VERSION_COMMIT
+GENERATED_REPLACEMENTS = AGENT_NAME AGENT_VERSION API_VERSION BINDIR COMMIT VERSION_COMMIT BUILD_TIME
 GENERATED_FILES = $(GENERATED_CODE)
 
 define get_command_version
@@ -112,7 +138,7 @@ logging-crate-tests:
 $(TARGET_PATH): show-summary
 	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build $(if $(findstring release,$(BUILD_TYPE)),--release) $(CARGO_TARGET_FLAG) $(EXTRA_RUSTFEATURES)
 
-$(GENERATED_FILES): %: %.in
+$(GENERATED_FILES): %: %.in FORCE
 	@sed $(foreach r,$(GENERATED_REPLACEMENTS),-e 's|@$r@|$($r)|g') "$<" > "$@"
 
 ##TARGET optimize: optimized build
@@ -129,8 +155,13 @@ clean:
 	@rm -f $(GENERATED_FILES)
 
 ##TARGET test: run tests
-test:
+test: $(GENERATED_FILES)
 	@cargo test --all $(EXTRA_RUSTFEATURES) -- --nocapture
+
+##TARGET fmt: format code
+fmt: $(GENERATED_FILES)
+	@if [ ! -f libs/protocols/src/agent.rs ]; then cargo check -p protocols; fi
+	cargo fmt
 
 ##TARGET check: run lint/fmt check
 check: $(GENERATED_FILES)
@@ -175,6 +206,8 @@ generate-protocols:
 	clean \
 	default \
 	docker \
+	fmt \
+	FORCE \
 	generate-protocols \
 	help \
 	install \

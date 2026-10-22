@@ -6,26 +6,36 @@ package cube
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/pausesnap"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/restoreplace"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 var (
 	resolveSnapshotReadyNodeScopeFn = templatecenter.ResolveSnapshotReadyNodeScope
 	resolveSnapshotReadyReplicaFn   = templatecenter.ResolveSnapshotReadyReplica
 	resolveTemplateReadyReplicaFn   = templatecenter.ResolveTemplateReadyReplica
+	getSnapshotRestoreSourceFn      = templatecenter.GetSnapshotRestoreSource
+	decideRestorePlacementFn        = restoreplace.Decide
+	ensureSnapshotReadyForNewUseFn  = templatecenter.EnsureSnapshotReadyForNewUse
 )
 
 func getCubeboxReqTemplate() (*types.CreateCubeSandboxReq, error) {
@@ -73,7 +83,7 @@ func dealCubeboxReqTemplateByLocalConfig(ctx context.Context, reqInOut *types.Cr
 	}
 
 	applyTemplateAnnotationsAndLabels(templateReq, reqInOut)
-	reqInOut.CubeVSContext = mergeCubeVSContexts(templateReq.CubeVSContext, reqInOut.CubeVSContext)
+	reqInOut.CubeNetworkConfig = mergeCubeNetworkConfigs(templateReq.CubeNetworkConfig, reqInOut.CubeNetworkConfig)
 
 	if templateReq.NetworkType != "" {
 		reqInOut.NetworkType = templateReq.NetworkType
@@ -254,41 +264,92 @@ func applyTemplateAnnotationsAndLabels(reqIn *types.CreateCubeSandboxReq, reqOut
 		}
 		maps.Copy(reqOut.Labels, reqIn.Labels)
 	}
+	if v := strings.TrimSpace(reqOut.Annotations[constants.CubeAnnotationComponentEnvdVersion]); v != "" {
+		if reqOut.Labels == nil {
+			reqOut.Labels = make(map[string]string)
+		}
+		reqOut.Labels[constants.CubeAnnotationComponentEnvdVersion] = v
+	}
 }
 
-func mergeCubeVSContexts(templateCtx *types.CubeVSContext, requestCtx *types.CubeVSContext) *types.CubeVSContext {
+func mergeCubeNetworkConfigs(templateCfg *types.CubeNetworkConfig, requestCfg *types.CubeNetworkConfig) *types.CubeNetworkConfig {
 	switch {
-	case templateCtx == nil:
-		return cloneCubeVSContext(requestCtx)
-	case requestCtx == nil:
-		return cloneCubeVSContext(templateCtx)
+	case templateCfg == nil:
+		return cloneCubeNetworkConfig(requestCfg)
+	case requestCfg == nil:
+		return cloneCubeNetworkConfig(templateCfg)
 	}
 
-	out := cloneCubeVSContext(templateCtx)
-	if requestCtx.AllowInternetAccess != nil {
-		allowInternetAccess := *requestCtx.AllowInternetAccess
+	out := cloneCubeNetworkConfig(templateCfg)
+	if requestCfg.AllowInternetAccess != nil {
+		allowInternetAccess := *requestCfg.AllowInternetAccess
 		out.AllowInternetAccess = &allowInternetAccess
 	}
-	if len(requestCtx.AllowOut) > 0 {
-		out.AllowOut = appendUniqueCIDRs(out.AllowOut, requestCtx.AllowOut)
+	// AllowPublicTraffic: per-create override wins over the template. Templates
+	// rarely set this; the request side carries the user's explicit decision
+	// (e2b SDK shape: network.allowPublicTraffic). Without this the request's
+	// false would silently fall back to the template's (usually nil) value and
+	// CubeProxy would never enforce the gate.
+	if requestCfg.AllowPublicTraffic != nil {
+		allowPublicTraffic := *requestCfg.AllowPublicTraffic
+		out.AllowPublicTraffic = &allowPublicTraffic
 	}
-	if len(requestCtx.DenyOut) > 0 {
-		out.DenyOut = appendUniqueCIDRs(out.DenyOut, requestCtx.DenyOut)
+	if requestCfg.MaskRequestHost != nil {
+		maskRequestHost := *requestCfg.MaskRequestHost
+		out.MaskRequestHost = &maskRequestHost
+	}
+	if len(requestCfg.AllowOut) > 0 {
+		out.AllowOut = appendUniqueCIDRs(out.AllowOut, requestCfg.AllowOut)
+	}
+	if len(requestCfg.DenyOut) > 0 {
+		out.DenyOut = appendUniqueCIDRs(out.DenyOut, requestCfg.DenyOut)
+	}
+	if len(requestCfg.Rules) > 0 {
+		out.Rules = mergeEgressRules(templateCfg.Rules, requestCfg.Rules)
+	} else {
+		out.Rules = cloneEgressRules(templateCfg.Rules)
 	}
 	return out
 }
 
-func cloneCubeVSContext(in *types.CubeVSContext) *types.CubeVSContext {
-	if in == nil {
+func cloneCubeNetworkConfig(in *types.CubeNetworkConfig) *types.CubeNetworkConfig {
+	return in.DeepCopy()
+}
+
+// mergeEgressRules combines template + request rules. Because egress rules are
+// first-match-wins, per-sandbox/request rules must come before template rules.
+func mergeEgressRules(base []*types.EgressRule, extra []*types.EgressRule) []*types.EgressRule {
+	if len(extra) == 0 {
+		return cloneEgressRules(base)
+	}
+	if len(base) == 0 {
+		return cloneEgressRules(extra)
+	}
+
+	out := make([]*types.EgressRule, 0, len(extra)+len(base))
+	for _, r := range extra {
+		if r == nil {
+			continue
+		}
+		out = append(out, r.DeepCopy())
+	}
+
+	for _, r := range base {
+		if r == nil {
+			continue
+		}
+		out = append(out, r.DeepCopy())
+	}
+	return out
+}
+
+func cloneEgressRules(in []*types.EgressRule) []*types.EgressRule {
+	if len(in) == 0 {
 		return nil
 	}
-	out := &types.CubeVSContext{
-		AllowOut: append([]string(nil), in.AllowOut...),
-		DenyOut:  append([]string(nil), in.DenyOut...),
-	}
-	if in.AllowInternetAccess != nil {
-		allowInternetAccess := *in.AllowInternetAccess
-		out.AllowInternetAccess = &allowInternetAccess
+	out := make([]*types.EgressRule, 0, len(in))
+	for _, r := range in {
+		out = append(out, r.DeepCopy())
 	}
 	return out
 }
@@ -336,6 +397,18 @@ func dealCubeboxCreateReqWithTemplate(ctx context.Context, reqInOut *types.Creat
 	}
 
 	if constants.GetAppSnapshotVersion(reqInOut.Annotations) == templatecenter.DefaultTemplateVersion {
+		// Alias resolution: only on the template-center / v2 path. Resolving
+		// before the version split would break non-v2 requests that carry a
+		// non-prefixed legacy identifier — they'd hit the DB for alias lookup,
+		// fail, and never reach dealCubeboxReqTemplateByLocalConfig.
+		if hasTemplateID && templateID != "" {
+			if resolved, err := templatecenter.ResolveTemplateIdentifier(ctx, templateID); err != nil {
+				return fmt.Errorf("failed to resolve template identifier %q: %w", templateID, err)
+			} else if resolved != "" && resolved != templateID {
+				templateID = resolved
+				reqInOut.Annotations[constants.CubeAnnotationAppSnapshotTemplateID] = templateID
+			}
+		}
 		return dealCubeboxCreateReqWithTemplateCenter(ctx, templateID, reqInOut)
 	}
 
@@ -381,16 +454,25 @@ func dealCubeboxCreateReqWithTemplateCenter(ctx context.Context, templateID stri
 	}
 	constants.NormalizeAppSnapshotAnnotations(templateReq.Annotations)
 	stageStart = time.Now()
-	err = templatecenter.EnsureTemplateLocalityReady(ctx, templateID, reqInOut.InstanceType)
-	templatecenter.ReportResolveStageMetric(ctx, constants.ActionTemplateResolveLocality, time.Since(stageStart))
-	if err != nil {
-		return fmt.Errorf("template %s is not ready on any healthy node: %w", templateID, err)
+	if !skipTemplateLocalityReady(ctx, templateID) {
+		err = templatecenter.EnsureTemplateLocalityReady(ctx, templateID, reqInOut.InstanceType)
+		templatecenter.ReportResolveStageMetric(ctx, constants.ActionTemplateResolveLocality, time.Since(stageStart))
+		if err != nil {
+			return fmt.Errorf("template %s is not ready on any healthy node: %w", templateID, err)
+		}
+	} else {
+		templatecenter.ReportResolveStageMetric(ctx, constants.ActionTemplateResolveLocality, time.Since(stageStart))
 	}
 	stageStart = time.Now()
 	templateKind, err := templatecenter.GetTemplateKind(ctx, templateID)
 	templatecenter.ReportResolveStageMetric(ctx, constants.ActionTemplateResolveKind, time.Since(stageStart))
 	if err != nil {
 		return fmt.Errorf("failed to resolve template kind: %w", err)
+	}
+	// Pause-produced snaps (Kind=pause_snapshot) are internal Resume artifacts:
+	// invisible on Snapshot List/Info and not usable to create a new sandbox.
+	if strings.EqualFold(strings.TrimSpace(templateKind), pausesnap.KindPauseSnapshot) {
+		return fmt.Errorf("%w: %s", templatecenter.ErrSnapshotNotFound, templateID)
 	}
 	if resolved := templateResolveResultFromContext(ctx); resolved != nil {
 		resolved.TemplateID = templateID
@@ -401,7 +483,11 @@ func dealCubeboxCreateReqWithTemplateCenter(ctx context.Context, templateID stri
 		templatecenter.ReportResolveStageMetric(ctx, constants.ActionTemplateResolveBind, time.Since(bindStart))
 	}()
 	if strings.EqualFold(templateKind, templatecenter.TemplateKindSnapshot) {
-		if err := bindSnapshotCreateReplica(ctx, templateID, reqInOut); err != nil {
+		if err := reconcileSnapshotPluginVolumes(templateID, reqInOut, templateReq); err != nil {
+			return err
+		}
+		pinToOrigin := snapshotRestoreHasRawHostMount(reqInOut, templateReq)
+		if err := bindSnapshotCreateReplicaWithHostMount(ctx, templateID, reqInOut, pinToOrigin); err != nil {
 			return err
 		}
 	}
@@ -412,12 +498,15 @@ func dealCubeboxCreateReqWithTemplateCenter(ctx context.Context, templateID stri
 	}
 
 	applyTemplateAnnotationsAndLabels(templateReq, reqInOut)
+	if err := templatecenter.InheritCreateBackendFromTemplate(reqInOut, templateReq); err != nil {
+		return err
+	}
 	if !strings.EqualFold(templateKind, templatecenter.TemplateKindSnapshot) {
 		if err := bindAppSnapshotTemplateReplica(ctx, templateID, reqInOut); err != nil {
 			return err
 		}
 	}
-	reqInOut.CubeVSContext = mergeCubeVSContexts(templateReq.CubeVSContext, reqInOut.CubeVSContext)
+	reqInOut.CubeNetworkConfig = mergeCubeNetworkConfigs(templateReq.CubeNetworkConfig, reqInOut.CubeNetworkConfig)
 
 	reqInOut.Volumes = append(reqInOut.Volumes, templateReq.Volumes...)
 
@@ -431,7 +520,6 @@ func dealCubeboxCreateReqWithTemplateCenter(ctx context.Context, templateID stri
 			return err
 		}
 	}
-
 	if templateReq.NetworkType != "" {
 		reqInOut.NetworkType = templateReq.NetworkType
 	}
@@ -453,6 +541,101 @@ func dealCubeboxCreateReqWithTemplateCenter(ctx context.Context, templateID stri
 		log.G(ctx).Infof("dealCubeboxCreateReqWithTemplateCenter success:template=%s %s", templateID, summarizeTemplateRequest(reqInOut))
 	}
 	return nil
+}
+
+type snapshotPluginVolumeMount struct {
+	Name          string `json:"name"`
+	ContainerPath string `json:"container_path"`
+	Readonly      bool   `json:"readonly,omitempty"`
+}
+
+// reconcileSnapshotPluginVolumes lets E2B clients re-send the volumeMounts a
+// snapshot already carries. The snapshot's memory image has the mounts baked
+// in, so the request must match them exactly; identical declarations are
+// dropped from the request so each volume is declared once after the
+// template merge, and any difference is rejected instead of silently ignored.
+func reconcileSnapshotPluginVolumes(snapshotID string, req, templateReq *types.CreateCubeSandboxReq) error {
+	if req == nil || templateReq == nil {
+		return nil
+	}
+	snapshotMounts, err := parseSnapshotPluginVolumeMounts(templateReq.Annotations[sandbox.AnnotationPluginVolumeMounts])
+	if err != nil {
+		return fmt.Errorf("snapshot %s: parse stored plugin-volume-mounts: %w", snapshotID, err)
+	}
+	if len(snapshotMounts) == 0 {
+		return nil
+	}
+	requestMounts, err := parseSnapshotPluginVolumeMounts(req.Annotations[sandbox.AnnotationPluginVolumeMounts])
+	if err != nil {
+		return fmt.Errorf("parse plugin-volume-mounts: %w", err)
+	}
+	if len(requestMounts) == 0 {
+		return nil
+	}
+	if !maps.Equal(snapshotMounts, requestMounts) {
+		return fmt.Errorf("snapshot %s: volumeMounts must match the snapshot's volume mounts when restoring (snapshot=%s, request=%s)",
+			snapshotID, describeSnapshotPluginVolumeMounts(snapshotMounts), describeSnapshotPluginVolumeMounts(requestMounts))
+	}
+	kept := req.Volumes[:0]
+	for _, volume := range req.Volumes {
+		if volume != nil {
+			if _, ok := snapshotMounts[strings.TrimSpace(volume.Name)]; ok {
+				continue
+			}
+		}
+		kept = append(kept, volume)
+	}
+	req.Volumes = kept
+	delete(req.Annotations, sandbox.AnnotationPluginVolumeMounts)
+	return nil
+}
+
+func parseSnapshotPluginVolumeMounts(raw string) (map[string]snapshotPluginVolumeMount, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var entries []snapshotPluginVolumeMount
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return nil, err
+	}
+	out := make(map[string]snapshotPluginVolumeMount, len(entries))
+	for _, entry := range entries {
+		entry.Name = strings.TrimSpace(entry.Name)
+		entry.ContainerPath = filepath.Clean(entry.ContainerPath)
+		if _, ok := out[entry.Name]; ok {
+			return nil, fmt.Errorf("volume %q is duplicated", entry.Name)
+		}
+		out[entry.Name] = entry
+	}
+	return out, nil
+}
+
+func describeSnapshotPluginVolumeMounts(mounts map[string]snapshotPluginVolumeMount) string {
+	names := slices.Sorted(maps.Keys(mounts))
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		m := mounts[name]
+		part := name + ":" + m.ContainerPath
+		if m.Readonly {
+			part += ":ro"
+		}
+		parts = append(parts, part)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+func snapshotRestoreHasRawHostMount(req, templateReq *types.CreateCubeSandboxReq) bool {
+	return sandbox.CreateRequestHasHostMount(req) ||
+		sandbox.CreateRequestHasHostMount(templateReq)
+}
+
+func skipTemplateLocalityReady(ctx context.Context, templateID string) bool {
+	src, err := getSnapshotRestoreSourceFn(ctx, templateID)
+	if err != nil || src == nil {
+		return false
+	}
+	return restoreplace.CanCrossNode(src.Backend, src.RemoteStatus)
 }
 
 func constrainSnapshotCreateScope(ctx context.Context, snapshotID string, reqInOut *types.CreateCubeSandboxReq) error {
@@ -495,6 +678,143 @@ func constrainSnapshotCreateScope(ctx context.Context, snapshotID string, reqInO
 // keys are explicitly deleted so any stale value supplied by the caller
 // cannot reach the cubelet.
 func bindSnapshotCreateReplica(ctx context.Context, snapshotID string, reqInOut *types.CreateCubeSandboxReq) error {
+	return bindSnapshotCreateReplicaWithHostMount(
+		ctx,
+		snapshotID,
+		reqInOut,
+		sandbox.CreateRequestHasHostMount(reqInOut),
+	)
+}
+
+func bindSnapshotCreateReplicaWithHostMount(ctx context.Context, snapshotID string, reqInOut *types.CreateCubeSandboxReq, pinToOrigin bool) error {
+	if err := ensureSnapshotReadyForNewUseFn(ctx, snapshotID); err != nil {
+		return err
+	}
+	if src, err := getSnapshotRestoreSourceFn(ctx, snapshotID); err == nil && src != nil {
+		return bindSnapshotCreateReplicaWithPlacement(ctx, snapshotID, reqInOut, src, pinToOrigin)
+	} else if err != nil && !errors.Is(err, templatecenter.ErrSnapshotNotFound) &&
+		!errors.Is(err, templatecenter.ErrTemplateStoreNotInitialized) {
+		return err
+	}
+	if pinToOrigin {
+		return fmt.Errorf("snapshot %s with host mount requires origin restore metadata", snapshotID)
+	}
+	return bindSnapshotCreateReplicaLocal(ctx, snapshotID, reqInOut)
+}
+
+// fromSnapshotPlacement pins FromSnap to the snapshot origin unless the
+// package is S3 remote-ready and may leave that node. XFS / not-ready S3
+// must not call Decide: after a Master restart the heartbeat cache is
+// empty and Decide would fail even though the snapshot row already has
+// OriginNodeIP.
+func fromSnapshotPlacement(ctx context.Context, snapshotID string, reqInOut *types.CreateCubeSandboxReq, src *templatecenter.RestoreSource, instanceType string, reqRes *selctx.RequestResource, pinToOrigin bool) (*restoreplace.Placement, error) {
+	if src == nil {
+		return nil, fmt.Errorf("snapshot %s: restore source is nil", snapshotID)
+	}
+	if !restoreplace.CanCrossNode(src.Backend, src.RemoteStatus) {
+		home := &restoreplace.Placement{
+			NodeID: strings.TrimSpace(src.OriginNodeID),
+			NodeIP: strings.TrimSpace(src.OriginNodeIP),
+		}
+		if home.NodeID == "" && home.NodeIP == "" {
+			return nil, fmt.Errorf("snapshot %s: origin node unknown and snapshot cannot restore cross-node", snapshotID)
+		}
+		return home, nil
+	}
+	requestedScope := []string(nil)
+	if reqInOut != nil {
+		requestedScope = append([]string(nil), reqInOut.DistributionScope...)
+	}
+	return decideRestorePlacementFn(ctx, restoreplace.Input{
+		SnapshotID:          src.SnapshotID,
+		Backend:             src.Backend,
+		RemoteStatus:        src.RemoteStatus,
+		OriginNodeID:        src.OriginNodeID,
+		OriginNodeIP:        src.OriginNodeIP,
+		OriginHostFactsJSON: src.OriginHostFactsJSON,
+		InstanceType:        instanceType,
+		ReqRes:              reqRes,
+		RequestedScope:      requestedScope,
+		PinToOrigin:         pinToOrigin,
+	})
+}
+
+func bindSnapshotCreateReplicaWithPlacement(ctx context.Context, snapshotID string, reqInOut *types.CreateCubeSandboxReq, src *templatecenter.RestoreSource, pinToOrigin bool) error {
+	var reqRes *selctx.RequestResource
+	if config.GetConfig() != nil {
+		if r, err := sandbox.RequestResources(reqInOut); err == nil {
+			reqRes = r
+		}
+	}
+	instanceType := strings.TrimSpace(reqInOut.InstanceType)
+	if instanceType == "" {
+		instanceType = src.InstanceType
+	}
+	placement, err := fromSnapshotPlacement(ctx, snapshotID, reqInOut, src, instanceType, reqRes, pinToOrigin)
+	if err != nil {
+		return err
+	}
+	if placement == nil || (strings.TrimSpace(placement.NodeID) == "" && strings.TrimSpace(placement.NodeIP) == "") {
+		return fmt.Errorf("snapshot %s: restore placement returned no node", snapshotID)
+	}
+
+	selectedNodeID := strings.TrimSpace(placement.NodeID)
+	if selectedNodeID == "" {
+		selectedNodeID = strings.TrimSpace(placement.NodeIP)
+	}
+	reqInOut.DistributionScope = []string{selectedNodeID}
+
+	if reqInOut.Annotations == nil {
+		reqInOut.Annotations = map[string]string{}
+	}
+	reqInOut.Annotations[constants.CubeAnnotationRuntimeSnapshotID] = strings.TrimSpace(snapshotID)
+	reqInOut.Annotations[constants.CubeAnnotationRuntimeSnapshotAttachedAt] = time.Now().UTC().Format(time.RFC3339Nano)
+	if b := strings.TrimSpace(src.Backend); b != "" {
+		reqInOut.Annotations[constants.CubeAnnotationStorageBackend] = b
+	}
+	if constants.IsS3Backend(src.Backend) {
+		if raw := strings.TrimSpace(src.ExportUUIDs); raw != "" {
+			reqInOut.Annotations[constants.CubeAnnotationSnapshotRemoteUUIDs] = raw
+		}
+	}
+
+	if placement.CrossNode {
+		reqInOut.Annotations[constants.CubeAnnotationSnapshotAllowNonLocal] = "true"
+		reqInOut.Annotations[constants.CubeAnnotationSnapshotCrossNode] = "true"
+		if resolved := templateResolveResultFromContext(ctx); resolved != nil {
+			resolved.ChosenReplica = templatecenter.ReplicaStatus{
+				NodeID:       placement.NodeID,
+				NodeIP:       placement.NodeIP,
+				InstanceType: instanceType,
+				Status:       templatecenter.ReplicaStatusReady,
+				Phase:        templatecenter.ReplicaPhaseReady,
+			}
+			resolved.HasChosenReplica = true
+		}
+		log.G(ctx).Infof("from-snapshot create: cross-node snapshot=%s origin=%s target=%s/%s",
+			snapshotID, src.OriginNodeID, placement.NodeID, placement.NodeIP)
+		return nil
+	}
+
+	replica, err := resolveSnapshotReadyReplicaFn(ctx, snapshotID, selectedNodeID)
+	if err != nil {
+		// Origin was chosen by placement; still stamp runtime annotations even
+		// if the replica cache is cold.
+		log.G(ctx).Warnf("from-snapshot create: origin replica lookup failed snapshot=%s node=%s: %v",
+			snapshotID, selectedNodeID, err)
+		return nil
+	}
+	if resolved := templateResolveResultFromContext(ctx); resolved != nil {
+		resolved.ChosenReplica = replica
+		resolved.HasChosenReplica = true
+	}
+	injectReplicaComponentVersionAnnotations(reqInOut.Annotations, replica)
+	return nil
+}
+
+// bindSnapshotCreateReplicaLocal is the origin-only pin used when the snapshot
+// row is unavailable (tests / pre-migration). It does not attempt cross-node.
+func bindSnapshotCreateReplicaLocal(ctx context.Context, snapshotID string, reqInOut *types.CreateCubeSandboxReq) error {
 	if err := constrainSnapshotCreateScope(ctx, snapshotID, reqInOut); err != nil {
 		return err
 	}
@@ -519,6 +839,7 @@ func bindSnapshotCreateReplica(ctx context.Context, snapshotID string, reqInOut 
 	}
 	reqInOut.Annotations[constants.CubeAnnotationRuntimeSnapshotID] = strings.TrimSpace(snapshotID)
 	reqInOut.Annotations[constants.CubeAnnotationRuntimeSnapshotAttachedAt] = time.Now().UTC().Format(time.RFC3339Nano)
+	injectReplicaComponentVersionAnnotations(reqInOut.Annotations, replica)
 	return nil
 }
 
@@ -530,13 +851,34 @@ func bindSnapshotCreateReplica(ctx context.Context, snapshotID string, reqInOut 
 // memory_vol/memory_kind annotation keys no longer exist as constants.
 func bindAppSnapshotTemplateReplica(ctx context.Context, templateID string, reqInOut *types.CreateCubeSandboxReq) error {
 	preferredNodeID := preferredDistributionNodeID(reqInOut)
-	if _, err := resolveTemplateReadyReplicaFn(ctx, templateID, preferredNodeID); err != nil {
+	replica, err := resolveTemplateReadyReplicaFn(ctx, templateID, preferredNodeID)
+	if err != nil {
 		return fmt.Errorf("template %s has no bindable ready replica: %w", templateID, err)
 	}
 	if reqInOut.Annotations == nil {
 		reqInOut.Annotations = map[string]string{}
 	}
+	injectReplicaComponentVersionAnnotations(reqInOut.Annotations, replica)
 	return nil
+}
+
+func injectReplicaComponentVersionAnnotations(annotations map[string]string, replica templatecenter.ReplicaStatus) {
+	if annotations == nil {
+		return
+	}
+	set := func(key, ver string) {
+		ver = strings.TrimSpace(ver)
+		if ver == "" {
+			return
+		}
+		if strings.TrimSpace(annotations[key]) == "" {
+			annotations[key] = ver
+		}
+	}
+	set(constants.CubeAnnotationComponentCubeImageVersion, replica.GuestImageVersion)
+	set(constants.CubeAnnotationComponentCubeAgentVersion, replica.AgentVersion)
+	set(constants.CubeAnnotationComponentCubeKernelVersion, replica.KernelVersion)
+	set(constants.CubeAnnotationComponentCubeShimVersion, replica.ShimVersion)
 }
 
 func preferredDistributionNodeID(req *types.CreateCubeSandboxReq) string {
@@ -551,7 +893,7 @@ func summarizeTemplateRequest(req *types.CreateCubeSandboxReq) string {
 		return "request=nil"
 	}
 	return fmt.Sprintf(
-		"containers=%d volumes=%d labels=%d annotations=%d network=%s runtime=%s namespace=%s cubevs_context=%s",
+		"containers=%d volumes=%d labels=%d annotations=%d network=%s runtime=%s namespace=%s cube_network_config=%s",
 		len(req.Containers),
 		len(req.Volumes),
 		len(req.Labels),
@@ -559,19 +901,19 @@ func summarizeTemplateRequest(req *types.CreateCubeSandboxReq) string {
 		req.NetworkType,
 		req.RuntimeHandler,
 		req.Namespace,
-		formatCubeVSContextSummary(req.CubeVSContext),
+		formatCubeNetworkConfigSummary(req.CubeNetworkConfig),
 	)
 }
 
-func formatCubeVSContextSummary(ctx *types.CubeVSContext) string {
-	if ctx == nil {
-		return "allow_internet_access=default(true) allow_out=[] deny_out=[]"
+func formatCubeNetworkConfigSummary(cfg *types.CubeNetworkConfig) string {
+	if cfg == nil {
+		return "allow_internet_access=default(true) allow_out=[] deny_out=[] rules=0"
 	}
 	allowInternetAccess := "default(true)"
-	if ctx.AllowInternetAccess != nil {
-		allowInternetAccess = fmt.Sprintf("%t", *ctx.AllowInternetAccess)
+	if cfg.AllowInternetAccess != nil {
+		allowInternetAccess = fmt.Sprintf("%t", *cfg.AllowInternetAccess)
 	}
-	return fmt.Sprintf("allow_internet_access=%s allow_out=%v deny_out=%v", allowInternetAccess, ctx.AllowOut, ctx.DenyOut)
+	return fmt.Sprintf("allow_internet_access=%s allow_out=%v deny_out=%v rules=%d", allowInternetAccess, cfg.AllowOut, cfg.DenyOut, len(cfg.Rules))
 }
 
 func dealVolumeTemplate(volumes []*types.Volume, templateVolumes []*types.Volume) {

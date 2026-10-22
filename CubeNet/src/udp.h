@@ -18,12 +18,15 @@ static __always_inline void update_udp_session(enum ip_conntrack_dir dir,
 	session_mark_replied(dir, sess, UDP_CT_UNREPLIED, UDP_CT_REPLIED);
 }
 
-static __always_inline bool create_udp_sessions(struct session_key *ekey,
+static __always_inline bool create_udp_sessions(struct __sk_buff *skb,
+						struct session_key *ekey,
 						__u64 now_ns, __u32 vm_ifindex,
-						struct snat_ip *snat_ip, __u16 snat_port)
+						struct snat_ip *snat_ip, __u16 snat_port,
+						__u32 policy_version)
 {
-	return create_nat_session(ekey, now_ns, vm_ifindex, snat_ip, snat_port,
-				  UDP_CT_UNREPLIED);
+	return create_nat_session(skb, ekey, now_ns, vm_ifindex, snat_ip, snat_port,
+				  UDP_CT_UNREPLIED, SNAT_PACKET, L7_SCHEME_NONE,
+				  policy_version);
 }
 
 #endif /* __UDP_H */

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -33,6 +34,12 @@ type Config struct {
 	APIURL         string
 	APIKey         string
 	ThemeName      string
+	HostMount      string // raw JSON array for config display and report export
+	NetworkPolicy  string // none | rules
+	networkFP      networkConfigFingerprint
+	hostMountValue string // compacted once for request-time reuse
+	requestBody    []byte
+	requestHeaders map[string]string
 	DryRun         bool
 	DryLatencyMean float64
 	DryLatencyStd  float64
@@ -40,6 +47,52 @@ type Config struct {
 	NoTUI          bool
 
 	elapsed float64
+}
+
+type createRequest struct {
+	TemplateID          string                `json:"templateID"`
+	AllowInternetAccess *bool                 `json:"allow_internet_access,omitempty"`
+	Network             *sandboxNetworkConfig `json:"network,omitempty"`
+	Metadata            map[string]string     `json:"metadata,omitempty"`
+}
+
+func prepareHostMount(rawJSON string) (string, error) {
+	if rawJSON == "" {
+		return "", nil
+	}
+
+	var mounts []json.RawMessage
+	if err := json.Unmarshal([]byte(rawJSON), &mounts); err != nil {
+		return "", fmt.Errorf("--host-mount must be a JSON array: %w", err)
+	}
+	if len(mounts) == 0 {
+		return "", fmt.Errorf("--host-mount must be a non-empty JSON array")
+	}
+
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, []byte(rawJSON)); err != nil {
+		return "", fmt.Errorf("--host-mount must be valid JSON: %w", err)
+	}
+	return compact.String(), nil
+}
+
+func buildCreateRequestBody(template string, hostMount string, networkPolicy string) ([]byte, error) {
+	reqBody := createRequest{TemplateID: template}
+	if hostMount != "" {
+		reqBody.Metadata = map[string]string{"host-mount": hostMount}
+	}
+	switch networkPolicy {
+	case "", networkPolicyNone:
+		// empty-network baseline (historical cube-bench behavior)
+	case networkPolicyRules:
+		denyAll := false
+		net := rulesNetworkConfig()
+		reqBody.AllowInternetAccess = &denyAll
+		reqBody.Network = &net
+	default:
+		return nil, fmt.Errorf("unsupported network policy %q", networkPolicy)
+	}
+	return json.Marshal(reqBody)
 }
 
 func parseConfig() *Config {
@@ -57,6 +110,9 @@ func parseConfig() *Config {
 	flag.StringVar(&cfg.Mode, "mode", "create-delete", "Benchmark mode: create-delete | create-only")
 	flag.StringVar(&cfg.Output, "o", "", "Export JSON report to file")
 	flag.StringVar(&cfg.Output, "output", "", "Export JSON report to file")
+	flag.StringVar(&cfg.HostMount, "host-mount", "", "Host mount list as a JSON array")
+	flag.StringVar(&cfg.NetworkPolicy, "network-policy", networkPolicyNone, "Network policy on create: none (no rules) | rules")
+	flag.StringVar(&cfg.NetworkPolicy, "np", networkPolicyNone, "Short for --network-policy")
 	flag.StringVar(&cfg.APIURL, "api-url", "", "CubeAPI base URL (overrides E2B_API_URL)")
 	flag.StringVar(&cfg.APIKey, "api-key", "", "API key (overrides E2B_API_KEY)")
 	flag.StringVar(&cfg.ThemeName, "theme", "auto", "Color theme: dark | light | auto")
@@ -71,6 +127,14 @@ func parseConfig() *Config {
 	flag.Parse()
 
 	cfg.NoTUI = noTUI || !term.IsTerminal(int(os.Stdout.Fd()))
+
+	policy, err := parseNetworkPolicy(cfg.NetworkPolicy)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	cfg.NetworkPolicy = policy
+	cfg.networkFP = networkFingerprint(policy)
 
 	cfg.DryLatencyMean = 80
 	cfg.DryLatencyStd = 30
@@ -112,6 +176,25 @@ func parseConfig() *Config {
 		cfg.Total = 1
 	}
 
+	// Validate host-mount early so the CLI fails fast on bad input while still
+	// preserving the original JSON for config display and exported reports.
+	// Cache the compacted JSON string once so benchmark throughput is not
+	// polluted by repeating client-side conversion on every request.
+	hostMountValue, err := prepareHostMount(cfg.HostMount)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	cfg.hostMountValue = hostMountValue
+	cfg.requestHeaders = map[string]string{"Authorization": "Bearer " + cfg.APIKey}
+
+	requestBody, err := buildCreateRequestBody(cfg.Template, cfg.hostMountValue, cfg.NetworkPolicy)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: create request body build failed: %v\n", err)
+		os.Exit(1)
+	}
+	cfg.requestBody = requestBody
+
 	return cfg
 }
 
@@ -131,10 +214,22 @@ func renderConfig(cfg *Config) {
 		{"Total Requests", fmt.Sprintf("%d", cfg.Total)},
 		{"Warmup Rounds", fmt.Sprintf("%d", cfg.Warmup)},
 		{"Mode", cfg.Mode},
-		{"Host", hostname},
-		{"Go", runtime.Version()},
-		{"Time", time.Now().UTC().Format("2006-01-02 15:04:05 UTC")},
+		{"Network Policy", cfg.networkFP.summary()},
 	}
+	if cfg.HostMount != "" {
+		// Pretty-print the original host-mount JSON for readability.
+		var pretty bytes.Buffer
+		if err := json.Indent(&pretty, []byte(cfg.HostMount), "    ", "  "); err == nil {
+			kvs = append(kvs, kvPair{"Host Mount", pretty.String()})
+		} else {
+			kvs = append(kvs, kvPair{"Host Mount", cfg.HostMount})
+		}
+	}
+	kvs = append(kvs,
+		kvPair{"Host", hostname},
+		kvPair{"Go", runtime.Version()},
+		kvPair{"Time", time.Now().UTC().Format("2006-01-02 15:04:05 UTC")},
+	)
 
 	var content strings.Builder
 	for _, kv := range kvs {
@@ -225,12 +320,17 @@ func exportJSON(results []IterResult, cfg *Config) {
 	report := map[string]interface{}{
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 		"config": map[string]interface{}{
-			"template":    cfg.Template,
-			"api_url":     cfg.APIURL,
-			"concurrency": cfg.Concurrency,
-			"total":       cfg.Total,
-			"warmup":      cfg.Warmup,
-			"mode":        cfg.Mode,
+			"template":             cfg.Template,
+			"api_url":              cfg.APIURL,
+			"concurrency":          cfg.Concurrency,
+			"total":                cfg.Total,
+			"warmup":               cfg.Warmup,
+			"mode":                 cfg.Mode,
+			"host_mount":           cfg.HostMount,
+			"network_policy":       cfg.networkFP.Policy,
+			"network_allow_out":    cfg.networkFP.AllowOut,
+			"network_rules":        cfg.networkFP.Rules,
+			"network_inject_rules": cfg.networkFP.InjectRules,
 		},
 		"summary": map[string]interface{}{
 			"total_time_s":   cfg.elapsed,
@@ -317,11 +417,13 @@ func main() {
 		renderDryRunBanner(cfg)
 	}
 
+	client := RunWarmup(cfg, os.Stdout)
+
 	resultCh := make(chan IterResult, cfg.Total)
 
 	startTime := time.Now()
 
-	go RunBenchmark(cfg, resultCh)
+	go RunBenchmark(cfg, resultCh, client)
 
 	var allResults []IterResult
 

@@ -5,24 +5,64 @@
 package cubebox
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	neturl "net/url"
+	"strconv"
 	"testing"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/network/proto"
+	networktypes "github.com/tencentcloud/CubeSandbox/Cubelet/network/types"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/telnet"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 	"k8s.io/utils/pointer"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+// pingAvailable reports whether ICMP ping works in this environment. Ping
+// needs CAP_NET_RAW or a permissive ping_group_range, which unprivileged
+// containers (e.g. the CI builder) usually lack.
+func pingAvailable() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ch := telnet.Telnet(ctx, &telnet.ProbeConfig{
+		Addr:             "127.0.0.1",
+		Timeout:          2 * time.Second,
+		Period:           100 * time.Millisecond,
+		SuccessThreshold: 1,
+		FailureThreshold: 3,
+		ProbeTimeout:     500 * time.Millisecond,
+		Action:           telnet.ActionPing,
+	})
+	return <-ch == nil
+}
+
+// requirePing skips ping-only tests when ping is unavailable.
+func requirePing(t *testing.T) {
+	t.Helper()
+	if !pingAvailable() {
+		t.Skip("ping not available in this environment")
+	}
+}
 
 func TestProbeErrIp(t *testing.T) {
 	cnt := &cubebox.ContainerConfig{
@@ -43,8 +83,8 @@ func TestProbeErrIp(t *testing.T) {
 		},
 	}
 	createInfo := &workflow.CreateContext{
-		NetworkInfo: &proto.ShimNetReq{
-			Interfaces: []*proto.Interface{
+		NetworkInfo: &networktypes.ShimNetReq{
+			Interfaces: []*networktypes.Interface{
 				{
 					IPAddr: net.ParseIP("invalid"),
 				},
@@ -85,8 +125,8 @@ func TestProbeErrTimeout(t *testing.T) {
 		},
 	}
 	createInfo := &workflow.CreateContext{
-		NetworkInfo: &proto.ShimNetReq{
-			Interfaces: []*proto.Interface{
+		NetworkInfo: &networktypes.ShimNetReq{
+			Interfaces: []*networktypes.Interface{
 				{
 					IPAddr: net.ParseIP("127.0.0.1"),
 				},
@@ -124,8 +164,8 @@ func TestProbeErrAction(t *testing.T) {
 		},
 	}
 	createInfo := &workflow.CreateContext{
-		NetworkInfo: &proto.ShimNetReq{
-			Interfaces: []*proto.Interface{
+		NetworkInfo: &networktypes.ShimNetReq{
+			Interfaces: []*networktypes.Interface{
 				{
 					IPAddr: net.ParseIP("127.0.0.1"),
 				},
@@ -144,6 +184,216 @@ func TestProbeErrAction(t *testing.T) {
 	retErr := l.doProbe(ctx, cnt, ci)
 	err, _ := ret.FromError(retErr)
 	assert.Equal(t, errorcode.ErrorCode_InvalidParamFormat, err.Code())
+}
+
+func TestDoCreateTimeEnvdInitPostsEnvVars(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/init" {
+			t.Fatalf("path=%q, want /init", r.URL.Path)
+		}
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	u, err := neturl.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse server port: %v", err)
+	}
+
+	req := &cubebox.RunCubeSandboxRequest{
+		Annotations: map[string]string{
+			constants.MasterAnnotationComponentEnvdVersion: "0.2.0",
+			constants.MasterAnnotationCreateTimeEnvVars:    `{"SESSION_ID":"user-session-test","USER_ID":"42"}`,
+		},
+	}
+	sandBox := &cubeboxstore.CubeBox{IP: "127.0.0.1"}
+
+	l := &local{envdHTTPClient: server.Client(), envdInitPort: port}
+	if err := l.doCreateTimeEnvdInit(context.Background(), req, sandBox); err != nil {
+		t.Fatalf("doCreateTimeEnvdInit err=%v", err)
+	}
+	envVars, ok := gotBody["envVars"].(map[string]any)
+	if !ok {
+		t.Fatalf("envVars payload missing: %#v", gotBody)
+	}
+	if envVars["SESSION_ID"] != "user-session-test" {
+		t.Fatalf("SESSION_ID=%v, want user-session-test", envVars["SESSION_ID"])
+	}
+	if envVars["USER_ID"] != "42" {
+		t.Fatalf("USER_ID=%v, want 42", envVars["USER_ID"])
+	}
+}
+
+func TestDoCreateTimeEnvdInitFailsOnHTTPError(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		http.Error(w, "envd refused init", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	u, err := neturl.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse server port: %v", err)
+	}
+
+	req := &cubebox.RunCubeSandboxRequest{
+		Annotations: map[string]string{
+			constants.MasterAnnotationComponentEnvdVersion: "0.2.0",
+			constants.MasterAnnotationCreateTimeEnvVars:    `{"SESSION_ID":"user-session-test"}`,
+		},
+	}
+	sandBox := &cubeboxstore.CubeBox{IP: "127.0.0.1"}
+
+	l := &local{envdHTTPClient: server.Client(), envdInitPort: port}
+	retErr := l.doCreateTimeEnvdInit(context.Background(), req, sandBox)
+	if retErr == nil {
+		t.Fatal("expected init failure")
+	}
+	errInfo, _ := ret.FromError(retErr)
+	assert.Equal(t, errorcode.ErrorCode_ExecCommandInSandboxFailed, errInfo.Code())
+	assert.Contains(t, errInfo.Message(), "envd refused init")
+	assert.Equal(t, 1, callCount)
+}
+
+func TestDoCreateTimeEnvdInitRetriesTransientHTTPError(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount < envdInitMaxAttempts {
+			http.Error(w, "envd warming up", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	u, err := neturl.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse server port: %v", err)
+	}
+
+	req := &cubebox.RunCubeSandboxRequest{
+		Annotations: map[string]string{
+			constants.MasterAnnotationComponentEnvdVersion: "0.2.0",
+			constants.MasterAnnotationCreateTimeEnvVars:    `{"SESSION_ID":"user-session-test"}`,
+		},
+	}
+	sandBox := &cubeboxstore.CubeBox{IP: "127.0.0.1"}
+
+	l := &local{envdHTTPClient: server.Client(), envdInitPort: port}
+	if err := l.doCreateTimeEnvdInit(context.Background(), req, sandBox); err != nil {
+		t.Fatalf("doCreateTimeEnvdInit err=%v", err)
+	}
+	assert.Equal(t, envdInitMaxAttempts, callCount)
+}
+
+func TestDoCreateTimeEnvdInitRetriesTransportError(t *testing.T) {
+	callCount := 0
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			callCount++
+			if callCount < envdInitMaxAttempts {
+				return nil, fmt.Errorf("dial tcp %s: connection refused", r.URL.Host)
+			}
+			return &http.Response{
+				StatusCode: http.StatusNoContent,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader(nil)),
+				Request:    r,
+			}, nil
+		}),
+	}
+
+	req := &cubebox.RunCubeSandboxRequest{
+		Annotations: map[string]string{
+			constants.MasterAnnotationComponentEnvdVersion: "0.2.0",
+			constants.MasterAnnotationCreateTimeEnvVars:    `{"SESSION_ID":"user-session-test"}`,
+		},
+	}
+	sandBox := &cubeboxstore.CubeBox{IP: "127.0.0.1"}
+
+	l := &local{envdHTTPClient: client, envdInitPort: 49983}
+	if err := l.doCreateTimeEnvdInit(context.Background(), req, sandBox); err != nil {
+		t.Fatalf("doCreateTimeEnvdInit err=%v", err)
+	}
+	assert.Equal(t, envdInitMaxAttempts, callCount)
+}
+
+func TestDoCreateTimeEnvdInitFallsBackWithoutEnvdSupportAnnotation(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		if r.URL.Path != "/init" {
+			t.Fatalf("path=%q, want /init", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	u, err := neturl.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse server port: %v", err)
+	}
+
+	req := &cubebox.RunCubeSandboxRequest{
+		Annotations: map[string]string{
+			constants.MasterAnnotationCreateTimeEnvVars: `{"SESSION_ID":"user-session-test"}`,
+		},
+	}
+	sandBox := &cubeboxstore.CubeBox{IP: "127.0.0.1"}
+
+	l := &local{envdHTTPClient: server.Client(), envdInitPort: port}
+	if err := l.doCreateTimeEnvdInit(context.Background(), req, sandBox); err != nil {
+		t.Fatalf("doCreateTimeEnvdInit err=%v", err)
+	}
+	if !called {
+		t.Fatal("expected missing envd support annotation to still issue envd init request")
+	}
+}
+
+func TestDoCreateTimeEnvdInitFailsWithoutEnvdSupportAnnotationWhenEnvdUnavailable(t *testing.T) {
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("dial tcp %s: connection refused", r.URL.Host)
+		}),
+	}
+	req := &cubebox.RunCubeSandboxRequest{
+		Annotations: map[string]string{
+			constants.MasterAnnotationCreateTimeEnvVars: `{"SESSION_ID":"user-session-test"}`,
+		},
+	}
+	sandBox := &cubeboxstore.CubeBox{IP: "127.0.0.1"}
+
+	l := &local{envdHTTPClient: client, envdInitPort: 49983}
+	retErr := l.doCreateTimeEnvdInit(context.Background(), req, sandBox)
+	if retErr == nil {
+		t.Fatal("expected init failure when envd init cannot be reached without envd support annotation")
+	}
+	errInfo, _ := ret.FromError(retErr)
+	assert.Equal(t, errorcode.ErrorCode_ExecCommandInSandboxFailed, errInfo.Code())
+	assert.Contains(t, errInfo.Message(), "connection refused")
 }
 
 func TestProbe(t *testing.T) {
@@ -175,8 +425,8 @@ func TestProbe(t *testing.T) {
 		},
 	}
 	createInfo := &workflow.CreateContext{}
-	createInfo.NetworkInfo = &proto.ShimNetReq{
-		Interfaces: []*proto.Interface{
+	createInfo.NetworkInfo = &networktypes.ShimNetReq{
+		Interfaces: []*networktypes.Interface{
 			{
 				IPAddr: net.ParseIP("127.0.0.1"),
 			},
@@ -229,8 +479,8 @@ func TestProbeReqTimeout(t *testing.T) {
 		},
 	}
 	createInfo := &workflow.CreateContext{}
-	createInfo.NetworkInfo = &proto.ShimNetReq{
-		Interfaces: []*proto.Interface{
+	createInfo.NetworkInfo = &networktypes.ShimNetReq{
+		Interfaces: []*networktypes.Interface{
 			{
 				IPAddr: net.ParseIP(testHost),
 			},
@@ -325,8 +575,8 @@ func TestHttpProbe(t *testing.T) {
 		},
 	}
 	createInfo := &workflow.CreateContext{}
-	createInfo.NetworkInfo = &proto.ShimNetReq{
-		Interfaces: []*proto.Interface{
+	createInfo.NetworkInfo = &networktypes.ShimNetReq{
+		Interfaces: []*networktypes.Interface{
 			{
 				IPAddr: net.ParseIP("127.0.0.1"),
 			},
@@ -414,8 +664,8 @@ func TestProbeTimeoutMsDefault(t *testing.T) {
 				},
 			}
 			createInfo := &workflow.CreateContext{}
-			createInfo.NetworkInfo = &proto.ShimNetReq{
-				Interfaces: []*proto.Interface{
+			createInfo.NetworkInfo = &networktypes.ShimNetReq{
+				Interfaces: []*networktypes.Interface{
 					{
 						IPAddr: net.ParseIP(testHost),
 					},
@@ -484,8 +734,8 @@ func TestProbeTimeoutMsWithHttpProbe(t *testing.T) {
 		},
 	}
 	createInfo := &workflow.CreateContext{}
-	createInfo.NetworkInfo = &proto.ShimNetReq{
-		Interfaces: []*proto.Interface{
+	createInfo.NetworkInfo = &networktypes.ShimNetReq{
+		Interfaces: []*networktypes.Interface{
 			{
 				IPAddr: net.ParseIP("127.0.0.1"),
 			},
@@ -511,6 +761,7 @@ func TestProbeTimeoutMsWithHttpProbe(t *testing.T) {
 }
 
 func TestProbeTimeoutMsWithPing(t *testing.T) {
+	requirePing(t)
 	testHost := "127.0.0.1"
 
 	tests := []struct {
@@ -556,8 +807,8 @@ func TestProbeTimeoutMsWithPing(t *testing.T) {
 				},
 			}
 			createInfo := &workflow.CreateContext{}
-			createInfo.NetworkInfo = &proto.ShimNetReq{
-				Interfaces: []*proto.Interface{
+			createInfo.NetworkInfo = &networktypes.ShimNetReq{
+				Interfaces: []*networktypes.Interface{
 					{
 						IPAddr: net.ParseIP(testHost),
 					},
@@ -671,8 +922,8 @@ func TestProbeTimeoutFailure(t *testing.T) {
 				},
 			}
 			createInfo := &workflow.CreateContext{}
-			createInfo.NetworkInfo = &proto.ShimNetReq{
-				Interfaces: []*proto.Interface{
+			createInfo.NetworkInfo = &networktypes.ShimNetReq{
+				Interfaces: []*networktypes.Interface{
 					{
 						IPAddr: net.ParseIP("127.0.0.1"),
 					},
@@ -754,8 +1005,8 @@ func TestProbeConcurrent(t *testing.T) {
 				},
 			}
 			createInfo := &workflow.CreateContext{}
-			createInfo.NetworkInfo = &proto.ShimNetReq{
-				Interfaces: []*proto.Interface{
+			createInfo.NetworkInfo = &networktypes.ShimNetReq{
+				Interfaces: []*networktypes.Interface{
 					{
 						IPAddr: net.ParseIP("127.0.0.1"),
 					},
@@ -794,6 +1045,7 @@ func TestProbeConcurrent(t *testing.T) {
 }
 
 func TestProbeConcurrentMixed(t *testing.T) {
+	pingOK := pingAvailable()
 
 	httpPort := 9100
 	mux := http.NewServeMux()
@@ -815,63 +1067,55 @@ func TestProbeConcurrentMixed(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
+	tcpHandler := func() *cubebox.ProbeHandler {
+		return &cubebox.ProbeHandler{
+			TcpSocket: &cubebox.TCPSocketAction{
+				Port: int32(tcpPort),
+			},
+		}
+	}
+	// probeHandlerFor rotates HTTP/TCP/Ping across goroutines. Where ping is
+	// unavailable the ping slot degrades to TCP, so the mixed-concurrency
+	// assertion still exercises the probe types this environment supports.
+	probeHandlerFor := func(index int) *cubebox.ProbeHandler {
+		switch index % 3 {
+		case 0:
+			return &cubebox.ProbeHandler{
+				HttpGet: &cubebox.HTTPGetAction{
+					Port: int32(httpPort),
+					Path: pointer.String("/health"),
+				},
+			}
+		case 1:
+			return tcpHandler()
+		case 2:
+			if pingOK {
+				return &cubebox.ProbeHandler{
+					Ping: &cubebox.PingAction{
+						Udp: false,
+					},
+				}
+			}
+			return tcpHandler()
+		}
+		return nil
+	}
+
 	concurrentCount := 15
 	errCh := make(chan error, concurrentCount)
 
 	for i := 0; i < concurrentCount; i++ {
 		go func(index int) {
-			var cnt *cubebox.ContainerConfig
-
-			switch index % 3 {
-			case 0:
-				cnt = &cubebox.ContainerConfig{
-					Probe: &cubebox.Probe{
-						InitialDelayMs:   0,
-						TimeoutMs:        200,
-						PeriodMs:         10,
-						SuccessThreshold: 1,
-						FailureThreshold: 1,
-						ProbeTimeoutMs:   50,
-						ProbeHandler: &cubebox.ProbeHandler{
-							HttpGet: &cubebox.HTTPGetAction{
-								Port: int32(httpPort),
-								Path: pointer.String("/health"),
-							},
-						},
-					},
-				}
-			case 1:
-				cnt = &cubebox.ContainerConfig{
-					Probe: &cubebox.Probe{
-						InitialDelayMs:   0,
-						TimeoutMs:        200,
-						PeriodMs:         10,
-						SuccessThreshold: 1,
-						FailureThreshold: 1,
-						ProbeTimeoutMs:   50,
-						ProbeHandler: &cubebox.ProbeHandler{
-							TcpSocket: &cubebox.TCPSocketAction{
-								Port: int32(tcpPort),
-							},
-						},
-					},
-				}
-			case 2:
-				cnt = &cubebox.ContainerConfig{
-					Probe: &cubebox.Probe{
-						InitialDelayMs:   0,
-						TimeoutMs:        200,
-						PeriodMs:         10,
-						SuccessThreshold: 1,
-						FailureThreshold: 1,
-						ProbeTimeoutMs:   50,
-						ProbeHandler: &cubebox.ProbeHandler{
-							Ping: &cubebox.PingAction{
-								Udp: false,
-							},
-						},
-					},
-				}
+			cnt := &cubebox.ContainerConfig{
+				Probe: &cubebox.Probe{
+					InitialDelayMs:   0,
+					TimeoutMs:        200,
+					PeriodMs:         10,
+					SuccessThreshold: 1,
+					FailureThreshold: 1,
+					ProbeTimeoutMs:   50,
+					ProbeHandler:     probeHandlerFor(index),
+				},
 			}
 
 			req := &cubebox.RunCubeSandboxRequest{
@@ -880,8 +1124,8 @@ func TestProbeConcurrentMixed(t *testing.T) {
 				},
 			}
 			createInfo := &workflow.CreateContext{}
-			createInfo.NetworkInfo = &proto.ShimNetReq{
-				Interfaces: []*proto.Interface{
+			createInfo.NetworkInfo = &networktypes.ShimNetReq{
+				Interfaces: []*networktypes.Interface{
 					{
 						IPAddr: net.ParseIP("127.0.0.1"),
 					},

@@ -95,7 +95,7 @@ This chapter measures the end-to-end time to start a ready-to-use sandbox — ca
 ```bash
 pip install e2b-code-interpreter
 
-export CUBE_API_URL=http://<your-server-ip>:3000
+export E2B_API_URL=http://<your-server-ip>:3000
 export E2B_API_KEY=e2b_000000           # any non-empty string for local deploys
 export CUBE_TEMPLATE_ID=<your-template-id>  # from cubemastercli tpl list
 export SSL_CERT_FILE=/root/.local/share/mkcert/rootCA.pem  # mkcert certificate path
@@ -245,7 +245,7 @@ Per-VM amortized overhead = (current used - baseline used) ÷ VM count
 
 **Scaling up the TAP pre-allocation pool:**
 
-The TAP pool target is specified by `tap_init_num` in the cubelet configuration (default **500**). However, this parameter is actually consumed by **network-agent** (which reads the same cubelet config via `--cubelet-config` at startup) to pre-create TAP devices. After modifying it, you need to restart **network-agent** (not cubelet) for the change to take effect. The target density must not exceed this value — for example, to benchmark 1000 sandboxes, first set `tap_init_num` to 1000 (or higher).
+The TAP pool target is specified by `tap_init_num` in the cubelet configuration (default **500**). This parameter is now consumed by the **embedded network runtime inside cubelet** to pre-create TAP devices. After modifying it, restart **cubelet** for the change to take effect. The target density must not exceed this value — for example, to benchmark 1000 sandboxes, first set `tap_init_num` to 1000 (or higher).
 
 ```bash
 # 1. Edit cubelet config, increase tap_init_num under [plugins."io.cubelet.internal.v1.network"]
@@ -253,8 +253,8 @@ vi /usr/local/services/cubetoolbox/Cubelet/config/config.toml
 #   [plugins."io.cubelet.internal.v1.network"]
 #     tap_init_num = 1000        # default 500; set to 1000+ for benchmarking 1000 sandboxes
 
-# 2. Restart network-agent to pre-create TAP devices with the new target
-systemctl restart cube-sandbox-network-agent.service
+# 2. Restart cubelet so the embedded network runtime pre-creates TAP devices with the new target
+systemctl restart cube-sandbox-cubelet.service
 ```
 
 **Estimated single-host capacity (BMI5, 375 GiB memory):**
@@ -279,10 +279,10 @@ pip install -r requirements.txt   # installs the cubesandbox SDK
 
 # The following environment variables are prerequisites for all 4.x benchmark scripts;
 # export in each new shell (or write to env.sh and source it)
-export E2B_API_URL=http://<your-server-ip>:3000
-export CUBE_API_URL=http://<your-server-ip>:3000   # same as E2B_API_URL
-export E2B_API_KEY=e2b_000000                       # any non-empty string for local deploys
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>          # from cubemastercli tpl list
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>       # use 127.0.0.1 when running on the CubeProxy host
+export CUBE_PROXY_PORT_HTTP=80                      # CubeProxy listen port (default 80)
 ```
 
 > Sections 4.1–4.5 below assume you have completed the above `export` in your current shell (scripts read these variables via `env.py`). Re-export if you open a new terminal.
@@ -298,9 +298,10 @@ export CUBE_TEMPLATE_ID=<your-template-id>          # from cubemastercli tpl lis
 ```bash
 cd examples/snapshot-rollback-clone
 # If this is a new terminal, set environment variables (same as the dependency installation section):
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # The script provides single-tier mechanism; control concurrency tiers from the command line:
 python bench_snapshot_concurrency.py -c 1  -n 5
@@ -329,9 +330,10 @@ The test precisely controls dirty page size by pre-writing data to `/dev/shm` (t
 ```bash
 cd examples/snapshot-rollback-clone
 # If this is a new terminal, set environment variables (same as the dependency installation section):
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # The script provides single-tier mechanism; control dirty page size from the command line (-d = write size in MB):
 python bench_snapshot_dirty.py -d 0    -n 3
@@ -372,9 +374,10 @@ python bench_snapshot_dirty.py -d 1024 -n 3 --no-header
 ```bash
 cd examples/snapshot-rollback-clone
 # If this is a new terminal, set environment variables (same as the dependency installation section):
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # The script provides single-tier mechanism; control concurrency from the command line:
 python bench_create_concurrency.py -c 1  -n 3
@@ -405,9 +408,10 @@ Single sandbox startup ~**64 ms**; at 20-concurrent, wall ~**119 ms**, amortized
 ```bash
 cd examples/snapshot-rollback-clone
 # If this is a new terminal, set environment variables (same as the dependency installation section):
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # The script provides single-tier mechanism; control concurrency from the command line:
 python bench_rollback_concurrency.py -c 1  -n 5
@@ -438,9 +442,10 @@ python bench_rollback_concurrency.py -c 10 -n 5 --no-header
 ```bash
 cd examples/snapshot-rollback-clone
 # If this is a new terminal, set environment variables (same as the dependency installation section):
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # The script provides single-scenario mechanism; control n/concurrency/rounds from the command line:
 python bench_clone_concurrency.py -n 1   -c 1  --rounds 5
@@ -473,9 +478,10 @@ Clone (full memory + filesystem state): single clone ~**220 ms**; for 100 sandbo
 ```bash
 cd examples/snapshot-rollback-clone
 # If this is a new terminal, set environment variables (same as the dependency installation section):
-export E2B_API_URL=http://<your-server-ip>:3000
-export E2B_API_KEY=e2b_000000
+export CUBE_API_URL=http://<your-server-ip>:3000
 export CUBE_TEMPLATE_ID=<your-template-id>
+export CUBE_PROXY_NODE_IP=<your-cubeproxy-ip>
+export CUBE_PROXY_PORT_HTTP=80
 
 # The script provides single-tier mechanism; control concurrency from the command line:
 python bench_pause_resume_concurrency.py -c 1  -n 5

@@ -18,13 +18,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agiledragon/gomonkey"
+	"github.com/agiledragon/gomonkey/v2"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gomodule/redigo/redis"
 	"github.com/google/uuid"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
-	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/errorcode/v1"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/images/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db"
@@ -35,6 +32,10 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	"github.com/tencentcloud/CubeSandbox/pkgs/cubedb/dao"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/images/v1"
 	"gorm.io/gorm"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
@@ -123,12 +124,15 @@ func mocktest_InitGlobalResources() {
 
 func mocktest_CleanupGlobalResources() {
 
-	conn := wrapredis.GetRedis(wrapredis.RedisWrite)
-
-	redisKeysBefore, _ := redis.Int(conn.Do("DBSIZE"))
-	conn.Do("FLUSHDB")
-
-	redisRecordsCleaned := redisKeysBefore
+	// Clear only this test's dedicated miniredis instance instead of issuing a
+	// raw FLUSHDB over the shared connection. If RedisConf.Nodes were ever
+	// pointed at a real shared Redis (multiple services share db_no=0), FLUSHDB
+	// would wipe other services' data. Flushing the owned mock server is safe.
+	redisRecordsCleaned := 0
+	if mocktest_RedisSrv != nil {
+		redisRecordsCleaned = len(mocktest_RedisSrv.Keys())
+		mocktest_RedisSrv.FlushDB()
+	}
 	stdlog.Printf("Redis database cleanup completed, cleaned %d keys", redisRecordsCleaned)
 
 	if mocktest_OssDb != nil {
@@ -182,12 +186,6 @@ func mock_Redis() {
 	if config.GetConfig().RedisConf != nil {
 		config.GetConfig().RedisConf.Nodes = mocktest_RedisSrv.Addr()
 	}
-	if config.GetConfig().RedisReadConf != nil {
-		config.GetConfig().RedisReadConf.Nodes = mocktest_RedisSrv.Addr()
-	}
-	if config.GetConfig().RedisWriteConf != nil {
-		config.GetConfig().RedisWriteConf.Nodes = mocktest_RedisSrv.Addr()
-	}
 	go func() {
 		for {
 			select {
@@ -216,7 +214,7 @@ func mocktest_reportMetric(insID string) {
 		RealTimeCreateNum: get_realtime_create_num(insID),
 		MetricUpdate:      string(metricNow()),
 	}
-	wrapredis.GetRedis(wrapredis.RedisWrite).Do("HSET", redis.Args{insID}.AddFlat(redisNode)...)
+	wrapredis.GetRedis().Do("HSET", redis.Args{insID}.AddFlat(redisNode)...)
 }
 
 func mock_getHostInfoByIP(ip string) *models.HostInfo {
@@ -657,10 +655,22 @@ func metricNow() []byte {
 }
 
 func mock_db() {
+	// Establish the shared dao handle before db.Init (a dao.Default()
+	// wrapper) needs it. dao.Open is idempotent for the same config
+	// identity, so the later open in app.Run's initDatabaseSchema is a
+	// no-op; schema migration (including t_cube_host_type) still runs
+	// there. Both call sites build their dao config through
+	// db.ConfigFromDBConfig so the identities cannot drift.
+	daoCfg, err := db.ConfigFromDBConfig(config.GetDbConfig())
+	if err != nil {
+		stdlog.Fatalf("integration: dao config fail: %v", err)
+	}
+	if _, err := dao.Open(mocktest_Ctx, daoCfg); err != nil {
+		stdlog.Fatalf("dao open fail:%v", err)
+	}
 	mocktest_OssDb = db.Init(config.GetDbConfig())
-	// Schema (including t_cube_host_type) is owned by the dao.Migrate
-	// path that the integration test bootstrap runs before tests.
 }
+
 func mock_getstr() string {
 	return fmt.Sprintf("%d.%d.%d.%d", rand.Int31n(254), rand.Int31n(254), rand.Int31n(254), rand.Int31n(254))
 }

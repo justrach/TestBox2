@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -69,16 +70,53 @@ func (c *Client) Create(ctx context.Context, opts CreateOptions) (*Sandbox, erro
 		return nil, err
 	}
 
+	// A templateID in Extra is an explicit choice: it is sent verbatim, without
+	// the MCP template fallback.
+	var templates []string
+	if _, extraTemplate := opts.Extra["templateID"]; !extraTemplate && opts.TemplateID == "" && opts.MCP != nil {
+		templates = []string{c.config.MCPTemplateID}
+		if c.config.TemplateID != "" && c.config.TemplateID != c.config.MCPTemplateID {
+			templates = append(templates, c.config.TemplateID)
+		}
+	}
 	var sandbox Sandbox
-	if err := c.doJSON(ctx, http.MethodPost, "/sandboxes", payload, &sandbox, http.StatusOK, http.StatusCreated); err != nil {
+	if len(templates) == 0 {
+		err = c.doJSON(ctx, http.MethodPost, "/sandboxes", payload, &sandbox, http.StatusOK, http.StatusCreated)
+	}
+	for i, templateID := range templates {
+		payload["templateID"] = templateID
+		err = c.doJSON(ctx, http.MethodPost, "/sandboxes", payload, &sandbox, http.StatusOK, http.StatusCreated)
+		if err == nil || !errors.Is(err, ErrTemplateNotFound) {
+			break
+		}
+		if i == len(templates)-1 {
+			err = &APIError{
+				StatusCode: http.StatusNotFound,
+				Kind:       apiErrorKindTemplateNotFound,
+				Message: fmt.Sprintf("no template for mcp: tried %q. Build a template that provides mcp-gateway "+
+					"(see docs/guide/mcp-gateway.md), then set TemplateID or CUBE_MCP_TEMPLATE_ID", templates),
+			}
+		}
+	}
+	if err != nil {
 		return nil, err
 	}
 	c.attachSandbox(&sandbox)
+	if opts.MCP != nil {
+		if err := sandbox.startMCPGateway(ctx, opts.MCP); err != nil {
+			killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.config.RequestTimeout)
+			defer cancel()
+			_ = sandbox.Kill(killCtx)
+			return nil, err
+		}
+	}
 	return &sandbox, nil
 }
 
 func (c *Client) Connect(ctx context.Context, sandboxID string) (*Sandbox, error) {
-	payload := map[string]any{"timeout": durationSeconds(c.config.Timeout)}
+	// Do not fabricate a timeout on connect: with no caller-provided value we
+	// omit the field entirely and let the server keep its own timeout policy.
+	payload := map[string]any{}
 	var sandbox Sandbox
 	if err := c.doJSON(ctx, http.MethodPost, "/sandboxes/"+url.PathEscape(sandboxID)+"/connect", payload, &sandbox, http.StatusOK); err != nil {
 		return nil, err
@@ -113,6 +151,9 @@ func (c *Client) Health(ctx context.Context) (map[string]any, error) {
 
 func (c *Client) createPayload(opts CreateOptions) (map[string]any, error) {
 	templateID := opts.TemplateID
+	if templateID == "" && opts.MCP != nil {
+		templateID = c.config.MCPTemplateID
+	}
 	if templateID == "" {
 		templateID = c.config.TemplateID
 	}
@@ -120,13 +161,12 @@ func (c *Client) createPayload(opts CreateOptions) (map[string]any, error) {
 		return nil, fmt.Errorf("template is required. Set CUBE_TEMPLATE_ID or pass TemplateID")
 	}
 
-	timeout := opts.Timeout
-	if timeout <= 0 {
-		timeout = c.config.Timeout
-	}
 	payload := map[string]any{
 		"templateID": templateID,
-		"timeout":    durationSeconds(timeout),
+	}
+	// Omitted when nil; see docs/guide/lifecycle.md.
+	if opts.Timeout != nil {
+		payload["timeout"] = timeoutPayloadSeconds(*opts.Timeout)
 	}
 	if len(opts.EnvVars) > 0 {
 		payload["envVars"] = opts.EnvVars
@@ -134,19 +174,28 @@ func (c *Client) createPayload(opts CreateOptions) (map[string]any, error) {
 	if len(opts.Metadata) > 0 {
 		payload["metadata"] = opts.Metadata
 	}
-	if opts.AllowInternetAccess != nil && !*opts.AllowInternetAccess {
+	internetAccessDisabled := opts.AllowInternetAccess != nil && !*opts.AllowInternetAccess
+	if internetAccessDisabled {
 		payload["allowInternetAccess"] = false
 	}
 
-	network := map[string]any{}
-	if len(opts.Network.AllowOut) > 0 {
-		network["allowOut"] = opts.Network.AllowOut
-	}
-	if len(opts.Network.DenyOut) > 0 {
-		network["denyOut"] = opts.Network.DenyOut
+	network, err := buildNetworkPayload(opts.Network, internetAccessDisabled)
+	if err != nil {
+		return nil, err
 	}
 	if len(network) > 0 {
 		payload["network"] = network
+	}
+
+	if len(opts.VolumeMounts) > 0 {
+		if err := validateVolumeMounts(opts.VolumeMounts); err != nil {
+			return nil, err
+		}
+		payload["volumeMounts"] = opts.VolumeMounts
+	}
+
+	if opts.MCP != nil {
+		payload["mcp"] = opts.MCP
 	}
 
 	for key, value := range opts.Extra {

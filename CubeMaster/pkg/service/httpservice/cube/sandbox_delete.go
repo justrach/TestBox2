@@ -8,17 +8,16 @@ import (
 	"net/http"
 
 	"github.com/google/uuid"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
-func deleteSandbox(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	_ = w
+func deleteSandbox(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 	req := &types.DeleteCubeSandboxReq{}
 	if err := utils.DecodeHttpBody(r.Body, req); err != nil {
 		rt.RetCode = int64(errorcode.ErrorCode_MasterParamsError)

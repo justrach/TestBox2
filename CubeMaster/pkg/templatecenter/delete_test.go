@@ -10,11 +10,11 @@ import (
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
-	cubeboxv1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
-	errorcodev1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db/models"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
+	sandboxtypes "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	errorcodev1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
+	"gorm.io/gorm"
 )
 
 func TestDeleteTemplateWithTargetsAllowsJobOnlyCleanup(t *testing.T) {
@@ -30,7 +30,7 @@ func TestDeleteTemplateWithTargetsAllowsJobOnlyCleanup(t *testing.T) {
 	})
 
 	var replicaCalled, artifactCalled, metadataCalled, jobCalled bool
-	runReplicaCleanup = func(ctx context.Context, templateID string, locators []templateCleanupLocator) error {
+	runReplicaCleanup = func(ctx context.Context, templateID string, locators []templateCleanupLocator, _ string) error {
 		replicaCalled = true
 		// v4: locators are deduplicated by (NodeID|NodeIP); SnapshotPath is
 		// no longer part of the identity or the cleanup payload.
@@ -78,7 +78,7 @@ func TestDeleteTemplateWithTargetsAllowsJobOnlyCleanup(t *testing.T) {
 			{NodeIP: "10.0.0.8"},
 		},
 		ArtifactIDs: map[string]struct{}{"artifact-1": {}},
-	})
+	}, DeleteTemplateOptions{})
 	if err != nil {
 		t.Fatalf("deleteTemplateWithTargets failed: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestDeleteTemplateWithTargetsRejectsActiveJobs(t *testing.T) {
 			{TemplateID: "tpl-active", Status: JobStatusPending},
 		},
 		InstanceType: cubeboxv1.InstanceType_cubebox.String(),
-	})
+	}, DeleteTemplateOptions{})
 	if !errors.Is(err, ErrTemplateAttemptInProgress) {
 		t.Fatalf("expected ErrTemplateAttemptInProgress, got %v", err)
 	}
@@ -103,7 +103,7 @@ func TestDeleteTemplateWithTargetsRejectsPendingDefinitionBuild(t *testing.T) {
 	err := deleteTemplateWithTargets(context.Background(), "tpl-pending", &templateCleanupTargets{
 		Definition:   &models.TemplateDefinition{TemplateID: "tpl-pending", Status: StatusPending},
 		InstanceType: cubeboxv1.InstanceType_cubebox.String(),
-	})
+	}, DeleteTemplateOptions{})
 	if !errors.Is(err, ErrTemplateAttemptInProgress) {
 		t.Fatalf("expected ErrTemplateAttemptInProgress for pending definition, got %v", err)
 	}
@@ -118,7 +118,7 @@ func TestDeleteTemplateWithTargetsRejectsMissingCleanupLocator(t *testing.T) {
 			{TemplateID: "tpl-missing-locator", Status: JobStatusFailed, NodeID: "node-a"},
 		},
 		InstanceType: cubeboxv1.InstanceType_cubebox.String(),
-	})
+	}, DeleteTemplateOptions{})
 	if !errors.Is(err, ErrTemplateCleanupLocatorMissing) {
 		t.Fatalf("expected ErrTemplateCleanupLocatorMissing, got %v", err)
 	}
@@ -139,7 +139,7 @@ func TestDeleteTemplateWithTargetsAllowsOrphanedJobCleanup(t *testing.T) {
 	})
 
 	var metadataCalled, jobCalled bool
-	runReplicaCleanup = func(ctx context.Context, templateID string, locators []templateCleanupLocator) error {
+	runReplicaCleanup = func(ctx context.Context, templateID string, locators []templateCleanupLocator, _ string) error {
 		if len(locators) != 0 {
 			t.Fatalf("expected no locators for orphaned job, got %+v", locators)
 		}
@@ -164,7 +164,7 @@ func TestDeleteTemplateWithTargetsAllowsOrphanedJobCleanup(t *testing.T) {
 		},
 		ArtifactIDs:  map[string]struct{}{},
 		InstanceType: cubeboxv1.InstanceType_cubebox.String(),
-	})
+	}, DeleteTemplateOptions{})
 	if err != nil {
 		t.Fatalf("orphaned job cleanup should succeed, got: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestDeleteTemplateWithTargetsAllowsArtifactOnlyCleanupWithoutLocator(t *tes
 	})
 
 	var artifactCalled, metadataCalled, jobCalled bool
-	runReplicaCleanup = func(ctx context.Context, templateID string, locators []templateCleanupLocator) error {
+	runReplicaCleanup = func(ctx context.Context, templateID string, locators []templateCleanupLocator, _ string) error {
 		if len(locators) != 0 {
 			t.Fatalf("expected no locators, got %+v", locators)
 		}
@@ -217,7 +217,7 @@ func TestDeleteTemplateWithTargetsAllowsArtifactOnlyCleanupWithoutLocator(t *tes
 		},
 		ArtifactIDs:  map[string]struct{}{"artifact-only": {}},
 		InstanceType: cubeboxv1.InstanceType_cubebox.String(),
-	})
+	}, DeleteTemplateOptions{})
 	if err != nil {
 		t.Fatalf("deleteTemplateWithTargets failed: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestDeleteTemplateWithTargetsPreservesJobsAfterPartialFailure(t *testing.T)
 
 	replicaErr := errors.New("cubelet temporarily unavailable")
 	var metadataCalled, jobCalled, invalidated bool
-	runReplicaCleanup = func(ctx context.Context, templateID string, locators []templateCleanupLocator) error {
+	runReplicaCleanup = func(ctx context.Context, templateID string, locators []templateCleanupLocator, _ string) error {
 		return replicaErr
 	}
 	runArtifactCleanup = func(ctx context.Context, templateID string, targets *templateCleanupTargets) error {
@@ -265,7 +265,7 @@ func TestDeleteTemplateWithTargetsPreservesJobsAfterPartialFailure(t *testing.T)
 		Locators:     []templateCleanupLocator{{NodeIP: "10.0.0.8"}},
 		ArtifactIDs:  map[string]struct{}{},
 		InstanceType: cubeboxv1.InstanceType_cubebox.String(),
-	})
+	}, DeleteTemplateOptions{})
 	if !errors.Is(err, replicaErr) {
 		t.Fatalf("expected replica cleanup error, got %v", err)
 	}
@@ -294,7 +294,7 @@ func TestDeleteTemplateWithTargetsPreservesMetadataAfterArtifactFailure(t *testi
 
 	artifactErr := errors.New("artifact delete failed")
 	var metadataCalled, jobCalled, invalidated bool
-	runReplicaCleanup = func(ctx context.Context, templateID string, locators []templateCleanupLocator) error {
+	runReplicaCleanup = func(ctx context.Context, templateID string, locators []templateCleanupLocator, _ string) error {
 		return nil
 	}
 	runArtifactCleanup = func(ctx context.Context, templateID string, targets *templateCleanupTargets) error {
@@ -318,7 +318,7 @@ func TestDeleteTemplateWithTargetsPreservesMetadataAfterArtifactFailure(t *testi
 		Jobs:         []models.TemplateImageJob{{TemplateID: "tpl-artifact-failure", ArtifactID: "artifact-1"}},
 		ArtifactIDs:  map[string]struct{}{"artifact-1": {}},
 		InstanceType: cubeboxv1.InstanceType_cubebox.String(),
-	})
+	}, DeleteTemplateOptions{})
 	if !errors.Is(err, artifactErr) {
 		t.Fatalf("expected artifact cleanup error, got %v", err)
 	}
@@ -330,61 +330,6 @@ func TestDeleteTemplateWithTargetsPreservesMetadataAfterArtifactFailure(t *testi
 	}
 	if invalidated {
 		t.Fatal("cache should remain intact after artifact cleanup failure")
-	}
-}
-
-func TestResolveArtifactCleanupNodesUsesHistoricalTargets(t *testing.T) {
-	targets := &templateCleanupTargets{
-		Replicas: []models.TemplateReplica{
-			{ArtifactID: "artifact-1", NodeID: "node-a", NodeIP: "10.0.0.1"},
-			{ArtifactID: "artifact-1", NodeID: "node-a", NodeIP: "10.0.0.1"},
-		},
-		Jobs: []models.TemplateImageJob{
-			{ArtifactID: "artifact-1", NodeID: "node-b", NodeIP: "10.0.0.2"},
-			{ArtifactID: "artifact-2", NodeID: "node-c", NodeIP: "10.0.0.3"},
-		},
-	}
-
-	got := resolveArtifactCleanupNodes(targets, "artifact-1")
-	if len(got) != 2 {
-		t.Fatalf("expected 2 cleanup targets, got %d", len(got))
-	}
-	expected := map[string]struct{}{
-		"node-a|10.0.0.1": {},
-		"node-b|10.0.0.2": {},
-	}
-	for _, item := range got {
-		key := item.ID() + "|" + item.HostIP()
-		if _, ok := expected[key]; !ok {
-			t.Fatalf("unexpected cleanup node: %+v", item)
-		}
-		delete(expected, key)
-	}
-	if len(expected) != 0 {
-		t.Fatalf("missing cleanup nodes: %+v", expected)
-	}
-}
-
-func TestResolveArtifactCleanupNodesFallsBackToLocalcacheAddress(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyFunc(localcache.GetNode, func(nodeID string) (*node.Node, bool) {
-		if nodeID == "node-a" {
-			return &node.Node{InsID: "node-a", IP: "10.0.0.1"}, true
-		}
-		return nil, false
-	})
-
-	got := resolveArtifactCleanupNodes(&templateCleanupTargets{
-		Replicas: []models.TemplateReplica{
-			{ArtifactID: "artifact-1", NodeID: "node-a"},
-		},
-	}, "artifact-1")
-	if len(got) != 1 {
-		t.Fatalf("expected 1 cleanup target, got %d", len(got))
-	}
-	if got[0].ID() != "node-a" || got[0].HostIP() != "10.0.0.1" {
-		t.Fatalf("unexpected cleanup target: %+v", got[0])
 	}
 }
 
@@ -406,6 +351,9 @@ func TestCleanupTemplateReplicasWithLocatorsIgnoresNotFound(t *testing.T) {
 		if got := req.GetSnapshotPath(); got != "" {
 			t.Fatalf("v4: cleanup request must not carry SnapshotPath; got %q", got)
 		}
+		if got := req.GetBackend(); got != "" {
+			t.Fatalf("empty cleanup must not inject backend; got %q", got)
+		}
 		return &cubeboxv1.CleanupTemplateResponse{
 			Ret: &errorcodev1.Ret{
 				RetCode: errorcodev1.ErrorCode_Unknown,
@@ -414,8 +362,39 @@ func TestCleanupTemplateReplicasWithLocatorsIgnoresNotFound(t *testing.T) {
 		}, nil
 	}
 
-	if err := cleanupTemplateReplicasWithLocators(context.Background(), "tpl-1", []templateCleanupLocator{{NodeIP: "10.0.0.8"}}); err != nil {
+	if err := cleanupTemplateReplicasWithLocators(context.Background(), "tpl-1", []templateCleanupLocator{{NodeIP: "10.0.0.8"}}, ""); err != nil {
 		t.Fatalf("expected not-found cleanup to be ignored, got %v", err)
+	}
+}
+
+func TestCleanupTemplateReplicasWithLocatorsForwardsPinnedBackend(t *testing.T) {
+	origCleanupTemplateOnCubelet := cleanupTemplateOnCubelet
+	origGetCubeletAddrForDelete := getCubeletAddrForDelete
+	t.Cleanup(func() {
+		cleanupTemplateOnCubelet = origCleanupTemplateOnCubelet
+		getCubeletAddrForDelete = origGetCubeletAddrForDelete
+	})
+
+	getCubeletAddrForDelete = func(hostIP string) string { return hostIP + ":9000" }
+	gotBackend := ""
+	cleanupTemplateOnCubelet = func(ctx context.Context, calleeEp string, req *cubeboxv1.CleanupTemplateRequest) (*cubeboxv1.CleanupTemplateResponse, error) {
+		gotBackend = req.GetBackend()
+		return &cubeboxv1.CleanupTemplateResponse{
+			Ret: &errorcodev1.Ret{RetCode: errorcodev1.ErrorCode_Success},
+		}, nil
+	}
+
+	if err := cleanupTemplateReplicasWithLocators(context.Background(), "tpl-s3", []templateCleanupLocator{{NodeIP: "10.0.0.8"}}, "s3"); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if gotBackend != "s3" {
+		t.Fatalf("cleanup backend=%q, want s3", gotBackend)
+	}
+	if err := cleanupTemplateReplicasWithLocators(context.Background(), "tpl-legacy", []templateCleanupLocator{{NodeIP: "10.0.0.8"}}, "cubecow"); err != nil {
+		t.Fatalf("legacy cleanup: %v", err)
+	}
+	if gotBackend != "" {
+		t.Fatalf("historical cubecow must stay empty on cleanup, got %q", gotBackend)
 	}
 }
 
@@ -456,6 +435,39 @@ func TestIsIgnorableArtifactDeleteMessage(t *testing.T) {
 	}
 	if isIgnorableArtifactDeleteMessage("node not found") {
 		t.Fatal("node not found should not be ignored")
+	}
+}
+
+func TestDeleteTemplateDelegatesTombstonedSnapshot(t *testing.T) {
+	oldDB := store.db
+	store.db = &gorm.DB{}
+	defer func() { store.db = oldDB }()
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(getSnapshotRecord, func(ctx context.Context, snapshotID string) (*models.SnapshotRecord, error) {
+		return &models.SnapshotRecord{SnapshotID: snapshotID, Status: StatusDeleted}, nil
+	})
+	delegated := false
+	patches.ApplyFunc(DeleteSnapshot, func(ctx context.Context, requestID, snapshotID, instanceType string) (*sandboxtypes.TemplateImageJobInfo, error) {
+		delegated = true
+		if snapshotID != "snap-tomb" {
+			t.Fatalf("snapshotID = %q", snapshotID)
+		}
+		return &sandboxtypes.TemplateImageJobInfo{Status: JobStatusReady}, nil
+	})
+	origReplica := runReplicaCleanup
+	t.Cleanup(func() { runReplicaCleanup = origReplica })
+	runReplicaCleanup = func(ctx context.Context, templateID string, locators []templateCleanupLocator, _ string) error {
+		t.Fatal("must not physically clean a snapshot via DeleteTemplate")
+		return nil
+	}
+
+	if err := DeleteTemplate(context.Background(), "snap-tomb", "cubebox"); err != nil {
+		t.Fatalf("DeleteTemplate: %v", err)
+	}
+	if !delegated {
+		t.Fatal("expected DeleteSnapshot")
 	}
 }
 

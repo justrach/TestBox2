@@ -8,20 +8,22 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/containerd/containerd/v2/pkg/oci"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/virtiofs"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 func generateSandboxVirtiofsOpt(ctx context.Context, flowOpts *workflow.CreateContext, coldStart bool) ([]oci.SpecOpts, error) {
@@ -58,6 +60,7 @@ func generateSandboxVirtiofsOpt(ctx context.Context, flowOpts *workflow.CreateCo
 				AllowedDirs: v.bindPaths,
 				ReadOnly:    k.readOnly,
 				Cache:       constants.VirtiofsCacheNone,
+				RemapFilter: flowOpts.IsGuestMountRestore(),
 			},
 		}
 		if k.readOnly {
@@ -95,6 +98,14 @@ func generateSandboxVirtiofsOpt(ctx context.Context, flowOpts *workflow.CreateCo
 
 func generateRestoreVirtiofsOpt(ctx context.Context, flowOpts *workflow.CreateContext, containerReq *cubebox.ContainerConfig) ([]oci.SpecOpts, error) {
 	var specOpts []oci.SpecOpts
+	// Pause / FromSnap: container /mnt/* binds are already in guest memory.
+	// Re-emitting exec.mounts would re-enter do_exec_mount and fail (ENOENT on
+	// /.container_rw/... or EBUSY on virtio_rw). Create-from-template still
+	// needs these annotations for newly attached volumes.
+	if flowOpts != nil && flowOpts.IsGuestMountRestore() {
+		log.G(ctx).Infof("[hostdir] memory restore: skip propagation exec.mount / umount annotations")
+		return specOpts, nil
+	}
 	if flowOpts.StorageInfo == nil {
 		return specOpts, nil
 	}
@@ -103,15 +114,19 @@ func generateRestoreVirtiofsOpt(ctx context.Context, flowOpts *workflow.CreateCo
 		return specOpts, nil
 	}
 
-	vmByVolName := make(map[string]*cubebox.VolumeMounts)
+	type indexedVolumeMount struct {
+		mount *cubebox.VolumeMounts
+		index int
+	}
+	vmByVolName := make(map[string]indexedVolumeMount)
 	if containerReq != nil {
-		for _, vm := range containerReq.GetVolumeMounts() {
-			vmByVolName[vm.GetName()] = vm
+		for i, vm := range containerReq.GetVolumeMounts() {
+			vmByVolName[vm.GetName()] = indexedVolumeMount{mount: vm, index: i}
 		}
 	}
 
-	var allMnts []virtiofs.VirtioMounts
-	for _, info := range storageInfo.HostDirBackendInfos {
+	var restoreMounts []restoreVirtioMount
+	for backendKey, info := range storageInfo.HostDirBackendInfos {
 
 		base := filepath.Base(info.BindPath)
 		var containerSrc string
@@ -121,21 +136,34 @@ func generateRestoreVirtiofsOpt(ctx context.Context, flowOpts *workflow.CreateCo
 			containerSrc = constants.PropagationContainerDirRw + "/" + base
 		}
 
-		vm, ok := vmByVolName[info.VolumeName]
-		if !ok || vm.GetContainerPath() == "" {
+		indexedVM, ok := vmByVolName[info.VolumeName]
+		if !ok {
 			log.G(ctx).Warnf("[hostdir] generateRestoreVirtiofsOpt: no VolumeMount for volume %q, skip", info.VolumeName)
 			continue
 		}
+		containerPath := indexedVM.mount.GetContainerPath()
+		if containerPath == "" {
+			log.G(ctx).Warnf("[hostdir] generateRestoreVirtiofsOpt: VolumeMount for volume %q has empty container path, skip", info.VolumeName)
+			continue
+		}
 
-		log.G(ctx).Infof("[hostdir] exec.mount: %s -> %s", containerSrc, vm.GetContainerPath())
-		allMnts = append(allMnts, virtiofs.VirtioMounts{
-			VirtiofsSource: containerSrc,
-			Destination:    vm.GetContainerPath(),
+		log.G(ctx).Infof("[hostdir] exec.mount: %s -> %s", containerSrc, containerPath)
+		restoreMounts = append(restoreMounts, restoreVirtioMount{
+			mount: virtiofs.VirtioMounts{
+				VirtiofsSource: containerSrc,
+				Destination:    containerPath,
+			},
+			requestIndex: indexedVM.index,
+			backendKey:   backendKey,
 		})
 	}
+	allMnts := sortRestoreVirtioMounts(restoreMounts)
 
 	if len(allMnts) > 0 {
-		vc, _ := jsoniter.Marshal(allMnts)
+		vc, err := jsoniter.Marshal(allMnts)
+		if err != nil {
+			return nil, fmt.Errorf("marshal restore virtiofs mounts: %w", err)
+		}
 		specOpts = append(specOpts, oci.WithAnnotations(map[string]string{
 			constants.AnnotationPropagationExecMounts:       string(vc),
 			constants.AnnotationPropagationContainerUmounts: virtiofs.GenPropagationContainerUmounts(),
@@ -144,6 +172,40 @@ func generateRestoreVirtiofsOpt(ctx context.Context, flowOpts *workflow.CreateCo
 		log.G(ctx).Infof("[hostdir] %s annotation set: %s", constants.AnnotationPropagationContainerUmounts, virtiofs.GenPropagationContainerUmounts())
 	}
 	return specOpts, nil
+}
+
+type restoreVirtioMount struct {
+	mount        virtiofs.VirtioMounts
+	requestIndex int
+	backendKey   string
+}
+
+// sortRestoreVirtioMounts makes the mount order deterministic and keeps parent
+// destinations ahead of nested destinations. Equal destinations retain the
+// caller's VolumeMount order, preserving the usual last-mount-wins behavior;
+// backendKey provides the final deterministic tiebreaker.
+func sortRestoreVirtioMounts(candidates []restoreVirtioMount) []virtiofs.VirtioMounts {
+	sort.Slice(candidates, func(i, j int) bool {
+		left := path.Clean(candidates[i].mount.Destination)
+		right := path.Clean(candidates[j].mount.Destination)
+		if left != right {
+			// A cleaned parent path is a strict lexical prefix of its nested
+			// child, so lexical ordering always places the parent first. For
+			// unrelated paths, the lexical order is deterministic but has no
+			// additional semantic meaning.
+			return left < right
+		}
+		if candidates[i].requestIndex != candidates[j].requestIndex {
+			return candidates[i].requestIndex < candidates[j].requestIndex
+		}
+		return candidates[i].backendKey < candidates[j].backendKey
+	})
+
+	mounts := make([]virtiofs.VirtioMounts, 0, len(candidates))
+	for _, candidate := range candidates {
+		mounts = append(mounts, candidate.mount)
+	}
+	return mounts
 }
 
 func appendVirtiofsConfig(ctx context.Context, opts *workflow.CreateContext, allVirtios []*virtiofs.VirtiofsConfig,

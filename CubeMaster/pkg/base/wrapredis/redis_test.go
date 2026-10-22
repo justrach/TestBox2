@@ -22,7 +22,7 @@ func init() {
 	}
 	fmt.Printf("mydir=%s\n", mydir)
 	if os.Getenv("CUBE_MASTER_CONFIG_PATH") == "" {
-		os.Setenv("CUBE_MASTER_CONFIG_PATH", filepath.Clean(filepath.Join(mydir, "../../../test/conf.yaml")))
+		os.Setenv("CUBE_MASTER_CONFIG_PATH", filepath.Clean(filepath.Join(mydir, "../../../conf.yaml")))
 	}
 	config.Init()
 }
@@ -34,18 +34,14 @@ func TestDo(t *testing.T) {
 }
 
 func TestDoType(t *testing.T) {
-	redis := GetRedis(RedisDefault)
+	redis := GetRedis()
 	assert.NotNil(t, redis)
 	_, err := redis.Do("HGETALL", "test", "test")
 	assert.NotNil(t, err)
 
-	redis = GetRedis(RedisRead)
-	assert.NotNil(t, redis)
 	_, err = redis.Do("GET", "test", "test")
 	assert.NotNil(t, err)
 
-	redis = GetRedis(RedisWrite)
-	assert.NotNil(t, redis)
 	_, err = redis.Do("SET", "test", "test")
 	assert.NotNil(t, err)
 }

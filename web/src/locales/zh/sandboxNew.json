@@ -4,10 +4,15 @@
   "section": {
     "template": "选择模板",
     "templateDesc": "仅显示状态为 ready 的模板可供选择。",
+    "config": "配置",
+    "configDesc": "设置沙箱的超时时长。",
     "metadata": "元数据",
     "metadataDesc": "附加到沙箱的自定义键值对，可用于标识和过滤。"
   },
   "form": {
+    "timeout": "超时时长（秒）",
+    "timeoutPlaceholder": "如 300",
+    "timeoutHint": "沙箱存活时长，到期后将被销毁或暂停。留空则使用服务端默认值。",
     "templateRequired": "请选择一个模板以继续。",
     "alias": "别名（可选）",
     "aliasPlaceholder": "如 my-dev-sandbox",
@@ -16,6 +21,11 @@
     "metaKey": "键",
     "metaValue": "值",
     "addMeta": "添加键值对"
+  },
+  "compat": {
+    "unpinned": "需重建",
+    "unpinnedHelp": "节点升级后，用这个模板新建沙箱可能失败。请先打开模板，点击「重建模板」。",
+    "openTemplate": "打开模板"
   },
   "actions": {
     "cancel": "取消",

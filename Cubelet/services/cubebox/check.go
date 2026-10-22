@@ -12,17 +12,19 @@ import (
 	"syscall"
 
 	"github.com/containerd/fifo"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/recov"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/taskio"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
+
+const debugStdoutFIFOFlags = syscall.O_RDWR | syscall.O_CREAT
 
 func checkParam(ctx context.Context, realReq *cubebox.RunCubeSandboxRequest) error {
 	if err := checkReqVolumes(ctx, realReq); err != nil {
@@ -51,10 +53,6 @@ func checkParam(ctx context.Context, realReq *cubebox.RunCubeSandboxRequest) err
 		if p <= 0 || p > 65535 {
 			return ret.Errorf(errorcode.ErrorCode_InvalidParamFormat, "invalid exposed port %d", p)
 		}
-	}
-	if len(realReq.GetExposedPorts()) > 4 {
-		return ret.Errorf(errorcode.ErrorCode_InvalidParamFormat,
-			"exposed ports should be at most 4")
 	}
 
 	if err != nil {
@@ -204,7 +202,12 @@ func debugStdout(ctx context.Context, id string) {
 	recov.GoWithRecover(
 		func() {
 			stdoutFifo := taskio.GetFIFOFile(id)
-			f, err := fifo.OpenFifo(context.Background(), stdoutFifo, syscall.O_RDONLY|syscall.O_CREAT|syscall.O_NONBLOCK, 0700)
+			// Hold both ends of the FIFO open for the lifetime of the debug
+			// reader. During pause the shim closes its writer; a read-only
+			// descriptor would then observe EOF and permanently stop consuming
+			// PID1 output, leaving no reader for the shim's non-blocking reopen
+			// on resume (ENXIO). O_RDWR keeps the reader alive across that gap.
+			f, err := fifo.OpenFifo(ctx, stdoutFifo, debugStdoutFIFOFlags, 0700)
 			if err != nil {
 				log.Errorf("%s OpenFifo err:%v", err)
 				return

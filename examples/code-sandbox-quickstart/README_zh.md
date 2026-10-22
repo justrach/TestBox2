@@ -8,8 +8,8 @@ Cube Sandbox 最基础的使用方式：创建沙箱、在其中运行 Python �
 
 **Cube Sandbox** 是轻量级 MicroVM 平台，控制面和数据面完全兼容 [E2B SDK](https://e2b.dev)。其设计分为两个平面：
 
-- **控制面 (Control Plane)**：负责沙箱生命周期管理。每次 `Sandbox.create()` 调用都会在 50ms 内从模板快照启动一个新的 KVM MicroVM。指令流经 CubeAPI/Master，最终由 Cubelet 在 VM 内通过 `cube-agent` (PID 1) 拉起 `envd` 服务。
-- **数据面 (Data Plane)**：负责沙箱内的代码执行和数据交互。流量经由 CubeProxy 直接路由至沙箱内的 `envd`，支持在隔离环境内运行 Python 或 Shell 脚本。沙箱完全隔离——拥有独立内核、文件系统和网络。`with` 块退出时，沙箱自动销毁。
+- **控制面 (Control Plane)**：负责沙箱生命周期管理。每次 `Sandbox.create()` 调用都会在 50ms 内从模板快照启动一个新的 KVM MicroVM。本示例使用的官方 `sandbox-code` 镜像中，创建请求到达 Cubelet 后，由 VM 内的 `cube-agent` (PID 1) 拉起 `envd`。
+- **数据面 (Data Plane)**：负责通过沙箱内的代码解释器执行代码，同时将 `commands.run`、`files.read/write` 等请求经由 CubeProxy 直接路由至沙箱内的 `envd`。沙箱完全隔离——拥有独立内核、文件系统和网络。`with` 块退出时，沙箱自动销毁。
 
 ```text
                              用户脚本 (E2B SDK)
@@ -18,7 +18,7 @@ Cube Sandbox 最基础的使用方式：创建沙箱、在其中运行 Python �
         ┌─────────────────────────────┴─────────────────────────────┐
         │                                                           │
  【1. 管理流程 Control Plane】                            【2. 调用流程 Data Plane】
-  (如 Sandbox.create / delete)                        (如 run_code, commands.run)
+  (如 Sandbox.create / delete)             (如 run_code, commands.run, files.read/write)
         │                                                           │
         ▼  REST API (端口 3000)                                     ▼  WSS / HTTP
      CubeAPI                                                    CubeProxy
@@ -31,14 +31,14 @@ Cube Sandbox 最基础的使用方式：创建沙箱、在其中运行 Python �
      Cubelet ──────────────┼──► cube-agent ──► envd  ◄──────────┼───┘
                            │     (PID 1)         │              │
                            │                     ▼              │
-                           │                Python / Shell      │
+                           │          Code Interpreter / envd   │
                            └────────────────────────────────────┘
 ```
 
 ## 2. 前置条件
 
 - 已部署的 Cube Sandbox 环境
-- Python 3.8+
+- Python 3.9+（`cubesandbox` 与 `e2b-code-interpreter` 依赖）
 
 ```bash
 pip install -r requirements.txt
@@ -73,6 +73,20 @@ cp .env.example .env
 
 之后直接运行任意示例脚本即可，无需手动 `export`。
 
+**集群外本地开发：** 若无法解析 `*.cube.app`，在 `.env` 中设置
+`CUBE_REMOTE_PROXY_BASE=https://<节点IP>:443`（CubeProxy 常用 443/8080/9090）。
+`load_local_dotenv()` 仅加载 `.env`；需要数据面的 E2B 脚本会调用
+`ensure_dev_sidecar()` 启动同级
+[`examples/e2b-dev-sidecar/`](../e2b-dev-sidecar/) 并为 **E2B SDK**
+（`e2b_code_interpreter`）打补丁，经本地 sidecar 转发数据面到 CubeProxy。
+需完整克隆本仓库；sidecar 启动失败时脚本会 warn 并继续。仅控制面的脚本
+（如 `create.py`）不会启动 sidecar。同目录下使用 `cubesandbox` SDK 的脚本
+（如 `auto-kill.py`）**不受** sidecar 补丁影响，集群外仍需 `*.cube.app` DNS
+或其它路由。`apply_create_time_envs()` 仅在 dev sidecar 生效时用 HTTP；
+否则 `/init` 默认走 HTTPS（仅在有意使用明文 HTTP 的部署中才用
+`CUBE_ENVD_INIT_SCHEME` 覆盖）。单次重试超时可调 `CUBE_ENVD_INIT_ATTEMPT_TIMEOUT_S`
+（默认每次 `5` 秒）。
+
 或直接导出：
 
 ```bash
@@ -93,9 +107,9 @@ python exec_code.py
 预期输出：
 
 ```
-Python 3.x.x (...)
 hello cube
-sum(1..100) = 5050
+
+Execution(Results: [], Logs: Logs(stdout: ['hello cube\n'], stderr: []), Error: None)
 ```
 
 ### 第四步 — 执行 Shell 命令
@@ -117,11 +131,15 @@ hello cube
 | `exec_code.py` | `sandbox.run_code()` — 在沙箱中执行 Python 代码 |
 | `cmd.py` | `sandbox.commands.run()` — 执行 Shell 命令 |
 | `create.py` | `sandbox.get_info()` — 获取沙箱元数据 |
+| `create_with_envs.py` | `Sandbox.create(envs=...)` — 创建时注入环境变量 |
 | `read.py` | `sandbox.files.read()` — 读取沙箱文件系统中的文件 |
 | `pause.py` | `sandbox.pause()` / `sandbox.connect()` — 快照与恢复 |
+| `auto-resume.py` | `lifecycle={"on_timeout": "pause", "auto_resume": True}` — 平台在空闲超时后自动暂停沙箱，下一次请求自动恢复 |
+| `auto-kill.py` | `lifecycle={"on_timeout": "kill"}` — 平台在空闲超时后直接销毁沙箱（默认行为，销毁不可逆，沙箱无法恢复） |
 | `network_no_internet.py` | `allow_internet_access=False` — 完全断网沙箱 |
 | `network_allowlist.py` | `allow_out` — 白名单 CIDR，拦截其余所有出口 |
 | `network_denylist.py` | `deny_out` — 黑名单 CIDR，其余放行 |
+| `restrict_public_access.py` | `network={"allow_public_traffic": False}` — 公网 URL 必须携带 per-sandbox token 才可访问 |
 
 ### exec_code.py — 运行 Python 代码
 
@@ -138,6 +156,20 @@ with Sandbox.create(template=template_id) as sandbox:
     print(result.stdout)
 ```
 
+### 创建时注入环境变量
+
+可以在创建沙箱时传入环境变量，后续在该沙箱中的命令执行也可以读取到这些变量：
+
+```python
+python create_with_envs.py
+```
+
+预期输出:
+
+```text
+session is user-session-test
+```
+
 ### pause.py — 暂停与恢复
 
 将运行中的沙箱快照以释放计算资源，之后恢复：
@@ -149,6 +181,48 @@ with Sandbox.create(template=template_id) as sandbox:
     sandbox.connect()     # 恢复快照，继续执行
     print(sandbox.get_info())
 ```
+
+### auto-resume.py — 自动暂停与自动恢复
+
+与 `pause.py` 类似，但暂停/恢复完全交给平台自动管理。`lifecycle` 参数与 e2b SDK 对齐
+（参考 [e2b 文档](https://e2b.dev/docs/sandbox/auto-resume)）：`on_timeout="pause"`
+表示空闲超时后由 sidecar 触发暂停；`auto_resume=True` 让下一次请求命中
+暂停沙箱时自动恢复：
+
+```python
+sandbox = Sandbox.create(
+    template=template_id,
+    timeout=30,             # auto-pause sidecar 用作空闲阈值
+    lifecycle={"on_timeout": "pause", "auto_resume": True},
+)
+sandbox.run_code("print('first call')")
+time.sleep(45)              # 超过空闲阈值，sidecar 暂停沙箱
+sandbox.run_code("print('back from a transparent resume')")
+sandbox.kill()
+```
+
+### auto-kill.py — 空闲超时后自动销毁
+
+`auto-resume.py` 的孪生销毁版本。`on_timeout="kill"`（不传 `lifecycle`
+时的默认值）告诉平台：沙箱空闲超过 `timeout` 后直接拆除 VM，不
+保留快照，下一次请求会以 **410 Gone** 快速失败：
+
+```python
+sandbox = Sandbox.create(
+    template=template_id,
+    timeout=30,             # 扫描器使用的空闲阈值
+    lifecycle={"on_timeout": "kill"},
+)
+sandbox.run_code("print('first call')")
+time.sleep(50)              # 超过空闲阈值，扫描器销毁沙箱
+try:
+    sandbox.run_code("print('should never run')")
+except Exception as exc:
+    print(f"sandbox is gone: {exc!r}")  # 销毁不可逆
+```
+
+TUI 版本额外交叉校验 `Sandbox.list()` 不再返回该沙箱，并创建一个对照
+沙箱来排除集群整体故障造成的假阳性。
 
 ### 网络策略
 
@@ -163,6 +237,31 @@ python network_allowlist.py
 python network_denylist.py
 ```
 
+### restrict_public_access.py — 限制公网 URL 访问
+
+默认情况下沙箱的公网 URL 任何知道地址的人都可访问。对敏感场景，可以在创建沙箱时
+传入 `network={"allow_public_traffic": False}`：CubeMaster 会为该沙箱签发一个
+`traffic_access_token`，CubeProxy 随后会拒绝所有未携带该 token 的请求
+（参考 [e2b 文档](https://e2b.dev/docs/network/restrict-public-access)）。
+请求方可以使用以下任一 header：
+
+- `e2b-traffic-access-token`（与 E2B 完全兼容）
+- `cube-traffic-access-token`（CubeSandbox 原生别名）
+
+```python
+sandbox = Sandbox.create(
+    template=template_id,
+    network={"allow_public_traffic": False},
+)
+url = f"http://{sandbox.get_host(80)}/"
+
+# 不带 token → 403
+requests.get(url)
+
+# 带 token → 200
+requests.get(url, headers={"e2b-traffic-access-token": sandbox.traffic_access_token})
+```
+
 ## 5. 常见问题
 
 | 现象 | 可能原因 | 解决方法 |
@@ -171,6 +270,8 @@ python network_denylist.py
 | `Template not found` | 模板 ID 错误 | 重新运行 `cubemastercli tpl list` |
 | `Connection refused` | CubeAPI 不可达 | 检查 `E2B_API_URL` 及端口 3000 |
 | `Sandbox timeout` | 沙箱超过 TTL | 增大 `Sandbox.create()` 中的 `timeout` |
+| `create_with_envs.py` 打印 `session is ` 但值为空 | cubebox/VNC 模板 create-time env 未落到 shell | 示例会 best-effort 调 `apply_create_time_envs()`（失败仅 warn）；仍为空则用 `commands.run(..., envs={...})` |
+| 设置 `CUBE_REMOTE_PROXY_BASE` 后 sidecar 未生效 | 只拷贝了 quickstart 目录或 sidecar 启动失败 | 使用完整仓库；检查 warn 信息。控制面脚本仍可运行，数据面需 sidecar 或 DNS |
 
 ## 6. 目录结构
 
@@ -181,11 +282,16 @@ code-sandbox-quickstart/
 ├── exec_code.py               # 在沙箱中运行 Python 代码
 ├── cmd.py                     # 执行 Shell 命令
 ├── create.py                  # 创建沙箱并查看元数据
+├── create_with_envs.py        # 创建时注入环境变量
+├── env_utils.py               # 共享的 .env 加载辅助脚本
 ├── read.py                    # 读取沙箱文件系统中的文件
 ├── pause.py                   # 暂停与恢复沙箱
+├── auto-resume.py             # 自动暂停 / 自动恢复（基于空闲超时）
+├── auto-kill.py               # 空闲超时后自动销毁（不可恢复）
 ├── network_no_internet.py     # 完全断网沙箱
 ├── network_allowlist.py       # 出口 CIDR 白名单
 ├── network_denylist.py        # 出口 CIDR 黑名单
+├── restrict_public_access.py  # 公网 URL 鉴权 token
 ├── requirements.txt           # Python 依赖
 └── .env.example               # 环境变量模板
 ```

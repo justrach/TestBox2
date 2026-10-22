@@ -156,22 +156,32 @@ type sessionKey struct {
 }
 
 type natSession struct {
-	AccessTime  uint64
-	NodeIfindex uint32
-	NodeIP      uint32
-	VMIfindex   uint32
-	VMIP        uint32
-	NodePort    uint16
-	VMPort      uint16
-	State       uint8
-	ActiveClose uint8
-	Reserved    [34]uint8
+	AccessTime    uint64
+	NodeIfindex   uint32
+	NodeIP        uint32
+	VMIfindex     uint32
+	VMIP          uint32
+	NodePort      uint16
+	VMPort        uint16
+	State         uint8
+	ActiveClose   uint8
+	PacketClass   uint8
+	L7Scheme      uint8
+	PolicyVersion uint32
+	Gen           uint32
+	Reserved      [24]uint8
 }
 
 // timeout returns the timeout for the session in nanoseconds.
 func (s *natSession) tcpTimeout() uint64 {
-	if s.State == uint8(tcpCTTimeWait) && s.ActiveClose == 1 {
-		// The guest kernel active close the connection
+	guestActiveClose := s.ActiveClose == 1
+	if s.PacketClass == packetClassPortMapping {
+		// Port mapping reverses the usual conntrack orientation: ORIGINAL is
+		// the external client and REPLY is the guest server.
+		guestActiveClose = s.ActiveClose == 0
+	}
+	if s.State == uint8(tcpCTTimeWait) && guestActiveClose {
+		// The guest kernel actively closed the connection.
 		return uint64(tcpTimeouts[tcpCTClose].Nanoseconds())
 	}
 
@@ -221,16 +231,8 @@ type ingressSessionValue struct {
 	Reserved [3]uint16
 }
 
-//nolint:unused
-func ingressSession(key *sessionKey, value *ingressSessionValue) string {
-	return fmt.Sprintf("%s:%d->%s:%d(%s:%d)",
-		uint32ToIP(key.SourceIP), ntohs(key.SourcePort),
-		uint32ToIP(key.TargetIP), ntohs(key.TargetPort),
-		uint32ToIP(value.VMIP), ntohs(value.VMPort))
-}
-
 // StartSessionReaper starts a goroutine that will periodically
-// check for sessions that have expired and remove them.
+// check for sessions and DNS-learned policies that have expired and remove them.
 func StartSessionReaper() <-chan Event {
 	once.Do(func() {
 		go doReap()
@@ -241,8 +243,10 @@ func StartSessionReaper() <-chan Event {
 func doReap() {
 	ticker := time.NewTicker(reapSessionsInterval)
 	defer ticker.Stop()
+
 	for range ticker.C {
 		reapSessions()
+		reapDNSState()
 	}
 }
 
@@ -354,33 +358,7 @@ func reapSessions() {
 		return
 	}
 
-	var (
-		key   sessionKey
-		value natSession
-		count int
-	)
-	iter := m.Iterate()
-	for iter.Next(&key, &value) {
-		count++
-		if sessionExpired(now, &key, &value) {
-			err := deleteSessions(m, m2, &key, &value)
-			if err != nil {
-				enqueueEvent(Event{
-					Error:   err,
-					Message: "failed to delete sessions",
-				})
-			}
-
-			if !sessionClosedNormally(&key, &value) {
-				enqueueEvent(Event{
-					Error:   ErrSessionExpiredNotClosed,
-					Message: egressSession(&key, &value, now),
-				})
-			}
-		}
-	}
-
-	err = iter.Err()
+	count, err := reapSessionMaps(m, m2, now)
 	if err != nil {
 		// Known error:
 		//   - ErrIterationAborted
@@ -396,4 +374,56 @@ func reapSessions() {
 	}
 
 	reportCount(count)
+}
+
+// reapSessionMaps removes expired egress sessions and their ingress
+// counterparts. count is the number of entries visited.
+//
+// An expired key is deleted on the following step, after Iterate has moved
+// the cursor past it. Deleting the key Iterate will use next restarts a hash
+// map from the first bucket. The last key is deleted after the walk finishes.
+func reapSessionMaps(egressSessions, ingressSessions *ebpf.Map, now uint64) (int, error) {
+	var (
+		key     sessionKey
+		value   natSession
+		prevKey sessionKey
+		prevVal natSession
+		hasPrev bool
+		count   int
+	)
+	iter := egressSessions.Iterate()
+	for iter.Next(&key, &value) {
+		if hasPrev {
+			deleteExpiredSession(egressSessions, ingressSessions, now, &prevKey, &prevVal)
+		}
+		prevKey = key
+		prevVal = value
+		hasPrev = true
+		count++
+	}
+	if hasPrev {
+		deleteExpiredSession(egressSessions, ingressSessions, now, &prevKey, &prevVal)
+	}
+	if err := iter.Err(); err != nil {
+		return count, err
+	}
+	return count, nil
+}
+
+func deleteExpiredSession(egressSessions, ingressSessions *ebpf.Map, now uint64, key *sessionKey, sess *natSession) {
+	if !sessionExpired(now, key, sess) {
+		return
+	}
+	if err := deleteSessions(egressSessions, ingressSessions, key, sess); err != nil {
+		enqueueEvent(Event{
+			Error:   err,
+			Message: "failed to delete sessions",
+		})
+	}
+	if !sessionClosedNormally(key, sess) {
+		enqueueEvent(Event{
+			Error:   ErrSessionExpiredNotClosed,
+			Message: egressSession(key, sess, now),
+		})
+	}
 }

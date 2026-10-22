@@ -11,7 +11,7 @@ import (
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/recov"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 var (
@@ -41,6 +41,17 @@ func DeleteSandboxCache(sandboxID string) {
 
 func SetSandboxCache(sandboxID string, cache *SandboxCache) {
 	listCache.Store(sandboxID, cache)
+}
+
+func ListKnownSandboxIDs() []string {
+	ids := make([]string, 0)
+	listCache.Range(func(key, _ any) bool {
+		if sandboxID, ok := key.(string); ok && sandboxID != "" {
+			ids = append(ids, sandboxID)
+		}
+		return true
+	})
+	return ids
 }
 
 func (l *local) cleanSandboxCache(ctx context.Context) {

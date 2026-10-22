@@ -17,6 +17,19 @@ use crate::{
 
 // ── POST /sandboxes/:sandboxID/snapshots ──────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/sandboxes/{sandboxID}/snapshots",
+    params(
+        ("sandboxID" = String, Path, description = "Sandbox identifier")
+    ),
+    request_body = CreateSnapshotRequest,
+    responses(
+        (status = 201, description = "Snapshot created", body = SnapshotInfo),
+        (status = 404, description = "Sandbox not found", body = ApiError),
+        (status = 500, description = "Unexpected backend error", body = ApiError)
+    )
+)]
 pub async fn create_snapshot(
     State(state): State<AppState>,
     Path(sandbox_id): Path<String>,
@@ -27,7 +40,7 @@ pub async fn create_snapshot(
     let info: SnapshotInfo = state
         .services
         .snapshots
-        .create(&sandbox_id, body.name)
+        .create(&sandbox_id, body.name, body.backend)
         .await?;
 
     tracing::info!(
@@ -58,6 +71,7 @@ pub async fn list_snapshots(
         sandbox_id = ?params.sandbox_id,
         limit = ?params.limit,
         next_token = ?params.next_token,
+        backend = ?params.backend,
         "list_snapshots"
     );
 
@@ -94,6 +108,19 @@ pub async fn list_snapshots(
 
 // ── POST /sandboxes/:sandboxID/rollback ───────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/sandboxes/{sandboxID}/rollback",
+    params(
+        ("sandboxID" = String, Path, description = "Sandbox identifier")
+    ),
+    request_body = RollbackRequest,
+    responses(
+        (status = 200, description = "Sandbox rolled back to snapshot", body = crate::models::RollbackResponse),
+        (status = 404, description = "Sandbox or snapshot not found", body = ApiError),
+        (status = 500, description = "Unexpected backend error", body = ApiError)
+    )
+)]
 pub async fn rollback_sandbox(
     State(state): State<AppState>,
     Path(sandbox_id): Path<String>,
@@ -108,7 +135,7 @@ pub async fn rollback_sandbox(
     let resp = state
         .services
         .snapshots
-        .rollback(&sandbox_id, &body.snapshot_id)
+        .rollback(&sandbox_id, &body.snapshot_id, body.backend)
         .await?;
 
     tracing::info!(

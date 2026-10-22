@@ -6,6 +6,8 @@ package sandbox
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -15,10 +17,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
-	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
@@ -34,8 +35,14 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/task"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	volrefcount "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/volume/refcount"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
+
+var setSandboxProxyMapFn = localcache.SetSandboxProxyMap
+var getSandboxProxyMapFn = localcache.GetSandboxProxyMap
 
 type createSandboxContext struct {
 	selctx           *selctx.SelectorCtx
@@ -131,7 +138,7 @@ func CreateSandbox(ctx context.Context, req *types.CreateCubeSandboxReq) (rsp *t
 				"RetCode": int64(rsp.Ret.RetCode),
 			}).Errorf("CreateSandbox_rsp fail:%+v", msg)
 		} else {
-			log.G(ctx).Infof("CreateSandbox_rsp:%s", utils.InterfaceToString(rsp))
+			log.G(ctx).Infof("CreateSandbox_rsp:%s", safePrintCreateCubeSandboxRes(rsp))
 		}
 	}()
 
@@ -211,6 +218,20 @@ func (c *createSandboxContext) handleCubelet() {
 			return
 		}
 
+		// Final cordon gate on this replica before Cubelet Create.
+		if err := c.refreshAndAdmitHost(); err != nil {
+			if c.directHost {
+				status, _ := ret.FromError(err)
+				c.setMasterRsp(int(status.Code()), status.Message())
+				return
+			}
+			c.selctx.AddLastBadNode(c.selectHost)
+			c.reschedule = true
+			log.G(c.ctx).Warnf("selected host blocked by scheduling admission, reschedule host=%s err=%v",
+				c.selectHost.ID(), err)
+			continue
+		}
+
 		if c.callCubelet() {
 			c.retryCost += c.cubeletEndTime.Sub(c.cubeletStartTime)
 			c.retryTimes++
@@ -225,6 +246,33 @@ func (c *createSandboxContext) handleCubelet() {
 		c.dealSuccResult()
 		return
 	}
+}
+
+func (c *createSandboxContext) refreshAndAdmitHost() error {
+	current, err := admitSelectedHost(c.selectHost, localcache.GetNode)
+	if err != nil {
+		return err
+	}
+	c.selectHost = current
+	return nil
+}
+
+// admitSelectedHost re-reads the selected host from cache and rejects cordoned
+// nodes. getNode is injected so unit tests cover all admission paths without a
+// live localcache.
+func admitSelectedHost(selected *node.Node, getNode func(string) (*node.Node, bool)) (*node.Node, error) {
+	if selected == nil {
+		return nil, ret.Err(errorcode.ErrorCode_SelectNodesFailed, "no selected host")
+	}
+	current, ok := getNode(selected.ID())
+	if !ok {
+		return nil, ret.Errorf(errorcode.ErrorCode_SelectNodesFailed, "selected host missing from cache: %s", selected.ID())
+	}
+	if !current.SchedulingAllowed() {
+		return nil, ret.Errorf(errorcode.ErrorCode_SelectNodesFailed,
+			"node %s is scheduling-disabled (cordon); new sandboxes are not admitted", current.ID())
+	}
+	return current, nil
 }
 
 func (c *createSandboxContext) callCubelet() bool {
@@ -263,6 +311,9 @@ func (c *createSandboxContext) dealSuccResult() {
 				c.masterRsp.ExtInfo[constants.CubeExtNumaKey] = string(v)
 			}
 		}
+		// Apply any node-level volume ref-count transitions (0→1) reported by
+		// Cubelet so the volume DB knows how many nodes reference each volume.
+		volrefcount.ApplyFromExtInfo(c.ctx, c.cubeletRsp.GetExtInfo())
 		if config.GetConfig().CubeletConf.EnableExposedPort {
 			if c.cubeletRsp.GetPortMappings() != nil {
 				c.cubeletRspPorts = make(map[string]string)
@@ -521,19 +572,51 @@ func (c *createSandboxContext) setProxyToRedis() error {
 	}
 	switch c.cubeletReq.GetInstanceType() {
 	case cubebox.InstanceType_cubebox.String():
+		// allow_public_traffic defaults to true (publicly reachable) to keep
+		// pre-feature behavior intact. Only an explicit false unlocks the
+		// per-sandbox token flow.
+		allowPublic := true
+		origReq := createOriginRequestFromContext(c.ctx)
+		if origReq != nil &&
+			origReq.CubeNetworkConfig != nil &&
+			origReq.CubeNetworkConfig.AllowPublicTraffic != nil {
+			allowPublic = *origReq.CubeNetworkConfig.AllowPublicTraffic
+		}
+		maskRequestHost := ""
+		if origReq != nil &&
+			origReq.CubeNetworkConfig != nil &&
+			origReq.CubeNetworkConfig.MaskRequestHost != nil {
+			maskRequestHost = *origReq.CubeNetworkConfig.MaskRequestHost
+		}
+		var token string
+		if !allowPublic {
+			sum := sha256.Sum256([]byte(uuid.NewString()))
+			token = hex.EncodeToString(sum[:])
+		}
+
 		proxy := &proxytypes.SandboxProxyMap{
-			HostIP:      c.selectHost.HostIP(),
-			SandboxID:   c.masterRsp.SandboxID,
-			SandboxIP:   c.masterRsp.SandboxIP,
-			SandboxPort: "8080",
-			CreatedAt:   strconv.FormatInt(time.Now().UnixNano(), 10),
+			HostIP:             c.selectHost.HostIP(),
+			SandboxID:          c.masterRsp.SandboxID,
+			SandboxIP:          c.masterRsp.SandboxIP,
+			SandboxPort:        "8080",
+			CreatedAt:          strconv.FormatInt(time.Now().UnixNano(), 10),
+			AllowPublicTraffic: allowPublic,
+			TrafficAccessToken: token,
+			MaskRequestHost:    maskRequestHost,
 		}
 
 		if config.GetConfig().CubeletConf.EnableExposedPort {
 			proxy.ContainerToHostPorts = c.cubeletRspPorts
 		}
 
-		return localcache.SetSandboxProxyMap(c.ctx, proxy)
+		if err := setSandboxProxyMapFn(c.ctx, proxy); err != nil {
+			return err
+		}
+		// Surface the token to the master response only after the proxy
+		// metadata is durably in Redis — avoids the window where API
+		// callers receive a token CubeProxy cannot yet validate.
+		c.masterRsp.TrafficAccessToken = token
+		return nil
 	}
 	return nil
 }
@@ -562,7 +645,9 @@ func (c *createSandboxContext) newContext(ctx context.Context, req *types.Create
 	}
 	c.selctx.ReqRes = reqResource
 
-	c.ctx, c.cancel = context.WithTimeout(ctx, time.Duration(req.Timeout)*time.Second)
+	// Create RPC deadline uses create_timeout_insec, not idle TTL.
+	createDeadline := time.Duration(config.GetConfig().CubeletConf.CreateTimeoutInsec) * time.Second
+	c.ctx, c.cancel = context.WithTimeout(ctx, createDeadline)
 	c.selctx.Ctx = c.ctx
 
 	switch {

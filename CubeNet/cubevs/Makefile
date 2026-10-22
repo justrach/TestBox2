@@ -1,7 +1,8 @@
 COVERAGE_PROFILE=.coverage
 COVERAGE_REPORT=coverage.html
 
-BPF_OBJS := $(wildcard *_bpfel.o)
+BPF_GENS := $(wildcard *_bpfel*.go)
+BPF_OBJS := $(wildcard *_bpfel*.o)
 
 ifeq ($(V),1)
 	Q =
@@ -26,13 +27,18 @@ gen:
 	$(call msg,GENERATE BPF)
 	$(Q)go generate ./...
 
+.PHONY: fmt
+fmt:
+	$(call msg,FORMAT)
+	$(Q)go fmt ./...
+
 .PHONY: lint
 lint:
 	$(call msg,RUN LINTERS)
 	$(Q)golangci-lint run --fix
 
 .PHONY: test
-test:
+test: gen
 	$(call msg,RUN TESTS)
 	$(Q)go clean -testcache
 	$(Q)go test $(VERBOSE) -cover -coverprofile=$(COVERAGE_PROFILE) ./...
@@ -48,4 +54,4 @@ $(BPF_OBJS):
 .PHONY: clean
 clean:
 	$(call msg,CLEAN)
-	$(Q)rm -f $(COVERAGE_PROFILE) $(COVERAGE_REPORT)
+	$(Q)rm -f $(COVERAGE_PROFILE) $(COVERAGE_REPORT) $(BPF_GENS) $(BPF_OBJS)

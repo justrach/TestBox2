@@ -10,7 +10,7 @@ import (
 	"unicode"
 
 	"github.com/containerd/plugin"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 const (
@@ -151,6 +151,13 @@ const (
 
 	CubeExtQueueKey = "cube-ext-queue"
 
+	// CubeExtVolumeRefEvents carries a JSON array of plugin_volume node-level
+	// reference-state changes ([{"volume_id","referenced"}]) reported to
+	// CubeMaster on create/destroy responses. referenced is 1 when this node
+	// started referencing the volume (0→1) and 0 when it stopped (1→0); repeat
+	// references on the same node emit no entry.
+	CubeExtVolumeRefEvents = "cube-volume-refcount-events"
+
 	CubeShimPid = "shim-pid"
 	CubeVmPid   = "vm-pid"
 )
@@ -196,20 +203,61 @@ const (
 	// matches the memory file recorded here.
 	MasterAnnotationRuntimeRestoreSnapshotID         = "cube.master.runtime.restore.snapshot.id"
 	MasterAnnotationRuntimeRestoreSnapshotAttachedAt = "cube.master.runtime.restore.snapshot.attached_at"
+	// MasterAnnotationPauseSnapshotID is the Master-allocated pause snapshot
+	// id (same snap-* format as normal Commit snapshots). Cubelet only stores
+	// the local catalog under this id; Kind=pause_snapshot.
+	MasterAnnotationPauseSnapshotID = "cube.master.pause.snapshot.id"
+	// MasterAnnotationLaunchMemorySnapshotID is the template or customer
+	// snapshot the sandbox was first started from. Pause may clone it only
+	// when it is still the VM's last restore (first Pause after
+	// Create-from-template). Resume and Commit must not overwrite it.
+	MasterAnnotationLaunchMemorySnapshotID = "cube.master.launch.memory.snapshot.id"
+	// MasterAnnotationStorageBackend is the CoW backend Master passes on
+	// Pause / Commit (xfs/s3). Empty means xfs.
+	MasterAnnotationStorageBackend = "cube.master.storage.backend"
+	// MasterAnnotationSnapshotRemoteUUIDs is the JSON blob of remote
+	// volume uuids (rootfs/memory/metadata) for cubecow_import_lvol.
+	MasterAnnotationSnapshotRemoteUUIDs = "cube.master.snapshot.remote_uuids"
+	// MasterAnnotationSnapshotCrossNode says placement landed this restore on
+	// a node that holds no replica of the package, so it has to be imported
+	// from S3 first. Value is the literal "true". Master is the only one that
+	// can know this, so Cubelet takes it as fact and refuses a restore it
+	// cannot satisfy instead of failing later on an unexplained catalog miss.
+	MasterAnnotationSnapshotCrossNode = "cube.master.snapshot.cross_node"
+	// MasterAnnotationDesiredSandboxID asks createid to use this sandbox ID
+	// instead of generating a new one (Resume-from-pause / same-ID recreate).
+	MasterAnnotationDesiredSandboxID = "cube.master.desired.sandbox.id"
+	// AnnotationPauseKeepTombstone is set on in-process Destroy after
+	// PauseToSnapshot (Cubelet Pause owns this; Master no longer issues a
+	// separate Destroy RPC): Detach volumes / wipe leftover live runtime, but
+	// keep the PAUSED CubeBox row for List/Info. PauseToSnapshot leaves the
+	// shim alive; Destroy's paused path uses task Delete to reap it.
+	AnnotationPauseKeepTombstone = "cube.pause.keep_tombstone"
+	// AnnotationPauseDeleteTombstone is set when deleting a paused sandbox for
+	// good: remove the PAUSED CubeBox store row (after pause-snap CleanupTemplate
+	// on Master).
+	AnnotationPauseDeleteTombstone = "cube.pause.delete_tombstone"
 
-	MasterAnnotationAppSnapshotVersion               = "cube.master.appsnapshot.version"
-	MasterAnnotationRootfsArtifactID                 = "cube.master.rootfs.artifact.id"
-	MasterAnnotationRootfsArtifactJobID              = "cube.master.rootfs.artifact.job_id"
-	MasterAnnotationRootfsArtifactURL                = "cube.master.rootfs.artifact.url"
-	MasterAnnotationRootfsArtifactToken              = "cube.master.rootfs.artifact.token"
-	MasterAnnotationRootfsArtifactSHA256             = "cube.master.rootfs.artifact.sha256"
-	MasterAnnotationRootfsArtifactSizeBytes          = "cube.master.rootfs.artifact.size_bytes"
-	MasterAnnotationWritableLayerSize                = "cube.master.rootfs.writable_layer_size"
-	MasterAnnotationTemplateSpecFingerprint          = "cube.master.template.spec_fingerprint"
-	MasterAnnotationInstanceType                     = "cube.master.instance.type"
-	MasterAnnotationNetworkPolicyBlockAll            = "cube.master.network.policy.block_all"
-	MasterAnnotationNetworkPolicyAllowPublicServices = "cube.master.network.policy.allow_public_services"
-	MasterAnnotationNetworkPolicyDefault             = "cube.master.network.policy.default"
+	MasterAnnotationAppSnapshotVersion      = "cube.master.appsnapshot.version"
+	MasterAnnotationRootfsArtifactID        = "cube.master.rootfs.artifact.id"
+	MasterAnnotationRootfsArtifactJobID     = "cube.master.rootfs.artifact.job_id"
+	MasterAnnotationRootfsArtifactURL       = "cube.master.rootfs.artifact.url"
+	MasterAnnotationRootfsArtifactToken     = "cube.master.rootfs.artifact.token"
+	MasterAnnotationRootfsArtifactSHA256    = "cube.master.rootfs.artifact.sha256"
+	MasterAnnotationRootfsArtifactSizeBytes = "cube.master.rootfs.artifact.size_bytes"
+	MasterAnnotationWritableLayerSize       = "cube.master.rootfs.writable_layer_size"
+	MasterAnnotationTemplateSpecFingerprint = "cube.master.template.spec_fingerprint"
+	MasterAnnotationComponentEnvdVersion    = "cube.master.components.envd.version"
+	MasterAnnotationCreateTimeEnvVars       = "cube.master.internal.create_time_env_vars"
+	MasterAnnotationInstanceType            = "cube.master.instance.type"
+)
+
+// Inventory version annotations used by Ensure
+const (
+	MasterAnnotationComponentCubeShimVersion   = "cube.master.components.cube-shim.version"
+	MasterAnnotationComponentCubeKernelVersion = "cube.master.components.cube-kernel-scf.version"
+	MasterAnnotationComponentCubeImageVersion  = "cube.master.components.cube-image.version"
+	MasterAnnotationComponentCubeAgentVersion  = "cube.master.components.cube-agent.version"
 )
 
 const (
@@ -227,8 +275,9 @@ const (
 	AnnotationsNetCubeVips        = "cube.net.vips"
 	AnnotationsCgroupPath         = "cube.sandbox_cgroup_path"
 	AnnotationsRuntimeCfgPath     = "cube.runtime.config.path"
-	AnnotationsVMImagePath        = "cube.vm.image.path"
+	AnnotationsVMOSImagePath      = "cube.vm.os-image.path"
 	AnnotationsVMKernelPath       = "cube.vm.kernel.path"
+	AnnotationsVMAgentPath        = "cube.vm.agent.path"
 	AnnotationsRootfsWritableKey  = "cube.rootfs.wlayer.path"
 	AnnotationsRootfsWlayerSubdir = "cube.rootfs.wlayer.subdir"
 	AnnotationsCubeMsgKey         = "cube.msg.dev.path"
@@ -303,6 +352,7 @@ const (
 	UpdateActionRemoveDevice = "removeDevice"
 	UpdateActionPause        = "pause"
 	UpdateActionResume       = "resume"
+	UpdateActionNetwork      = "network"
 	PreStopTypePause         = "pause"
 	PreStopTypeDestroy       = "destroy"
 )

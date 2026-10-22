@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/gomodule/redigo/redis"
@@ -17,11 +18,12 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/recov"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/rediskey"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/wrapredis"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 type RedisNodeInfo struct {
@@ -81,6 +83,28 @@ type NodeMetric struct {
 	SysDiskUsagePer     float64
 }
 
+const (
+	templateImageJobPullProgressExpireSeconds = int64(time.Hour / time.Second)
+	templateImageJobPullProgressSetScript     = `
+redis.call('HSET', KEYS[1], unpack(ARGV, 2))
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return 1
+`
+)
+
+func templateImageJobPullProgressKey(jobID string) string {
+	return "template_image_job_pull_progress" + ":" + jobID
+}
+
+func templateImageJobPullProgressSetArgs(key string, progress *types.TemplateImageJobPullProgressMap) redis.Args {
+	return redis.Args{
+		templateImageJobPullProgressSetScript,
+		1,
+		key,
+		templateImageJobPullProgressExpireSeconds,
+	}.AddFlat(progress)
+}
+
 // WriteNodeMetric persists a cubelet-reported metric snapshot to Redis so
 // all cubemaster replicas converge on the same view through their existing
 // loopUpdateMetric tick. We deliberately overwrite update_at with the
@@ -104,13 +128,13 @@ func WriteNodeMetric(ctx context.Context, m *NodeMetric) error {
 	// Enumerate only the groups the cubelet actually reported. AddFlat
 	// of RedisNodeInfo would emit zero values for every untagged field
 	// and would also clobber RealTimeCreateNum / CpuUtil that this
-	// heartbeat never measured, so we hand-build the HSET args list.
-	args := redis.Args{m.NodeID,
+	// heartbeat never measured, so we hand-build the HSET field list.
+	fields := []interface{}{
 		"ins_id", m.NodeID,
 		"update_at", string(updateAt),
 	}
 	if m.HasAllocated {
-		args = args.Add(
+		fields = append(fields,
 			"quota_cpu_usage", m.MilliCPUUsage,
 			"quota_mem_mb_usage", m.MemoryMBUsage,
 			"mvm_num", m.MvmNum,
@@ -118,20 +142,63 @@ func WriteNodeMetric(ctx context.Context, m *NodeMetric) error {
 		)
 	}
 	if m.HasDisk {
-		args = args.Add(
+		fields = append(fields,
 			"data_disk_usage_per", m.DataDiskUsagePer,
 			"storage_disk_usage_per", m.StorageDiskUsagePer,
 			"sys_disk_usage_per", m.SysDiskUsagePer,
 		)
 	}
-	if _, err := wrapredis.GetRedis(wrapredis.RedisWrite).Do("HSET", args...); err != nil {
-		log.G(ctx).Errorf("WriteNodeMetric HSET %s failed: %v", m.NodeID, err)
+	conn := wrapredis.GetRedis()
+	ttl := nodeMetricTTLSec()
+	key := rediskey.NodeMetric(m.NodeID)
+	if _, err := conn.Do("HSET", redis.Args{key}.Add(fields...)...); err != nil {
+		log.G(ctx).Errorf("WriteNodeMetric HSET %s failed: %v", key, err)
 		return err
+	}
+	// Refresh a safety TTL on every heartbeat so offline nodes expire
+	// instead of lingering forever; live nodes keep refreshing it.
+	if ttl > 0 {
+		if _, err := conn.Do("EXPIRE", key, ttl); err != nil {
+			log.G(ctx).Errorf("WriteNodeMetric EXPIRE %s failed: %v", key, err)
+		}
 	}
 	if log.IsDebug() {
 		log.G(ctx).Debugf("WriteNodeMetric: %+v", m)
 	}
 	return nil
+}
+
+// nodeMetricTTLSec returns the configured node-metric safety TTL in seconds.
+func nodeMetricTTLSec() int {
+	if c := config.GetConfig().RedisConf; c != nil {
+		return c.NodeMetricTTLSec
+	}
+	return 0
+}
+
+// sandboxProxyTTLSec returns the configured sandbox-proxy safety TTL in seconds.
+func sandboxProxyTTLSec() int {
+	if c := config.GetConfig().RedisConf; c != nil {
+		return c.SandboxProxyTTLSec
+	}
+	return 0
+}
+
+// getNodeMetricWithFallback reads a node metric following the migration read
+// order (new key first, legacy bare-id fallback during the dual phase).
+func (l *local) getNodeMetricWithFallback(ctx context.Context, nodeID string) (*node.Node, bool, error) {
+	var lastErr error
+	for _, key := range rediskey.ReadKeysWithFallback(rediskey.NodeMetric(nodeID), rediskey.LegacyNodeMetric(nodeID)) {
+		n, found, err := l.getNodeMetricFromRedis(ctx, key)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if found {
+			return n, true, nil
+		}
+	}
+	return nil, false, lastErr
 }
 
 // UpdateNodeMetricInProcess pushes a metric directly into the receiving
@@ -183,7 +250,7 @@ func UpdateNodeMetricInProcess(m *NodeMetric) error {
 func (l *local) loadMetricFromRedis() error {
 	elems := l.cache.Items()
 	for k := range elems {
-		if tmpNode, found, err := l.getNodeMetricFromRedis(context.Background(), k); found && err == nil {
+		if tmpNode, found, err := l.getNodeMetricWithFallback(context.Background(), k); found && err == nil {
 			if err := l.updateNodeMetric(tmpNode); err != nil {
 
 				CubeLog.WithContext(context.Background()).Warnf("updateMetric fail:%v", err)
@@ -211,10 +278,13 @@ func (l *local) loopUpdateMetric(ctx context.Context) {
 				defer func() {
 					checkDeadline = time.Now().Add(config.GetConfig().Common.SyncMetricDataInterval)
 				}()
-				ctx = context.WithValue(ctx, CubeLog.KeyRequestID, uuid.New().String())
+				// Keep the loop's base context immutable. Reassigning ctx here would
+				// create an unbounded valueCtx chain (one layer per metric tick),
+				// making every later ctx.Value/Done lookup increasingly expensive.
+				metricCtx := context.WithValue(ctx, CubeLog.KeyRequestID, uuid.New().String())
 				elems := l.cache.Items()
 				for k := range elems {
-					if tmpNode, found, err := l.getNodeMetricFromRedis(ctx, k); found && err == nil {
+					if tmpNode, found, err := l.getNodeMetricWithFallback(metricCtx, k); found && err == nil {
 						if err := l.updateNodeMetric(tmpNode); err != nil {
 
 							CubeLog.WithContext(context.Background()).Fatalf("updateMetric fail:%v", err)
@@ -232,7 +302,7 @@ func (l *local) loopUpdateMetric(ctx context.Context) {
 }
 
 func (l *local) getNodeMetricFromRedis(ctx context.Context, key string) (*node.Node, bool, error) {
-	values, err := redis.Values(wrapredis.GetRedis(wrapredis.RedisRead).Do("HGETALL", key))
+	values, err := redis.Values(wrapredis.GetRedis().Do("HGETALL", key))
 	if err != nil {
 		CubeLog.WithContext(ctx).Fatalf("getNodeMetricFromRedis %s err:%s", key, err)
 		return nil, false, err
@@ -268,7 +338,7 @@ func (l *local) getNodeMetricFromRedis(ctx context.Context, key string) (*node.N
 }
 
 func (l *local) getByPassProsyFromRedis(ctx context.Context, key string) (*types.SandboxProxyMap, error) {
-	mapvalues, err := redis.StringMap(wrapredis.GetRedis(wrapredis.RedisRead).Do("HGETALL", key))
+	mapvalues, err := redis.StringMap(wrapredis.GetRedis().Do("HGETALL", key))
 	if err != nil {
 		if errors.Is(err, redis.ErrNil) {
 			log.G(ctx).Debugf("no such key in redis:%s", key)
@@ -299,6 +369,22 @@ func (l *local) getByPassProsyFromRedis(ctx context.Context, key string) (*types
 		nodeIdIp.SandboxIP = sandboxIP
 		delete(mapvalues, "SandboxIP")
 	}
+	if v, ok := mapvalues["AllowPublicTraffic"]; ok {
+		// Missing field on legacy entries is treated as the historical
+		// default (true / publicly reachable).
+		nodeIdIp.AllowPublicTraffic, _ = strconv.ParseBool(v)
+		delete(mapvalues, "AllowPublicTraffic")
+	} else {
+		nodeIdIp.AllowPublicTraffic = true
+	}
+	if v, ok := mapvalues["TrafficAccessToken"]; ok {
+		nodeIdIp.TrafficAccessToken = v
+		delete(mapvalues, "TrafficAccessToken")
+	}
+	if v, ok := mapvalues["MaskRequestHost"]; ok {
+		nodeIdIp.MaskRequestHost = v
+		delete(mapvalues, "MaskRequestHost")
+	}
 
 	if len(mapvalues) == 0 {
 		log.G(ctx).Warnf("key: %s,has no ContainerToHostPorts", key)
@@ -312,7 +398,7 @@ func (l *local) getByPassProsyFromRedis(ctx context.Context, key string) (*types
 }
 
 func (l *local) getInsInfoFromRedis(ctx context.Context, key string) (*types.InstanceInfoMap, error) {
-	values, err := redis.Values(wrapredis.GetRedis(wrapredis.RedisRead).Do("HGETALL", key))
+	values, err := redis.Values(wrapredis.GetRedis().Do("HGETALL", key))
 	if err != nil {
 		if errors.Is(err, redis.ErrNil) {
 			log.G(ctx).Debugf("no such key in redis:%s", key)
@@ -336,8 +422,10 @@ func (l *local) getInsInfoFromRedis(ctx context.Context, key string) (*types.Ins
 
 func (l *local) setInstanceInfoMapToRedis(ctx context.Context, key string, info *types.InstanceInfoMap) (err error) {
 	start := time.Now()
-	defer traceRedis(ctx, "Create", "HSET", key, start, err)
-	_, err = wrapredis.GetRedis(wrapredis.RedisWrite).Do("HSET", redis.Args{key}.AddFlat(info)...)
+	defer func() {
+		traceRedis(ctx, "Create", "HSET", key, start, err)
+	}()
+	_, err = wrapredis.GetRedis().Do("HSET", redis.Args{key}.AddFlat(info)...)
 	if err != nil {
 		log.G(ctx).Errorf("redis set error, key: %s, err: %s", key, err)
 		return err
@@ -350,22 +438,42 @@ func (l *local) setInstanceInfoMapToRedis(ctx context.Context, key string, info 
 
 func (l *local) setByPassProsyToRedis(ctx context.Context, key string, byPassProsy *types.SandboxProxyMap) (err error) {
 	start := time.Now()
-	defer traceRedis(ctx, "Create", "HSET", key, start, err)
+	defer func() {
+		traceRedis(ctx, "Create", "HSET", key, start, err)
+	}()
 
 	fieldValues := []interface{}{
 		"HostIP", byPassProsy.HostIP,
 		"CreatedAt", byPassProsy.CreatedAt,
+		// Always written so CubeProxy can distinguish "explicit public" from
+		// a legacy entry written before this field existed (legacy → field
+		// missing → treated as public).
+		"AllowPublicTraffic", strconv.FormatBool(byPassProsy.AllowPublicTraffic),
 	}
 	if byPassProsy.SandboxIP != "" {
 		fieldValues = append(fieldValues, "SandboxIP", byPassProsy.SandboxIP)
 	}
+	if byPassProsy.TrafficAccessToken != "" {
+		fieldValues = append(fieldValues, "TrafficAccessToken", byPassProsy.TrafficAccessToken)
+	}
+	if byPassProsy.MaskRequestHost != "" {
+		fieldValues = append(fieldValues, "MaskRequestHost", byPassProsy.MaskRequestHost)
+	}
 	for k, v := range byPassProsy.ContainerToHostPorts {
 		fieldValues = append(fieldValues, k, v)
 	}
-	_, err = wrapredis.GetRedis(wrapredis.RedisWrite).Do("HSET", redis.Args{key}.AddFlat(fieldValues)...)
+	conn := wrapredis.GetRedis()
+	_, err = conn.Do("HSET", redis.Args{key}.AddFlat(fieldValues)...)
 	if err != nil {
 		log.G(ctx).Errorf("redis set error, key: %s, err: %s", key, err)
 		return err
+	}
+	// Refresh a safety fallback TTL so a missed DEL on teardown cannot leave a
+	// stale route forever; normal teardown still removes the key explicitly.
+	if ttl := sandboxProxyTTLSec(); ttl > 0 {
+		if _, e := conn.Do("EXPIRE", key, ttl); e != nil {
+			log.G(ctx).Errorf("setByPassProsyToRedis EXPIRE %s failed: %v", key, e)
+		}
 	}
 	if log.IsDebug() {
 		log.G(ctx).Debugf("setByPassProsyToRedis:%s,%s", key, fieldValues)
@@ -375,8 +483,10 @@ func (l *local) setByPassProsyToRedis(ctx context.Context, key string, byPassPro
 
 func (l *local) setDescribeTaskToRedis(ctx context.Context, key string, taskInfo *types.DescribeTaskMap) (err error) {
 	start := time.Now()
-	conn := wrapredis.GetRedis(wrapredis.RedisWrite)
-	defer traceRedis(ctx, "Create", "HSET", key, start, err)
+	conn := wrapredis.GetRedis()
+	defer func() {
+		traceRedis(ctx, "Create", "HSET", key, start, err)
+	}()
 	defer func() {
 		if err == nil {
 			_, err := conn.Do("EXPIRE", key, config.GetConfig().Common.DescribeTaskExpireTime)
@@ -397,7 +507,7 @@ func (l *local) setDescribeTaskToRedis(ctx context.Context, key string, taskInfo
 }
 
 func (l *local) getDescribeTaskFromRedis(ctx context.Context, key string) (*types.DescribeTaskMap, error) {
-	values, err := redis.Values(wrapredis.GetRedis(wrapredis.RedisRead).Do("HGETALL", key))
+	values, err := redis.Values(wrapredis.GetRedis().Do("HGETALL", key))
 	if err != nil {
 		if errors.Is(err, redis.ErrNil) {
 			log.G(ctx).Debugf("no such key in redis:%s", key)
@@ -419,10 +529,63 @@ func (l *local) getDescribeTaskFromRedis(ctx context.Context, key string) (*type
 	return taskInfo, nil
 }
 
+func (l *local) setTemplateImageJobPullProgressToRedis(ctx context.Context, key string, progress *types.TemplateImageJobPullProgressMap) (err error) {
+	start := time.Now()
+	defer traceRedis(ctx, "Create", "EVAL", key, start, err)
+	_, err = wrapredis.GetRedis().Do("EVAL", templateImageJobPullProgressSetArgs(key, progress)...)
+	if err != nil {
+		log.G(ctx).Warnf("redis set template image job pull progress error, key: %s, err: %s", key, err)
+		return err
+	}
+	if log.IsDebug() {
+		log.G(ctx).Debugf("setTemplateImageJobPullProgressToRedis:%s:%s", key, utils.InterfaceToString(progress))
+	}
+	return nil
+}
+
+func (l *local) setTemplateImageJobPullProgressFieldsToRedis(ctx context.Context, key string, progress *types.TemplateImageJobPullProgressMap) (err error) {
+	start := time.Now()
+	defer traceRedis(ctx, "Create", "HSET", key, start, err)
+	_, err = wrapredis.GetRedis().Do("HSET", redis.Args{key}.AddFlat(progress)...)
+	if err != nil {
+		log.G(ctx).Warnf("redis update template image job pull progress error, key: %s, err: %s", key, err)
+		return err
+	}
+	if log.IsDebug() {
+		log.G(ctx).Debugf("setTemplateImageJobPullProgressFieldsToRedis:%s:%s", key, utils.InterfaceToString(progress))
+	}
+	return nil
+}
+
+func (l *local) getTemplateImageJobPullProgressFromRedis(ctx context.Context, key string) (*types.TemplateImageJobPullProgressMap, error) {
+	values, err := redis.Values(wrapredis.GetRedis().Do("HGETALL", key))
+	if err != nil {
+		if errors.Is(err, redis.ErrNil) {
+			log.G(ctx).Debugf("no such key in redis:%s", key)
+			return nil, nil
+		}
+		log.G(ctx).Warnf("getTemplateImageJobPullProgressFromRedis %s err:%s", key, err)
+		return nil, err
+	}
+	if len(values) == 0 {
+		log.G(ctx).Debugf("redis hgetall empty, key: %s", key)
+		return nil, nil
+	}
+
+	progress := &types.TemplateImageJobPullProgressMap{}
+	if err := redis.ScanStruct(values, progress); err != nil {
+		log.G(ctx).Warnf("redis scanStruct template image job pull progress error, key: %s, err: %s, values:%v", key, err, values)
+		return nil, err
+	}
+	return progress, nil
+}
+
 func (l *local) deleteKeyFromRedis(ctx context.Context, key string) (err error) {
 	start := time.Now()
-	defer traceRedis(ctx, "Delete", "DEL", key, start, err)
-	_, err = wrapredis.GetRedis(wrapredis.RedisWrite).Do("DEL", key)
+	defer func() {
+		traceRedis(ctx, "Delete", "DEL", key, start, err)
+	}()
+	_, err = wrapredis.GetRedis().Do("DEL", key)
 	if err != nil {
 		log.G(ctx).Errorf("redis del error, key: %s, err: %s", key, err)
 		return err

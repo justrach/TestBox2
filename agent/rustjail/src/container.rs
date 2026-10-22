@@ -3,6 +3,45 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::clone::Clone;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::fmt::Display;
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
+use std::os::unix::io::RawFd;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use cgroups::freezer::FreezerState;
+use cube::rootfs::{
+    ANNO_PROPAGATION_CONTAINER_UMNTS, ANNO_PROPAGATION_EXEC_MNTS, ENV_CONTAINER_PID,
+};
+use libc::pid_t;
+use nix::errno::Errno;
+use nix::fcntl::{self, OFlag};
+use nix::fcntl::{FcntlArg, FdFlag};
+use nix::mount::MntFlags;
+use nix::sched::{self, CloneFlags};
+use nix::sys::signal::{self, Signal};
+use nix::sys::stat::{self, Mode};
+use nix::unistd::{self, fork, ForkResult, Gid, Pid, Uid, User};
+use oci::State as OCIState;
+use oci::{ContainerState, LinuxDevice, LinuxIdMapping};
+use oci::{Hook, Linux, LinuxNamespace, LinuxResources, Spec};
+use protobuf::MessageField;
+use protocols::agent::StatsContainerResponse;
+use rlimit::{setrlimit, Resource, Rlim};
+use slog::{debug, info, o, Logger};
+use tokio::io::AsyncBufReadExt;
+use tokio::sync::Mutex;
+
 use crate::capabilities;
 #[cfg(not(test))]
 use crate::cgroups::fs::Manager as FsManager;
@@ -12,57 +51,17 @@ use crate::cgroups::Manager;
 #[cfg(feature = "standard-oci-runtime")]
 use crate::console;
 use crate::log_child;
+use crate::pipestream::PipeStream;
 use crate::process::Process;
 #[cfg(feature = "seccomp")]
 use crate::seccomp;
 use crate::specconv::CreateOpts;
-use crate::{mount, validator};
-use anyhow::{anyhow, Context, Result};
-use cgroups::freezer::FreezerState;
-use cube::rootfs::{
-    ANNO_PROPAGATION_CONTAINER_UMNTS, ANNO_PROPAGATION_EXEC_MNTS, ENV_CONTAINER_PID,
+use crate::sync::{
+    read_sync, read_sync_with_timeout, write_count, write_sync, SYNC_DATA, SYNC_FAILED,
+    SYNC_SUCCESS,
 };
-use libc::pid_t;
-use oci::{ContainerState, LinuxDevice, LinuxIdMapping};
-use oci::{Hook, Linux, LinuxNamespace, LinuxResources, Spec};
-use std::clone::Clone;
-use std::ffi::CString;
-use std::fmt::Display;
-use std::fs;
-use std::os::unix::io::RawFd;
-use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
-
-use protocols::agent::StatsContainerResponse;
-
-use nix::errno::Errno;
-use nix::fcntl::{self, OFlag};
-use nix::fcntl::{FcntlArg, FdFlag};
-use nix::mount::MntFlags;
-use nix::sched::{self, CloneFlags};
-use nix::sys::signal::{self, Signal};
-use nix::sys::stat::{self, Mode};
-use nix::unistd::{self, fork, ForkResult, Gid, Pid, Uid, User};
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::AsRawFd;
-
-use protobuf::MessageField;
-
-use oci::State as OCIState;
-use std::collections::HashMap;
-use std::os::unix::io::FromRawFd;
-use std::str::FromStr;
-use std::sync::Arc;
-
-use slog::{debug, info, o, Logger};
-
-use crate::pipestream::PipeStream;
-use crate::sync::{read_sync, write_count, write_sync, SYNC_DATA, SYNC_FAILED, SYNC_SUCCESS};
 use crate::sync_with_async::{read_async, write_async};
-use async_trait::async_trait;
-use rlimit::{setrlimit, Resource, Rlim};
-use tokio::io::AsyncBufReadExt;
-use tokio::sync::Mutex;
+use crate::{mount, validator};
 pub const EXEC_FIFO_FILENAME: &str = "exec.fifo";
 
 const INIT: &str = "INIT";
@@ -71,6 +70,7 @@ const CRFD_FD: &str = "CRFD_FD";
 const CWFD_FD: &str = "CWFD_FD";
 const CLOG_FD: &str = "CLOG_FD";
 const FIFO_FD: &str = "FIFO_FD";
+const PARENT_READY_SYNC_TIMEOUT_SECS: u64 = 10;
 const HOME_ENV_KEY: &str = "HOME";
 const PIDNS_FD: &str = "PIDNS_FD";
 const CONSOLE_SOCKET_FD: &str = "CONSOLE_SOCKET_FD";
@@ -526,8 +526,15 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
 
     if to_new.contains(CloneFlags::CLONE_NEWNS) {
         // setup rootfs
-        mount::init_rootfs(cfd_log, &spec, &cm.paths, &cm.mounts, bind_device)
-            .map_err(|e| anyhow!("init_rootfs faild.{:}", e))?;
+        mount::init_rootfs(
+            cfd_log,
+            &spec,
+            &cm.paths,
+            &cm.mounts,
+            &cm.cpath,
+            bind_device,
+        )
+        .map_err(|e| anyhow!("init_rootfs failed.{:}", e))?;
     }
 
     if init {
@@ -669,6 +676,10 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
 
     // notify parent that the child's ready to start
     write_sync(cwfd, SYNC_SUCCESS, "")?;
+    // Wait until the parent has installed process bookkeeping and stdio
+    // forwarding. Fast execs can otherwise exit before passfd output tasks are
+    // ready to drain stdout/stderr.
+    read_sync_with_timeout(crfd, Duration::from_secs(PARENT_READY_SYNC_TIMEOUT_SECS))?;
     let duration_stat = start.elapsed().as_millis();
     log_child!(
         cfd_log,
@@ -824,8 +835,9 @@ impl BaseContainer for LinuxContainer {
     fn stats(&self) -> Result<StatsContainerResponse> {
         let mut r = StatsContainerResponse::default();
 
-        if self.cgroup_manager.is_some() {
-            r.cgroup_stats = MessageField::some(self.cgroup_manager.as_ref().unwrap().get_stats()?);
+        if let Some(manager) = self.cgroup_manager.as_ref() {
+            r.cgroup_stats = MessageField::some(manager.get_stats()?);
+            r.resource_metrics_version = manager.resource_metrics_version();
         }
 
         // what about network interface stats?
@@ -933,15 +945,15 @@ impl BaseContainer for LinuxContainer {
         let mut child_stderr = std::process::Stdio::null();
 
         if let Some(stdin) = p.stdin {
-            child_stdin = unsafe { std::process::Stdio::from_raw_fd(stdin) };
+            child_stdin = unsafe { std::process::Stdio::from_raw_fd(unistd::dup(stdin)?) };
         }
 
         if let Some(stdout) = p.stdout {
-            child_stdout = unsafe { std::process::Stdio::from_raw_fd(stdout) };
+            child_stdout = unsafe { std::process::Stdio::from_raw_fd(unistd::dup(stdout)?) };
         }
 
         if let Some(stderr) = p.stderr {
-            child_stderr = unsafe { std::process::Stdio::from_raw_fd(stderr) };
+            child_stderr = unsafe { std::process::Stdio::from_raw_fd(unistd::dup(stderr)?) };
         }
 
         let pidns = get_pid_namespace(&self.logger, linux)?;
@@ -981,6 +993,10 @@ impl BaseContainer for LinuxContainer {
         }
 
         child.spawn()?;
+
+        // Drop the agent's copy of child-side stdio fds so EOF on the parent
+        // side reflects the real container process lifetime.
+        p.close_inherited_write_ends();
 
         unistd::close(crfd)?;
         unistd::close(cwfd)?;
@@ -1034,11 +1050,16 @@ impl BaseContainer for LinuxContainer {
             let spec = self.config.spec.as_mut().unwrap();
             update_namespaces(&self.logger, spec, p.pid)?;
         }
+        let init = p.init;
+        p.setup_passfd_io().await;
         self.processes.insert(p.pid, p);
+        write_async(&mut pipe_w, SYNC_SUCCESS, "").await?;
 
-        let _ = log_handler
-            .await
-            .map_err(|e| warn!(logger, "joining log handler {:?}", e));
+        if init {
+            let _ = log_handler
+                .await
+                .map_err(|e| warn!(logger, "joining log handler {:?}", e));
+        }
         debug!(logger, "create process completed");
         Ok(())
     }
@@ -1511,7 +1532,7 @@ fn set_sysctls(sysctls: &HashMap<String, String>) -> Result<()> {
 }
 
 use std::process::Stdio;
-use std::time::Duration;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub async fn execute_hook(logger: &Logger, h: &Hook, st: &OCIState) -> Result<()> {
@@ -1626,10 +1647,10 @@ pub async fn execute_hook(logger: &Logger, h: &Hook, st: &OCIState) -> Result<()
     });
     match tokio::time::timeout(Duration::new(timeout, 0), join_handle).await {
         Ok(r) => match r {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                error!(logger2, "hook join error: {:?}", e);
-                Err(anyhow!(e))
+            Ok(hook_result) => hook_result,
+            Err(join_err) => {
+                error!(logger2, "hook join error: {:?}", join_err);
+                Err(anyhow!(join_err))
             }
         },
         Err(e) => {
@@ -1671,7 +1692,10 @@ pub async fn start_exec_process(
     println!("exec a child process");
     let exec_path = std::env::current_exe().map_err(|e| format!("get exe path failed:{}", e))?;
     let mut cmd = std::process::Command::new(exec_path);
-    cmd.arg("exec").env(ENV_CONTAINER_PID, format!("{}", pid));
+    cmd.arg("exec")
+        .env(ENV_CONTAINER_PID, format!("{}", pid))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     if let Some(mnt) = exec_mnts {
         cmd.env(ANNO_PROPAGATION_EXEC_MNTS, format!("{}", mnt));
     }
@@ -1681,17 +1705,29 @@ pub async fn start_exec_process(
     }
     let _lock = WAIT_PID_LOCKER.lock().await;
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| format!("spawn child process failed:{}", e))?;
-
-    let status = child
-        .wait()
+    let output = child
+        .wait_with_output()
         .map_err(|e| format!("wait child failed:{}", e))?;
-    match status.code() {
+    match output.status.code() {
         Some(code) => {
             if code != 0 {
-                return Err(format!("exec process exit code:{}", code));
+                // Surface the child's real failure reason (e.g.
+                // "the source dir X not exists") instead of a bare
+                // exit code. exit_proc_failed writes to stderr.
+                let detail = String::from_utf8_lossy(&output.stderr);
+                let detail = if detail.trim().is_empty() {
+                    String::from_utf8_lossy(&output.stdout)
+                } else {
+                    detail
+                };
+                let detail = detail.trim();
+                if detail.is_empty() {
+                    return Err(format!("exec process exit code:{}", code));
+                }
+                return Err(detail.to_string());
             }
         }
         None => {
@@ -1699,20 +1735,33 @@ pub async fn start_exec_process(
         }
     }
 
+    // On success, log child stdout for observability (was previously
+    // inherited to the agent's stdout before piping was added).
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        debug!(
+            slog_scope::logger(),
+            "exec mount child output: {}",
+            stdout.trim()
+        );
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::process::Process;
-    use crate::skip_if_not_root;
-    use nix::unistd::Uid;
     use std::fs;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
+
+    use nix::unistd::Uid;
     use tempfile::tempdir;
     use tokio::process::Command;
+
+    use super::*;
+    use crate::process::Process;
+    use crate::skip_if_not_root;
 
     macro_rules! sl {
         () => {
@@ -1769,13 +1818,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_hook_with_error() {
-        let ls = which("ls").await;
+        let false_bin = which("false").await;
 
         let res = execute_hook(
             &slog_scope::logger(),
             &Hook {
-                path: ls,
-                args: vec!["ls".to_string(), "/tmp/not-exist".to_string()],
+                path: false_bin,
+                args: vec!["false".to_string()],
                 env: vec![],
                 timeout: None,
             },
@@ -2108,6 +2157,17 @@ mod tests {
     fn test_linuxcontainer_stats() {
         let ret = new_linux_container_and_then(|c: LinuxContainer| c.stats());
         assert!(ret.is_ok(), "Expecting Ok, Got {:?}", ret);
+        assert_eq!(ret.unwrap().resource_metrics_version(), 1);
+    }
+
+    #[test]
+    fn test_linuxcontainer_without_cgroup_manager_does_not_claim_resource_metrics() {
+        let ret = new_linux_container_and_then(|mut c: LinuxContainer| {
+            c.cgroup_manager = None;
+            c.stats()
+        });
+        assert!(ret.is_ok(), "Expecting Ok, Got {:?}", ret);
+        assert_eq!(ret.unwrap().resource_metrics_version(), 0);
     }
 
     #[test]

@@ -6,14 +6,39 @@
 package node
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 )
+
+// HostFacts is the scheduler-side view of a node's static host identity. It
+// duplicates nodemeta.HostFacts to keep base/node free of a nodemeta import.
+type HostFacts struct {
+	CPUVendor             string `json:"cpu_vendor,omitempty"`
+	CPUModel              string `json:"cpu_model,omitempty"`
+	CPUIDHash             string `json:"cpuid_hash,omitempty"`
+	HostKernelRelease     string `json:"host_kernel_release,omitempty"`
+	HostKernelFingerprint string `json:"host_kernel_fingerprint,omitempty"`
+	KVMAPIVersion         int    `json:"kvm_api_version,omitempty"`
+	KVMModuleFingerprint  string `json:"kvm_module_fingerprint,omitempty"`
+	KVMModuleTaint        string `json:"kvm_module_taint,omitempty"`
+}
+
+// IsZero reports whether no meaningful host fact was collected.
+func (f *HostFacts) IsZero() bool {
+	if f == nil {
+		return true
+	}
+	return f.CPUVendor == "" && f.CPUModel == "" && f.CPUIDHash == "" &&
+		f.HostKernelRelease == "" && f.HostKernelFingerprint == "" && f.KVMAPIVersion == 0 &&
+		f.KVMModuleFingerprint == "" && f.KVMModuleTaint == ""
+}
 
 type Node struct {
 	Index int    `json:"Index,omitempty"`
@@ -54,7 +79,7 @@ type Node struct {
 
 	MetaDataUpdateAt time.Time `json:"MetaDataUpdateAt,omitempty"`
 
-	ReportedReady bool `json:"-"`
+	ReportedReady bool `json:"ReportedReady,omitempty"`
 
 	Healthy bool `json:"Healthy"`
 
@@ -86,22 +111,140 @@ type Node struct {
 
 	LocalCreateNum int64 `json:"LocalCreateNum,omitempty"`
 	NicQueues      int64 `json:"nic_queues,omitempty"`
+
+	NodeLabels     map[string]string `json:"NodeLabels,omitempty"`
+	LocalTemplates []string          `json:"LocalTemplates,omitempty"`
+
+	// Versions carries the real version of each component installed on the
+	// node. Populated by CubeOps /internal/v1/nodes; consumed by templatecenter
+	// compat scan via localcache.GetNode.
+	Versions []ComponentVersion `json:"Versions,omitempty"`
+
+	// HostFacts carries the host-level identity (CPU feature set, host kernel,
+	// KVM ABI) used for cross-node snapshot restore compatibility. A local copy
+	// of nodemeta.HostFacts kept here to avoid the nodemeta → base/node import
+	// cycle, mirroring how masterclient.HostFacts duplicates the same shape.
+	HostFacts *HostFacts `json:"HostFacts,omitempty"`
+
+	// schedulingDisabled is the cordon flag (true → block new sandboxes).
+	// Exposed via SchedulingDisabled() / JSON as "SchedulingDisabled".
+	schedulingDisabled atomic.Bool
+
+	labelsCache *nodeLabelsCacheStore
 }
+
+// DecodeSchedulingDisabled reports whether labels cordon the node.
+// Key absent → false; key present (canonical "true" or any other value) → true
+// so corrupt/non-canonical values fail closed.
+func DecodeSchedulingDisabled(labels map[string]string) bool {
+	if labels == nil {
+		return false
+	}
+	_, ok := labels[constants.LabelSchedulingDisabled]
+	return ok
+}
+
+// SetSchedulingDisabled stores the concurrent-safe cordon flag.
+func (n *Node) SetSchedulingDisabled(disabled bool) {
+	if n == nil {
+		return
+	}
+	n.schedulingDisabled.Store(disabled)
+}
+
+// SchedulingDisabled reports whether this node is cordoned.
+func (n *Node) SchedulingDisabled() bool {
+	return n != nil && n.schedulingDisabled.Load()
+}
+
+// SchedulingAllowed reports whether this node may receive new sandboxes based
+// solely on cordon state (health / metrics are orthogonal).
+func (n *Node) SchedulingAllowed() bool {
+	return n != nil && !n.schedulingDisabled.Load()
+}
+
+// MarshalJSON emits SchedulingDisabled from the atomic cordon flag.
+func (n *Node) MarshalJSON() ([]byte, error) {
+	type Alias Node
+	return json.Marshal(&struct {
+		*Alias
+		SchedulingDisabled bool `json:"SchedulingDisabled"`
+	}{
+		Alias:              (*Alias)(n),
+		SchedulingDisabled: n.SchedulingDisabled(),
+	})
+}
+
+// UnmarshalJSON loads SchedulingDisabled into the atomic cordon flag.
+func (n *Node) UnmarshalJSON(data []byte) error {
+	type Alias Node
+	aux := &struct {
+		*Alias
+		SchedulingDisabled bool `json:"SchedulingDisabled"`
+	}{
+		Alias: (*Alias)(n),
+	}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	n.SetSchedulingDisabled(aux.SchedulingDisabled)
+	return nil
+}
+
+type nodeLabelsCache struct {
+	labels map[string]string
+}
+
+type nodeLabelsCacheStore struct {
+	cache atomic.Pointer[nodeLabelsCache]
+}
+
+var nodeLabelsCacheInitMu sync.Mutex
 
 func (n *Node) Clone() *Node {
 	if n == nil {
 		return nil
 	}
 	// Clone provides a best-effort read-side snapshot. Mutable counters such
-	// as LocalCreateNum are refreshed via atomic loads after the structural
-	// copy so cloned read models stay aligned with the write path.
+	// as LocalCreateNum and schedulingDisabled are refreshed via atomic loads
+	// after the structural copy so cloned read models stay aligned with the
+	// write path under concurrent updates.
 	localCreateNum := atomic.LoadInt64(&n.LocalCreateNum)
+	schedulingDisabled := n.SchedulingDisabled()
 	cloned := *n
 	cloned.LocalCreateNum = localCreateNum
+	cloned.schedulingDisabled = atomic.Bool{}
+	cloned.SetSchedulingDisabled(schedulingDisabled)
+	cloned.labelsCache = nil
 	if n.VirtualNodeQuotaArray != nil {
 		cloned.VirtualNodeQuotaArray = append([]int64(nil), n.VirtualNodeQuotaArray...)
 	}
+	if n.NodeLabels != nil {
+		cloned.NodeLabels = make(map[string]string, len(n.NodeLabels))
+		for k, v := range n.NodeLabels {
+			cloned.NodeLabels[k] = v
+		}
+	}
+	if n.HostFacts != nil {
+		hf := *n.HostFacts
+		cloned.HostFacts = &hf
+	}
+	if n.Versions != nil {
+		cloned.Versions = append([]ComponentVersion(nil), n.Versions...)
+	}
 	return &cloned
+}
+
+func (n *Node) labelsCacheStore() *nodeLabelsCacheStore {
+	if n.labelsCache != nil {
+		return n.labelsCache
+	}
+	nodeLabelsCacheInitMu.Lock()
+	defer nodeLabelsCacheInitMu.Unlock()
+	if n.labelsCache == nil {
+		n.labelsCache = &nodeLabelsCacheStore{}
+	}
+	return n.labelsCache
 }
 
 func (n *Node) ID() string {
@@ -118,14 +261,37 @@ func (n *Node) LocalCreateNumIncrBy(i int64) int64 {
 }
 
 func (n *Node) Labels() map[string]string {
-	labels := make(map[string]string)
+	cacheStore := n.labelsCacheStore()
+	if cache := cacheStore.cache.Load(); cache != nil {
+		return cache.labels
+	}
+
+	// Canonical affinity keys derived from Node struct fields always take
+	// priority over node-reported labels, so they are written last.
+	labels := make(map[string]string, len(n.NodeLabels)+6)
+	for k, v := range n.NodeLabels {
+		labels[k] = v
+	}
 	labels[constants.AffinityKeyZone] = n.Zone
 	labels[constants.AffinityKeyClusterID] = n.ClusterLabel
 	labels[constants.AffinityKeyCPUType] = n.CPUType
 	labels[constants.AffinityKeyMemorySize] = fmt.Sprintf("%dMi", n.QuotaMem)
 	labels[constants.AffinityKeyCPUCores] = fmt.Sprintf("%dm", n.QuotaCpu)
 	labels[constants.AffinityKeyInstanceType] = n.InstanceType
+	cache := &nodeLabelsCache{labels: labels}
+	if cacheStore.cache.CompareAndSwap(nil, cache) {
+		return labels
+	}
+	if cache := cacheStore.cache.Load(); cache != nil {
+		return cache.labels
+	}
 	return labels
+}
+
+func (n *Node) InvalidateLabelsCache() {
+	if n.labelsCache != nil {
+		n.labelsCache.cache.Store(nil)
+	}
 }
 
 type NodeList []*Node
@@ -288,4 +454,17 @@ func (l NodeScoreList) AllSortByScore() NodeScoreList {
 		return l[i].Score > l[j].Score
 	})
 	return l
+}
+
+// ComponentVersion carries the real version of one component installed on a
+// node. Mirrors CubeOps model.ComponentVersion and Cubelet-side
+// masterclient.ComponentVersion. JSON tags match CubeOps SchedulerNode.Versions
+// so data flows CubeOps → localcache without translation.
+type ComponentVersion struct {
+	Component string `json:"component"`
+	Version   string `json:"version,omitempty"`
+	Commit    string `json:"commit,omitempty"`
+	BuildTime string `json:"build_time,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Variant   string `json:"variant,omitempty"`
 }

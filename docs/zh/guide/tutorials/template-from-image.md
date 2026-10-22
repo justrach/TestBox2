@@ -1,68 +1,45 @@
 # 从 OCI 镜像制作模板
 
-本文介绍如何使用 `cubemastercli` 命令行工具，从标准 OCI 容器镜像出发，完成模板的创建、进度监控和删除操作。
+本文介绍如何从标准 OCI 容器镜像出发，完成模板的创建、进度监控、可选的 `tpl merge` 存储迁移，以及删除操作。
 
-## 概述
-
-**模板（Template）** 是一份预构建的不可变 rootfs 快照，沙箱运行时用它来冷启动（或热启动）新的沙箱实例。从 OCI 镜像制作模板是一个在集群上**异步**执行的三阶段流水线：
-
-```
-OCI 镜像  ──拉取──►  ext4 rootfs  ──启动──►  快照  ──注册──►  模板 READY
-```
-
-模板进入 `READY` 状态后，即可通过其 `template_id` 创建沙箱实例。
-
----
+建议在开始前先阅读[模板概览](../templates.md)，了解 OCI 镜像、模板快照、端口、探针和 `envd` 等相关概念。
 
 ## 前置条件
 
-- 已安装 `cubemastercli` 并加入 `$PATH`
-- 设置环境变量 `CUBEMASTER_ADDR`，或在每条命令中加 `--server <host>`
+- 已安装 `cubemastercli` 并可以连接 CubeMaster
 - OCI 镜像须可被 CubeMaster 节点访问（公开仓库或已配置认证的私有仓库）
 
-### ⚠️ 镜像必须提供 HTTP 服务
+> 明文 HTTP 仓库（未启用 TLS）须在镜像引用前加上 `http://`，例如 `http://harbor.internal:5000/ns/app:tag`。不加此前缀时，CubeMaster 默认走 HTTPS（localhost 和 RFC1918 地址除外）。
 
-Cube 平台在制作模板时，会启动容器并**通过 HTTP 探测**容器是否已就绪。因此：
+## 第一步 — 选择 OCI 镜像
 
-1. 你的容器镜像**必须**在某个固定端口上启动一个 HTTP 服务器。
-2. 创建模板时**必须**指定以下参数：
-   - `--expose-port <port>` — 声明 HTTP 服务监听的端口
-   - `--probe <port>` — 告诉 Cube 要探测哪个端口
-   - `--probe-path <path>` — Cube 将 `GET` 的 HTTP 路径（如 `/` 或 `/health`）
-3. 你的容器入口程序应在**应用完全准备好对外提供服务之后**，再启动 HTTP 服务——Cube 在探针返回 HTTP 2xx 时即将模板标记为就绪，由此模板创建的沙箱会立刻开始接收请求。
+`create-from-image` 接收一个已经构建并发布的 OCI 镜像。本教程使用预装 `envd` 的 CubeSandbox 基础镜像：
 
-如果容器未暴露 HTTP 服务，或探针参数配置错误，模板制作将因超时而失败。
+```text
+ghcr.io/tencentcloud/cubesandbox-base:latest
+```
 
----
+该镜像中的 `envd` 默认监听 `49983`，可以直接使用 `GET /health` 作为模板探针。
 
-## 第一步 — 创建模板
+如需自定义镜像模板以及将其他现有镜像接入 CubeSandbox，请参阅[自定义模板镜像](./bring-your-own-image.md)。
+
+## 第二步 — 从镜像创建模板
 
 使用 `tpl create-from-image` 子命令发起构建任务：
 
 ```bash
 cubemastercli tpl create-from-image \
-  --image     cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-browser:latest \
+  --image     ghcr.io/tencentcloud/cubesandbox-base:latest \
   --writable-layer-size 1G \
-  --expose-port 9000 \
-  --probe 9000 \
-  --probe-path /
+  --expose-port 49983 \
+  --probe 49983 \
+  --probe-path /health
 ```
 
-> **镜像仓库说明：** 国内优先使用 `cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-browser:latest`；境外访问推荐使用 `cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-browser:latest`。
+> 加上 `--backend s3` 后，模板及其派生的沙箱 / 快照会走集群共享的 S3 CoW 后端，这是 [跨机 Pause / Resume / FromSnap](../cross-node-snapshot.md) 的前提。省略该标志则沿用历史 `xfs` 路径。
 
-命令成功后立即返回 `job_id` 和自动生成的 `template_id` 并退出，构建任务在集群后台继续执行：
 
-```
-job_id:      0042cd3a-c1d6-45fd-8757-2595ba0027e8
-template_id: tpl-4ff5adc5eea44c14b1c8dbb3
-attempt_no:  1
-artifact_id:
-status:      PENDING
-phase:       PULLING
-progress:    0%
-```
-
-#### 示例 — 多端口 + 自定义探针路径 + 环境变量
+构建模板的过程可以暴露多个端口以及自定义探针路径，也可以传入环境变量
 
 ```bash
 cubemastercli tpl create-from-image \
@@ -75,11 +52,8 @@ cubemastercli tpl create-from-image \
   --env        MY_ENV=production
 ```
 
-> **镜像仓库说明：** 国内优先使用 `cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-code:latest`；境外访问推荐使用 `cube-sandbox-int.tencentcloudcr.com/cube-sandbox/sandbox-code:latest`。
 
----
-
-## 第二步 — 监控进度
+## 第三步 — 监控进度
 
 有两种方式跟踪构建任务。
 
@@ -128,9 +102,8 @@ template_status:           READY
 cubemastercli tpl status --job-id <job_id>
 ```
 
----
 
-## 第三步 — 使用模板
+## 第四步 — 使用模板
 
 `template_status: READY` 后，通过 `template_id` 使用 E2B SDK 创建沙箱：
 
@@ -139,7 +112,6 @@ export CUBE_TEMPLATE_ID=tpl-748094d2f2374b0a8a37e6ec
 python CubeAPI/examples/create.py
 ```
 
----
 
 ## 查询模板
 
@@ -175,19 +147,21 @@ cubemastercli tpl list --json | jq '.data[].template_id'
 ### 查看单个模板详情
 
 ```bash
-cubemastercli tpl info --template-id tpl-748094d2f2374b0a8a37e6ec
+cubemastercli tpl info tpl-748094d2f2374b0a8a37e6ec
 ```
+
+模板 ID 既可以用位置参数传入（与 docker/kubectl 风格一致），也可以继续使用 `--template-id`，两种写法等价。
 
 需要机器可读输出时，加上 `--json`：
 
 ```bash
-cubemastercli tpl info --template-id tpl-748094d2f2374b0a8a37e6ec --json
+cubemastercli tpl info tpl-748094d2f2374b0a8a37e6ec --json
 ```
 
 如果想查看模板里保存的创建请求体，可再加 `--include-request`：
 
 ```bash
-cubemastercli tpl info --template-id tpl-748094d2f2374b0a8a37e6ec --json --include-request
+cubemastercli tpl info tpl-748094d2f2374b0a8a37e6ec --json --include-request
 ```
 
 如果想预览创建沙箱时最终生效的请求，可使用：
@@ -198,13 +172,53 @@ cubemastercli tpl render --template-id tpl-748094d2f2374b0a8a37e6ec --json
 
 如果你更关心“应该看什么、如何一步步预览最终请求”，可继续阅读[模板检查与请求预览](../template-inspection-and-preview.md)。
 
----
+## 第五步 — （可选）把历史本地 artifact 迁入 TC 存储
 
-## 删除模板
+大多数**新建**的 `from-image` 模板已经沿当前数据面直接走 TC 构建，因此**不一定需要再手动执行 `tpl merge`**。`tpl merge` 主要用于以下场景：
+
+- 历史模板的 rootfs ext4 还只在 CubeMaster 本地磁盘上
+- 集群后来开启了 `s3Backed=true`，希望把旧模板收敛进 S3 / TC artifact store
+- artifact 已经迁移过，但你想再次触发幂等检查并清理遗留的本地 ext4 文件
+
+命令名叫 `merge`，对应的 API 路径是 `/cube/template/migrate`。默认会阻塞到 migrate job 结束：
 
 ```bash
-cubemastercli tpl delete --template-id tpl-748094d2f2374b0a8a37e6ec
+cubemastercli tpl merge tpl-748094d2f2374b0a8a37e6ec
 ```
+
+如果只想提交 migrate job 就返回，可使用：
+
+```bash
+cubemastercli tpl merge tpl-748094d2f2374b0a8a37e6ec --detach
+```
+
+这里的 `merge` 指的是**artifact 存储迁移**，不是 `tpl render` 里看到的 `merged_request` 请求合并。
+
+如果你在处理的是**存量镜像对应的历史模板**，文档口径应统一为：**`tpl merge` 解决历史 artifact 的存储收敛问题，`tpl redo` 解决节点侧重新分发 / 必要时重建问题。**
+
+典型场景是：模板最初的 artifact 仍保存在 `CubeMaster` 本地盘，后续集群开启了 `s3Backed=true`，需要将这批历史 artifact 从本地盘迁移到 **S3 托管存储**。如果同一次运维还需要让模板重新覆盖目标节点，可以按下面的顺序执行：
+
+```bash
+cubemastercli tpl merge tpl-748094d2f2374b0a8a37e6ec
+cubemastercli tpl redo --template-id tpl-748094d2f2374b0a8a37e6ec
+```
+
+> **高亮提醒**
+> 在默认共盘 / 共享 PVC 部署里，即使跳过 `tpl merge`，现有 `READY` 模板通常也**仍可继续下载**；真正的问题是这些历史 artifact 仍未完成从**本地盘到 S3 托管存储**的收敛。
+>
+> - **存储侧**：开启 `s3Backed=true` 后，旧模板不会自动补做迁移。
+> - **恢复侧**：如果本地 ext4 已经丢失，再补跑 `tpl merge` 也修不回来，因为已经没有可上传的文件；这时只能对可重建的 `from-image` 模板执行 `tpl redo`，回退到重建流程。
+
+## 第六步 — 删除模板
+
+```bash
+cubemastercli tpl delete tpl-748094d2f2374b0a8a37e6ec
+
+# 一次删除多个模板
+cubemastercli tpl delete tpl-first tpl-second tpl-third
+```
+
+传入多个模板 ID 时，即使其中某个模板删除失败，CLI 也会继续尝试删除其余模板，最后汇总返回失败项。
 
 成功后输出：
 
@@ -214,13 +228,13 @@ template deleted: tpl-748094d2f2374b0a8a37e6ec
 
 > ⚠️ 删除操作会同时移除模板元数据和所有节点上的 artifact 副本。已基于该模板运行的沙箱**不受影响**，但此后无法再用该模板创建新沙箱。
 
----
 
 ## 常见问题
 
 | 现象 | 可能原因 | 处理方式 |
 |------|----------|----------|
 | `phase: PULLING` 长时间卡住 | 镜像拉取慢或集群节点无法访问镜像仓库 | 检查网络/防火墙；私有仓库需添加 `--registry-username` / `--registry-password` |
+| 明文 HTTP 仓库拉取失败（`server gave HTTP response to HTTPS client`） | 镜像引用未加 `http://` 前缀 | 写成 `http://harbor.internal:5000/ns/app:tag` |
 | `status: FAILED`（BUILDING 阶段） | 构建错误（磁盘满、Dockerfile 问题等） | 执行 `tpl status --job-id <id> --json` 查看 `last_error` 字段 |
 | `distribution: 0/N ready`（状态已 READY） | artifact 分发仍在进行（短暂正常） | 等待后重新执行 `tpl info`；若长时间未恢复检查目标节点的 Cubelet 日志 |
 | 沙箱启动后就绪探针一直失败 | 容器内服务未在预期端口/路径监听，或服务尚未完全就绪时 HTTP server 已提前启动 | 确认 HTTP server 在应用完全就绪后再启动；检查 `--probe-path` 是否正确 |

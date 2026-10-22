@@ -24,7 +24,7 @@ import (
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/cubes"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 const (
@@ -354,6 +354,13 @@ func (em *eventMonitor) handleContainerExit(ctx context.Context, e *eventtypes.T
 		// resume. RollbackSandbox is responsible for resyncing the
 		// status; defer to it. See Cubelet/services/cubebox/rollback.go.
 		log.G(ctx).Infof("ignoring TaskExit for container %s: rollback in flight", e.ID)
+		return nil
+	}
+	// CoW PauseToSnapshot exits the shim on purpose. TaskExit must not stamp
+	// FinishedAt / drive task.Delete while PausingAt or PausedAt is set —
+	// otherwise List/Info flicker to EXITED instead of PAUSING/PAUSED.
+	if cntr.Status != nil && cntr.Status.IsPaused() {
+		log.G(ctx).Infof("ignoring TaskExit for container %s: pause lifecycle in flight", e.ID)
 		return nil
 	}
 	if cntr.Container == nil {

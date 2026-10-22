@@ -6,10 +6,16 @@ on:
     paths:
       - 'CubeAPI/**'
       - 'CubeMaster/**'
+      - 'CubeTemplateCenter/**'
+      - 'CubeOps/**'
+      - 'pkgs/cubedb/**'
+      - 'pkgs/blobstore/**'
+      - 'pkgs/CubeLog/**'
+      - 'pkgs/proto/**'
       - 'Cubelet/**'
       - 'CubeShim/**'
       - 'agent/**'
-      - 'network-agent/**'
+      - 'examples/volume/s3/**'
       - 'docker/Dockerfile.builder'
       - '.github/workflows/build-builder-image.yml'
       - '.github/workflows/build-check.yml'
@@ -18,10 +24,16 @@ on:
     paths:
       - 'CubeAPI/**'
       - 'CubeMaster/**'
+      - 'CubeTemplateCenter/**'
+      - 'CubeOps/**'
+      - 'pkgs/cubedb/**'
+      - 'pkgs/blobstore/**'
+      - 'pkgs/CubeLog/**'
+      - 'pkgs/proto/**'
       - 'Cubelet/**'
       - 'CubeShim/**'
       - 'agent/**'
-      - 'network-agent/**'
+      - 'examples/volume/s3/**'
       - 'docker/Dockerfile.builder'
       - '.github/workflows/build-builder-image.yml'
       - '.github/workflows/build-check.yml'
@@ -42,21 +54,42 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.component }}
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.component }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        # Build every component on both amd64 and arm64. The two axes are
+        # crossed automatically; the per-arch `include` entries attach the
+        # runner label, and the per-component `include` entries attach the
+        # make target + expected binaries. Architecture coverage catches
+        # arch-specific regressions (e.g. cfg(target_arch) code in the shim /
+        # hypervisor) that an amd64-only build would miss.
+        component: [CubeAPI, CubeOps, CubeMaster, CubeTemplateCenter, Cubelet, agent, CubeShim, volume-s3]
+        arch: [amd64, arm64]
         include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
           - component: CubeAPI
             make_target: cubeapi
             expected_bins: |
               _output/bin/cube-api
+          - component: CubeOps
+            make_target: cubeops
+            expected_bins: |
+              _output/bin/cubeops
+              _output/bin/cubeopscli
           - component: CubeMaster
             make_target: cubemaster
             expected_bins: |
               _output/bin/cubemaster
               _output/bin/cubemastercli
+          - component: CubeTemplateCenter
+            make_target: cubetemplatecenter
+            expected_bins: |
+              _output/bin/templatecenter
           - component: Cubelet
             make_target: cubelet
             expected_bins: |
@@ -71,10 +104,12 @@ jobs:
             expected_bins: |
               _output/bin/containerd-shim-cube-rs
               _output/bin/cube-runtime
-          - component: network-agent
-            make_target: network-agent
+          # S3 Volume plugin (examples/volume/s3): its own Go module, so it is
+          # not covered by any component build above.
+          - component: volume-s3
+            make_target: cube-volume-s3
             expected_bins: |
-              _output/bin/network-agent
+              _output/bin/cube-volume-s3
 
     steps:
       - name: Checkout
@@ -184,3 +219,71 @@ jobs:
               exit 1
             fi
           done <<< "${EXPECTED_BINS}"
+
+  # Docker smoke build for release images that use repo-root context +
+  # adjacent Dockerfile.dockerignore (catches context/ignore regressions).
+  docker-smoke:
+    name: Docker Smoke Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build CubeMaster image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: CubeMaster/docker/Dockerfile
+          push: false
+          load: false
+
+      - name: Build cubemastercli image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: CubeMaster/docker/Dockerfile.cubemastercli
+          push: false
+          load: false
+
+      - name: Build cube-templatecenter image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: CubeTemplateCenter/docker/Dockerfile
+          push: false
+          load: false
+
+      - name: Build cubelet image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Cubelet/Dockerfile
+          push: false
+          load: false
+
+      - name: Build cube-shim image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: CubeShim/Dockerfile
+          push: false
+          load: false
+
+      - name: Build CubeOps image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: CubeOps/Dockerfile
+          push: false
+          load: false

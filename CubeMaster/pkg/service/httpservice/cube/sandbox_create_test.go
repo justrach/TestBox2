@@ -15,7 +15,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 func TestCreateSandboxMapsMissingTemplateToNotFound(t *testing.T) {
@@ -37,12 +37,12 @@ func TestCreateSandboxMapsMissingTemplateToNotFound(t *testing.T) {
 	req := httptest.NewRequest("POST", "/cube/sandbox", strings.NewReader(`{
 		"requestID":"req-1",
 		"annotations":{
-			"` + constants.CubeAnnotationAppSnapshotTemplateID + `":"tpl-missing",
-			"` + constants.CubeAnnotationAppSnapshotTemplateVersion + `":"v2"
+			"`+constants.CubeAnnotationAppSnapshotTemplateID+`":"tpl-missing",
+			"`+constants.CubeAnnotationAppSnapshotTemplateVersion+`":"v2"
 		}
 	}`))
 	rt := &CubeLog.RequestTrace{}
-	resp := createSandbox(httptest.NewRecorder(), req, rt)
+	resp := createSandbox(req, rt)
 
 	got, ok := resp.(*types.Res)
 	if !ok {
@@ -72,12 +72,12 @@ func TestCreateSandboxKeepsOtherTemplateErrorsAsParamsError(t *testing.T) {
 	req := httptest.NewRequest("POST", "/cube/sandbox", strings.NewReader(`{
 		"requestID":"req-2",
 		"annotations":{
-			"` + constants.CubeAnnotationAppSnapshotTemplateID + `":"tpl-other-error",
-			"` + constants.CubeAnnotationAppSnapshotTemplateVersion + `":"v2"
+			"`+constants.CubeAnnotationAppSnapshotTemplateID+`":"tpl-other-error",
+			"`+constants.CubeAnnotationAppSnapshotTemplateVersion+`":"v2"
 		}
 	}`))
 	rt := &CubeLog.RequestTrace{}
-	resp := createSandbox(httptest.NewRecorder(), req, rt)
+	resp := createSandbox(req, rt)
 
 	got, ok := resp.(*types.Res)
 	if !ok {

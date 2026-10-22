@@ -5,7 +5,6 @@
 mod config;
 mod constants;
 mod cubemaster;
-mod db;
 mod error;
 mod handlers;
 mod logging;
@@ -30,7 +29,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// Most settings are controlled via environment variables; only the most
 /// commonly overridden ones are exposed as CLI flags.
 #[derive(Parser, Debug)]
-#[command(name = "cube-api", version, about, long_about = None)]
+#[command(name = "cube-api", version = env!("CUBE_VERSION_FULL"), about, long_about = None)]
 struct Cli {
     /// Enable debug log level (overrides LOG_LEVEL env var and config).
     ///
@@ -180,7 +179,8 @@ fn main() -> anyhow::Result<()> {
         debug_mode = cli.debug,
         log_level = %cfg.log_level,
         bind = %cfg.bind,
-        auth_enabled = cfg.auth_callback_url.is_some(),
+        auth_enabled = cfg.auth_callback_url.is_some()
+            || cfg.cube_api_key.is_some(),
         "cube-api starting"
     );
 

@@ -44,10 +44,13 @@ Cube Sandbox provides a Docker-based builder image for a consistent build enviro
 # Build the builder image
 make builder-image
 
+# From mainland China, source apt packages from China-reachable mirrors
+make builder-image MIRROR=cn
+
 # Start an interactive shell inside the builder
 make builder-shell
 
-# Build all Go components (CubeMaster, Cubelet, network-agent)
+# Build all Go components (CubeMaster, Cubelet, …)
 make all
 
 # Build individual components
@@ -55,6 +58,9 @@ make cubemaster
 make cubelet
 make agent
 make shim
+
+# Remove local Go/Rust build artifacts (not global caches)
+make clean
 ```
 
 See the [Makefile](./Makefile) for the full list of build targets.
@@ -71,14 +77,13 @@ See the [Makefile](./Makefile) for the full list of build targets.
 | `agent/` | Rust | In-guest daemon running inside each sandbox |
 | `hypervisor/` | Rust | KVM-based MicroVM manager (Cloud Hypervisor fork) |
 | `mvs/` / `CubeNet/` | Go | CubeVS eBPF-based network isolation |
-| `network-agent/` | Go | Network management service |
 | `deploy/` | Shell | Deployment scripts and guest image tooling |
 | `examples/` | Python | SDK examples and end-to-end scenarios |
 | `docs/` | Markdown | VitePress documentation site (EN + ZH) |
 
 ## Submitting a Pull Request
 
-1. **Fork** the repository and create a feature branch from `main`.
+1. **Fork** the repository and create a feature branch from `master`.
 2. **Make your changes** — keep commits focused and atomic.
 3. **Test** — make sure existing tests and linters still pass.
 4. **Add tests** — add focused test coverage when behavior changes.
@@ -132,6 +137,15 @@ Commits without a valid `Signed-off-by` line will not be accepted.
 - **Go** — follow standard `gofmt` formatting and project conventions.
 - **Rust** — follow `rustfmt` and `clippy` recommendations.
 - **Documentation** — use clear, concise language. Both English and Chinese docs should be kept in sync.
+
+## Issue & PR Close Policy
+
+Issues and PRs are closed under the following conditions:
+
+- **Stale after a `need-info` request** — if a maintainer asks for more information or requested changes and the author does not respond **for more than 2 weeks**, the Issue/PR is closed as stale. It can be reopened once the requested information or changes are provided.
+- **Resolved or superseded** — the underlying bug is fixed, the feature is implemented, or the change has been superseded by another PR/approach.
+- **Out of scope / won't fix** — closed with a comment explaining why.
+- **Duplicate** — closed with a link to the original Issue/PR.
 
 ## Reporting Security Issues
 

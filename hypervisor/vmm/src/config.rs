@@ -10,6 +10,7 @@ pub use virtio_devices::fs::{
 };
 pub use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
 
+use crate::vm_config::*;
 use clap::ArgMatches;
 use option_parser::{
     ByteSized, IntegerList, OptionParser, OptionParserError, StringList, Toggle, Tuple,
@@ -23,15 +24,15 @@ use std::result;
 use std::str::FromStr;
 use std::{fmt, fs};
 use thiserror::Error;
+use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
 use virtiofsd::passthrough::xattrmap::XattrMap;
-
-use crate::vm_config::*;
 
 const MAX_NUM_PCI_SEGMENTS: u16 = 16;
 
 const UPDATE_FS_SHARED_DIR_FIELD: &str = "shared_dir";
 const UPDATE_FS_ALLOWED_DIRS_FIELD: &str = "allowed_dirs";
 const UPDATE_FS_CACHE_FIELD: &str = "cache";
+const UPDATE_FS_REMAP_FILTER_FIELD: &str = "remap_filter";
 
 /// Errors associated with VM configuration parameters.
 #[derive(Debug, Error)]
@@ -173,6 +174,8 @@ pub enum ValidationError {
     TdxFirmwareMissing,
     /// Insuffient vCPUs for queues
     TooManyQueues,
+    /// Invalid queue size
+    InvalidQueueSize(u16),
     /// Need shared memory for vfio-user
     UserDevicesRequireSharedMemory,
     /// Memory zone is reused across NUMA nodes
@@ -249,6 +252,12 @@ impl fmt::Display for ValidationError {
             }
             TooManyQueues => {
                 write!(f, "Number of vCPUs is insufficient for number of queues")
+            }
+            InvalidQueueSize(s) => {
+                write!(
+                    f,
+                    "Queue size is smaller than {MINIMUM_BLOCK_QUEUE_SIZE}: {s}"
+                )
             }
             UserDevicesRequireSharedMemory => {
                 write!(
@@ -1075,6 +1084,10 @@ impl DiskConfig {
             return Err(ValidationError::TooManyQueues);
         }
 
+        if self.queue_size <= MINIMUM_BLOCK_QUEUE_SIZE {
+            return Err(ValidationError::InvalidQueueSize(self.queue_size));
+        }
+
         if self.vhost_user && self.iommu {
             return Err(ValidationError::IommuNotSupported);
         }
@@ -1384,7 +1397,7 @@ impl FsConfig {
     thread_pool_size=<thread_pool_size>,ops_size=<ops_size>,\
     ops_one_time_burst=<ops_one_time_burst>,ops_refill_time=<ops_refill_time>,\
     bw_size=<bw_size>,bw_one_time_burst=<bw_one_time_burst>,bw_refill_time=<bw_refill_time>,\
-    allowed_dirs=<dir_list>\"";
+    allowed_dirs=<dir_list>,remap_filter=<remap_filter>\"";
 
     fn add_frontend_args(parser: &mut OptionParser) {
         parser
@@ -1413,7 +1426,8 @@ impl FsConfig {
             .add("rlimit_nofile")
             .add("killpriv_v2")
             .add("security_label")
-            .add("allowed_dirs");
+            .add("allowed_dirs")
+            .add("remap_filter");
     }
 
     fn add_ratelimiter_args(parser: &mut OptionParser) {
@@ -1511,6 +1525,11 @@ impl FsConfig {
             .convert::<StringList>("allowed_dirs")
             .map_err(Error::ParseFileSystem)?
             .map(|v| v.0);
+        let remap_filter = parser
+            .convert::<Toggle>("remap_filter")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
 
         Ok(BackendFsConfig {
             shared_dir,
@@ -1528,6 +1547,7 @@ impl FsConfig {
             killpriv_v2,
             security_label,
             allowed_dirs,
+            remap_filter,
         })
     }
 
@@ -2111,6 +2131,10 @@ pub struct RestoreConfig {
     /// source_url/<SNAPSHOT_FILENAME>.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_vol_url: Option<String>,
+    /// Optional ivshmem shared memory device configuration.
+    /// When present, the VM will have an ivshmem device for host-guest communication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ivshmem: Option<IvshmemConfig>,
 }
 
 impl RestoreConfig {
@@ -2155,6 +2179,7 @@ impl RestoreConfig {
             pmem: None,
             dirty_log,
             memory_vol_url,
+            ivshmem: None,
         })
     }
 }
@@ -2212,6 +2237,7 @@ enum DeviceValue {
     Str(String),
     Arr(Vec<String>),
     Value(u64),
+    Bool(bool),
 }
 
 impl VmConfig {
@@ -2345,6 +2371,10 @@ impl VmConfig {
                         UPDATE_FS_CACHE_FIELD,
                         DeviceValue::Value(backend.cache as u64),
                     );
+                    device.insert(
+                        UPDATE_FS_REMAP_FILTER_FIELD,
+                        DeviceValue::Bool(backend.remap_filter),
+                    );
                     devices.insert(fs_cfg.id.as_ref().unwrap().clone(), device);
                 }
                 if fs_cfg.rate_limiter_config.is_some() {
@@ -2374,6 +2404,11 @@ impl VmConfig {
                             {
                                 backend.cache = *cache as u8;
                             }
+                            if let Some(DeviceValue::Bool(remap_filter)) =
+                                device.get(UPDATE_FS_REMAP_FILTER_FIELD)
+                            {
+                                backend.remap_filter = *remap_filter;
+                            }
                         }
                     }
                     if let Some(rate_limit) = rate_limiter.get(id) {
@@ -2393,6 +2428,13 @@ impl VmConfig {
                 return;
             }
             vsock.socket = vsock_cfg.socket.clone();
+        }
+    }
+
+    pub fn update_ivshmem(&mut self, ivshmem_cfg: &IvshmemConfig) {
+        if let Some(ivshmem) = &mut self.ivshmem {
+            ivshmem.path = ivshmem_cfg.path.clone();
+            ivshmem.size = ivshmem_cfg.size;
         }
     }
 
@@ -2569,6 +2611,10 @@ impl VmConfig {
 
         if let Some(balloon) = &self.balloon {
             let mut ram_size = self.memory.size;
+
+            if let Some(hotplugged_size) = &self.memory.hotplugged_size {
+                ram_size += hotplugged_size;
+            }
 
             if let Some(zones) = &self.memory.zones {
                 for zone in zones {
@@ -2833,6 +2879,36 @@ impl VmConfig {
 mod tests {
     use super::*;
     use net_util::MacAddr;
+
+    #[test]
+    fn update_fses_preserves_restore_remap_filter() {
+        let mut config = VmConfig {
+            fs: Some(vec![FsConfig {
+                id: Some("virtio_rw".to_string()),
+                backendfs_config: Some(BackendFsConfig::default()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let restore_fses = vec![FsConfig {
+            id: Some("virtio_rw".to_string()),
+            backendfs_config: Some(BackendFsConfig {
+                remap_filter: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+
+        config.update_fses(&restore_fses);
+
+        assert!(
+            config.fs.unwrap()[0]
+                .backendfs_config
+                .as_ref()
+                .unwrap()
+                .remap_filter
+        );
+    }
 
     #[test]
     fn test_cpu_parsing() -> Result<()> {
@@ -3387,6 +3463,41 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_update_ivshmem_ignores_missing_snapshot_device() {
+        let mut vm_config = VmConfig {
+            ivshmem: None,
+            ..Default::default()
+        };
+        let restore_ivshmem = IvshmemConfig {
+            path: PathBuf::from("/dev/shm/ivshmem-sandbox"),
+            size: 1024 * 1024,
+        };
+
+        vm_config.update_ivshmem(&restore_ivshmem);
+
+        assert_eq!(vm_config.ivshmem, None);
+    }
+
+    #[test]
+    fn test_update_ivshmem_updates_existing_backend() {
+        let mut vm_config = VmConfig {
+            ivshmem: Some(IvshmemConfig {
+                path: PathBuf::from("/dev/shm/ivshmem-template"),
+                size: 512 * 1024,
+            }),
+            ..Default::default()
+        };
+        let restore_ivshmem = IvshmemConfig {
+            path: PathBuf::from("/dev/shm/ivshmem-sandbox"),
+            size: 1024 * 1024,
+        };
+
+        vm_config.update_ivshmem(&restore_ivshmem);
+
+        assert_eq!(vm_config.ivshmem, Some(restore_ivshmem));
     }
 
     #[test]

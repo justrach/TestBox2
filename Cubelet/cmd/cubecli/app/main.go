@@ -15,6 +15,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands/container"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands/ctrcommands"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands/cubebox"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands/diag"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands/image"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands/metadata"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands/network"
@@ -33,7 +34,7 @@ var extraCmds = []*cli.Command{
 
 func init() {
 	cli.VersionPrinter = func(c *cli.Context) {
-		fmt.Println(c.App.Name, pkgv.Package, c.App.Version)
+		fmt.Println(pkgv.VersionString("cubecli"))
 	}
 }
 
@@ -92,6 +93,7 @@ func New() *cli.App {
 		cubebox.MultiRun,
 		unsafe.Command,
 		cubebox.ListCommand,
+		cubebox.LogsCommand,
 		image.ImageCommand(),
 		image.GlobalListImageCommand,
 		image.Load,
@@ -100,6 +102,7 @@ func New() *cli.App {
 		storage.Command,
 		network.Command,
 		metadata.Command,
+		diag.Command,
 		ctrcommands.Command,
 	}, extraCmds...)
 	return app

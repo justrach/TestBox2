@@ -24,9 +24,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	cubecommands "github.com/tencentcloud/CubeSandbox/Cubelet/cmd/cubecli/commands"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 var ExecCommand = &cli.Command{
@@ -181,7 +181,7 @@ var ExecCommand = &cli.Command{
 		if flagD {
 			return nil
 		}
-		status := <-statusC
+		status := waitForProcessIO(statusC, process.IO().Wait)
 		code, _, err := status.Result()
 		if err != nil {
 			return fmt.Errorf("failed to get exit code: %w", err)
@@ -191,6 +191,14 @@ var ExecCommand = &cli.Command{
 		}
 		return nil
 	},
+}
+
+// waitForProcessIO prevents process deletion from racing the final stdout and
+// stderr copy loops after the process has exited.
+func waitForProcessIO(statusC <-chan containerd.ExitStatus, wait func()) containerd.ExitStatus {
+	status := <-statusC
+	wait()
+	return status
 }
 
 func findContainer(ctx gocontext.Context, id string, cntdClient *containerd.Client) ([]containerd.Container, error) {

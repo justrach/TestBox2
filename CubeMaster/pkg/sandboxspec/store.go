@@ -44,7 +44,7 @@ func Init(client *gorm.DB) error {
 	if client == nil {
 		return errors.New("sandboxspec.Init: nil db")
 	}
-	// Schema for t_cube_sandbox_spec is owned by pkg/base/dao/migrate and
+	// Schema for t_cube_sandbox_spec is owned by pkgs/cubedb/migrate and
 	// applied at startup before Init runs; here we only cache the handle.
 	dbMu.Lock()
 	db = client
@@ -108,6 +108,19 @@ func doPut(ctx context.Context, sandboxID string, req *sandboxtypes.CreateCubeSa
 	if canonical.Annotations != nil {
 		templateID = strings.TrimSpace(canonical.Annotations[constants.CubeAnnotationAppSnapshotTemplateID])
 	}
+	backend := ""
+	if normalized, ok, err := constants.OptionalSnapshotBackend(canonical.Backend); err == nil && ok {
+		backend = normalized
+		canonical.Backend = normalized
+		if canonical.Annotations == nil {
+			canonical.Annotations = map[string]string{}
+		}
+		canonical.Annotations[constants.CubeAnnotationStorageBackend] = normalized
+		payload, err = json.Marshal(canonical)
+		if err != nil {
+			return err
+		}
+	}
 	rec := &models.SandboxSpec{
 		SandboxID:    sandboxID,
 		TemplateID:   templateID,
@@ -116,6 +129,7 @@ func doPut(ctx context.Context, sandboxID string, req *sandboxtypes.CreateCubeSa
 		HostID:       strings.TrimSpace(opts.HostID),
 		HostIP:       strings.TrimSpace(opts.HostIP),
 		RequestJSON:  string(payload),
+		Backend:      backend,
 		Backfilled:   opts.Backfilled,
 	}
 	// Single-roundtrip UPSERT keyed on the unique sandbox_id index so the
@@ -135,6 +149,7 @@ func doPut(ctx context.Context, sandboxID string, req *sandboxtypes.CreateCubeSa
 				"host_id",
 				"host_ip",
 				"request_json",
+				"backend",
 				"backfilled",
 				"updated_at",
 			}),
@@ -178,9 +193,81 @@ func Get(ctx context.Context, sandboxID string) (*sandboxtypes.CreateCubeSandbox
 		}
 		return nil, err
 	}
+	return decodeSpec(&rec)
+}
+
+// getManyBatchSize bounds one IN list. Tests lower it to exercise batching.
+var getManyBatchSize = 500
+
+// GetMany returns the canonical requests for the given sandbox ids. Ids
+// without a spec are absent from the result; a row that fails to decode is
+// skipped rather than failing the whole batch. A query error stops further
+// batches and returns the rows already decoded together with the error.
+func GetMany(ctx context.Context, sandboxIDs []string) (map[string]*sandboxtypes.CreateCubeSandboxReq, error) {
+	client := getDB()
+	if client == nil {
+		return nil, ErrSandboxSpecStoreNotReady
+	}
+	ids := uniqueTrimmedIDs(sandboxIDs)
+	out := make(map[string]*sandboxtypes.CreateCubeSandboxReq, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	batchSize := getManyBatchSize
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+	for start := 0; start < len(ids); start += batchSize {
+		end := start + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		var recs []models.SandboxSpec
+		if err := client.WithContext(ctx).Table(constants.SandboxSpecTableName).
+			Where("sandbox_id IN ?", ids[start:end]).Find(&recs).Error; err != nil {
+			return out, err
+		}
+		for i := range recs {
+			req, err := decodeSpec(&recs[i])
+			if err != nil {
+				continue
+			}
+			out[recs[i].SandboxID] = req
+		}
+	}
+	return out, nil
+}
+
+func uniqueTrimmedIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func decodeSpec(rec *models.SandboxSpec) (*sandboxtypes.CreateCubeSandboxReq, error) {
+	if rec == nil {
+		return nil, errors.New("sandboxspec: nil record")
+	}
 	out := &sandboxtypes.CreateCubeSandboxReq{}
 	if err := json.Unmarshal([]byte(rec.RequestJSON), out); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(out.Backend) == "" && strings.TrimSpace(rec.Backend) != "" {
+		out.Backend = rec.Backend
 	}
 	return out, nil
 }
@@ -232,7 +319,7 @@ func CanonicalizeRequest(req *sandboxtypes.CreateCubeSandboxReq) (*sandboxtypes.
 	if out.Labels == nil {
 		out.Labels = map[string]string{}
 	}
-	out.Timeout = 0
+	out.Timeout = nil
 	out.InsId = ""
 	out.InsIp = ""
 	out.Request = nil

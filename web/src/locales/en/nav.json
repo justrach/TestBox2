@@ -3,10 +3,11 @@
   "sandboxes": "Sandboxes",
   "templates": "Templates",
   "nodes": "Nodes",
+  "versions": "Versions",
   "network": "Network",
   "observability": "Observability",
-  "apiKeys": "API Keys",
   "settings": "Settings",
   "store": "Template Store",
-  "agentHub": "AgentHub"
+  "agentHub": "AgentHub",
+  "warehouse": "Warehouse"
 }

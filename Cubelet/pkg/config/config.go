@@ -21,15 +21,11 @@ import (
 
 var cfg *Config
 
-var networkAgentOverride struct {
-	enable   bool
-	endpoint string
-	set      bool
-}
-
 type MetaServerConfig struct {
 	MetaServerEndpoint  string `yaml:"meta_server_endpoint,omitempty"`
 	NodeStatusMaxImages int32  `yaml:"node_status_max_images,omitempty"`
+	// CubeMasterHTTPAddr is the CubeMaster HTTP address for artifact downloads.
+	CubeMasterHTTPAddr string `yaml:"cubemaster_http_addr,omitempty"`
 }
 
 type Config struct {
@@ -50,6 +46,29 @@ type HostConfigQuota struct {
 	Mem                   string `yaml:"mem_limit"`
 	MvmLimit              int    `yaml:"mvm_limit"`
 	CreationConcurrentNum int    `yaml:"creation_concurrent_num"`
+
+	// PausedResourceReleaseRatio is the paused-resource scheduling dial.
+	// Pausing a sandbox snapshots it to disk and shuts the MicroVM down, so its
+	// host CPU/RAM is already reclaimed; this ratio decides how much of that
+	// quota is released back to the scheduler vs kept reserved as resume
+	// headroom. It is in [0,1] (out-of-range values are clamped) and is applied
+	// symmetrically to CPU and memory:
+	//   0.0 (default) -- release nothing: paused sandboxes keep their full
+	//                    quota, so resume is guaranteed. Identical to the legacy
+	//                    behaviour (the safe zero-value default).
+	//   1.0           -- release everything: maximum density, resume is purely
+	//                    best-effort and rejected when the node can no longer
+	//                    fit the sandbox (see UpdateWithResume admission).
+	//   0 < r < 1     -- release a fraction r and reserve (1-r) as headroom. A
+	//                    pause-heavy node then (a) keeps room for its own
+	//                    resumes and (b), because the reserved quota still shows
+	//                    up in QuotaCpuUsage/QuotaMemUsage, is naturally
+	//                    deprioritised by the cpu/mem quota scoring factors, so
+	//                    the scheduler stops piling new sandboxes onto nodes
+	//                    that already hold many paused ones.
+	// Disk is intentionally still counted (the pause snapshot occupies storage)
+	// and paused sandboxes still count toward MvmNum, regardless of the ratio.
+	PausedResourceReleaseRatio float64 `yaml:"paused_resource_release_ratio"`
 }
 
 type HostConfigGC struct {
@@ -60,8 +79,6 @@ type HostConfigGC struct {
 type CommonConf struct {
 	CommonTimeout         time.Duration `yaml:"common_timeout"`
 	LogLevel              string        `yaml:"log_level"`
-	EnableNetworkAgent    bool          `yaml:"enable_network_agent"`
-	NetworkAgentEndpoint  string        `yaml:"network_agent_endpoint"`
 	DescribeAsyncInterval time.Duration `yaml:"describe_asynchronous"`
 	EnablePFMode          bool          `yaml:"enable_pf_mode"`
 	DescribeBDFInterval   time.Duration `yaml:"describe_bdf"`
@@ -89,8 +106,10 @@ type CommonConf struct {
 
 	DisableHostNetfile bool `yaml:"disable_host_netfile"`
 
-	DefaultDNSServers []string      `yaml:"default_dns_servers"`
-	ReconcileInterval time.Duration `yaml:"reconcile_interval"`
+	DefaultDNSServers  []string      `yaml:"default_dns_servers"`
+	DefaultDNSSearches []string      `yaml:"default_dns_searches"`
+	DefaultDNSOptions  []string      `yaml:"default_dns_options"`
+	ReconcileInterval  time.Duration `yaml:"reconcile_interval"`
 
 	DisableCubeBoxTemplateBaseFormatPoolOfNumberVer bool `yaml:"disable_cube_box_template_base_format_pool_of_number_ver"`
 }
@@ -125,12 +144,6 @@ func Init(configPath string, useDefault bool) (*Config, error) {
 	return newCfg, nil
 }
 
-func SetNetworkAgentOverride(enable bool, endpoint string) {
-	networkAgentOverride.enable = enable
-	networkAgentOverride.endpoint = endpoint
-	networkAgentOverride.set = true
-}
-
 func validate(cfg *Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
@@ -163,8 +176,28 @@ func validate(cfg *Config) error {
 				return fmt.Errorf("invalid common.default_dns_servers entry: %q", dns)
 			}
 		}
+		for _, search := range cfg.Common.DefaultDNSSearches {
+			if !validDNSConfigToken(search) {
+				return fmt.Errorf("invalid common.default_dns_searches entry: %q", search)
+			}
+		}
+		for _, option := range cfg.Common.DefaultDNSOptions {
+			if !validDNSConfigToken(option) {
+				return fmt.Errorf("invalid common.default_dns_options entry: %q", option)
+			}
+		}
 	}
 	return nil
+}
+
+// validDNSConfigToken mirrors netfile token rules for search/options config entries.
+func validDNSConfigToken(item string) bool {
+	for _, r := range item {
+		if r <= ' ' || r == 0x7f || r == '#' || r == ';' {
+			return false
+		}
+	}
+	return true
 }
 
 func preHandle(config *Config) (*Config, error) {
@@ -175,16 +208,6 @@ func preHandle(config *Config) (*Config, error) {
 		config.Common = &CommonConf{}
 	}
 
-	if networkAgentOverride.set {
-		config.Common.EnableNetworkAgent = networkAgentOverride.enable
-		if networkAgentOverride.endpoint != "" {
-			config.Common.NetworkAgentEndpoint = networkAgentOverride.endpoint
-		}
-	}
-
-	if config.Common.NetworkAgentEndpoint == "" {
-		config.Common.NetworkAgentEndpoint = "grpc+unix:///run/cube/network-agent-grpc.sock"
-	}
 	if config.HostConf == nil {
 		config.HostConf = &HostConf{}
 	}
@@ -230,17 +253,9 @@ func preHandle(config *Config) (*Config, error) {
 	if config.Common.GetBDFByIfNameCmd == "" {
 		config.Common.GetBDFByIfNameCmd = "/usr/local/services/AdamPlugins-1.0/snhost_snic_sdk/cath/bm/tools/get_bdf_by_ifname"
 	}
-	if len(config.Common.DefaultDNSServers) > 0 {
-		normalized := make([]string, 0, len(config.Common.DefaultDNSServers))
-		for _, dns := range config.Common.DefaultDNSServers {
-			dns = strings.TrimSpace(dns)
-			if dns == "" {
-				continue
-			}
-			normalized = append(normalized, dns)
-		}
-		config.Common.DefaultDNSServers = normalized
-	}
+	config.Common.DefaultDNSServers = normalizeStringList(config.Common.DefaultDNSServers)
+	config.Common.DefaultDNSSearches = normalizeStringList(config.Common.DefaultDNSSearches)
+	config.Common.DefaultDNSOptions = normalizeStringList(config.Common.DefaultDNSOptions)
 
 	if config.Tenant == nil {
 		config.Tenant = &TenantManager{
@@ -269,7 +284,10 @@ func preHandle(config *Config) (*Config, error) {
 		config.MetaServerConfig = &MetaServerConfig{}
 	}
 	if config.MetaServerConfig.MetaServerEndpoint == "" {
-		config.MetaServerConfig.MetaServerEndpoint = "cube-meta-server.cube.com"
+		config.MetaServerConfig.MetaServerEndpoint = "127.0.0.1:3010"
+	}
+	if config.MetaServerConfig.CubeMasterHTTPAddr == "" {
+		config.MetaServerConfig.CubeMasterHTTPAddr = "127.0.0.1:8089"
 	}
 	if config.MetaServerConfig.NodeStatusMaxImages == 0 {
 		config.MetaServerConfig.NodeStatusMaxImages = 40000
@@ -279,6 +297,21 @@ func preHandle(config *Config) (*Config, error) {
 		config.Common.ReconcileInterval = time.Minute * 5
 	}
 	return config, nil
+}
+
+func normalizeStringList(values []string) []string {
+	if len(values) == 0 {
+		return values
+	}
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		normalized = append(normalized, value)
+	}
+	return normalized
 }
 
 //go:noinline

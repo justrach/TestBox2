@@ -87,6 +87,63 @@ CubeProxy 会在转发时剥离 `/sandbox/<id>/<port>` 前缀，沙箱内的应�
 
 两种模式在每个 CubeProxy 实例上同时启用，共享同一份 Redis 路由元数据，无需额外配置即可使用路径形式。
 
+## 自定义沙箱服务收到的 Host
+
+部分 Web 框架会校验 HTTP `Host`，而 Cube 的 public URL Host 默认是
+`<port>-<sandbox-id>.<domain>`。创建沙箱时可通过 E2B 兼容的
+`network.maskRequestHost` 设置 CubeProxy 转发给用户服务的 Host：
+
+```python
+from cubesandbox import Sandbox
+
+sandbox = Sandbox.create(
+    network={
+        "mask_request_host": "localhost:${PORT}",
+    },
+)
+```
+
+`${PORT}` 会在每次请求时替换为 public URL 或 Path 模式中的沙箱服务端口：
+
+```text
+访问 3000 端口 -> Host: localhost:3000
+访问 8080 端口 -> Host: localhost:8080
+```
+
+外部 URL、DNS 与 TLS SNI 均不改变。掩码生效时，CubeProxy 还会把原始请求
+Host 写入 `X-Forwarded-Host`。该配置同时适用于 Host 模式、Path 模式以及
+用户服务的 WebSocket 握手。
+
+`maskRequestHost` 是按 sandbox 配置的 create-only 选项，运行中不可更新。
+为避免影响 commands/files/PTY 等内部数据面协议，envd 端口 `49983` 不应用
+该掩码。直接访问 SandboxIP 或节点 HostPort 会绕过 CubeProxy，因此也不会
+发生 Host 改写。
+
+---
+
+## gRPC 接入（明文 HTTP/2）
+
+CubeProxy 还提供独立的沙箱 gRPC 接入监听端口。一键部署默认使用 `9090`，可通过 `.env` 中的 `CUBE_PROXY_GRPC_PORT` 调整。
+
+客户端以明文 HTTP/2 连接 CubeProxy IP，并通过 gRPC `:authority` 指定目标沙箱，格式与 Host 模式一致：
+
+```
+<container-port>-<sandbox-id>
+```
+
+例如，经部署在 `10.0.0.5` 的 CubeProxy 访问沙箱 `abc123` 的 `49983` 端口：
+
+```
+dial: 10.0.0.5:9090
+:authority: 49983-abc123
+```
+
+该模式适用于无法使用泛域名 DNS 或在 CubeProxy 侧终止 TLS 的 gRPC 客户端，路由元数据与 Host 模式共用，无需额外配置。
+
+若沙箱创建时设置了 `network.allow_public_traffic = false`，本监听端口同样会校验
+`e2b-traffic-access-token` / `cube-traffic-access-token`；gRPC 客户端需在每次请求的
+metadata（或等效 header）中携带 token。详见[限制公网访问](./restrict-public-access.md)。
+
 ---
 
 ## HTTPS 证书配置

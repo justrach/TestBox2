@@ -7,13 +7,14 @@ package server
 
 import (
 	"context"
-	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
+	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
@@ -21,10 +22,9 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/recov"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/cube"
 	inner "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/inner"
-	metahttp "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/meta"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/middleware"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/notify"
-	"github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 type Server struct {
@@ -48,7 +48,31 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 type internalHttp struct {
 	*http.Server
-	router *mux.Router
+	engine *gin.Engine
+}
+
+// newEngine builds the gin engine with the routing-level policies that must be
+// shared between production (NewInternalHttp) and tests. It deliberately keeps
+// the request middleware OFF the engine itself so that NoRoute / NoMethod stay
+// bare — gorilla/mux does not run router middleware on unmatched or
+// method-mismatch requests (MatchErr != nil), so neither must gin here (in
+// particular, checkAuth must not run on probes / mistyped URLs).
+func newEngine() *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	engine.RedirectTrailingSlash = false
+	engine.HandleMethodNotAllowed = true
+	// Mux parity: unmatched path → plain HTTP 404, no middleware (no auth).
+	engine.NoRoute(func(c *gin.Context) {
+		http.NotFound(c.Writer, c.Request)
+	})
+	// Mux parity: method-mismatch → HTTP 405 (empty body, Allow header), no
+	// middleware. gorilla/mux returns 405 via methodNotAllowedHandler() when
+	// match.MatchErr == ErrMethodMismatch.
+	engine.NoMethod(func(c *gin.Context) {
+		c.AbortWithStatus(http.StatusMethodNotAllowed)
+	})
+	return engine
 }
 
 func NewInternalHttp(ctx context.Context, cfg *config.Config) (*internalHttp, error) {
@@ -56,66 +80,43 @@ func NewInternalHttp(ctx context.Context, cfg *config.Config) (*internalHttp, er
 		return nil, errors.New("config is nil")
 	}
 
-	router := mux.NewRouter()
+	engine := newEngine()
 	s := &internalHttp{
 		Server: &http.Server{
-			Addr:         fmt.Sprintf("0.0.0.0:%d", cfg.Common.HttpPort),
+			Addr:         net.JoinHostPort(cfg.Common.HttpBind, strconv.Itoa(cfg.Common.HttpPort)),
 			ReadTimeout:  time.Second * time.Duration(cfg.Common.ReadTimeout),
 			WriteTimeout: time.Second * time.Duration(cfg.Common.WriteTimeout),
 			IdleTimeout:  time.Second * time.Duration(cfg.Common.IdleTimeout),
-			Handler:      router,
+			Handler:      engine,
 		},
-		router: router,
+		engine: engine,
 	}
 
-	s.registerHandlers()
+	s.registerRoutes()
 	return s, nil
 }
 
-func (s *internalHttp) registerHandlers() {
-	r := s.router
+// registerRoutes mounts the request middleware (logging / auth / recovery /
+// trace) on a root group so it runs for every matched route — mirroring the
+// previous gorilla/mux router-level middleware — while leaving the engine-level
+// NoRoute / NoMethod handlers bare.
+func (s *internalHttp) registerRoutes() {
+	// The internal template callback (TC -> Master build status) sits OUTSIDE
+	// GinRequestMiddleware: when AuthConf.Enable is on, checkAuth would reject
+	// the unsigned callback with an HTTP-200 business error, and TC's reporter
+	// treats StatusCode == 200 as success — the shared-token gate in the
+	// handler would never run. gin.Recovery keeps panic handling; the token
+	// gate is the only auth on these routes (same shape as TC's internal API).
+	internal := s.engine.Group("", gin.Recovery())
+	cube.RegisterInternalTemplateRoutes(internal)
 
-	r.Use(middleware.MiddlewareLogging)
-	r.Handle("/metrics", promhttp.Handler()).Methods(http.MethodGet)
+	root := s.engine.Group("")
+	root.Use(middleware.GinRequestMiddleware())
+	root.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
-	notifyGroup := r.PathPrefix(notify.NotifyURI()).Subrouter()
-	notifyGroup.HandleFunc(notify.HostChangeNotifyAction, notify.HttpHandler).Methods(http.MethodPost)
-	notifyGroup.HandleFunc(notify.HealthCheckAction, notify.HttpHandler).Methods(http.MethodGet)
-
-	cubeGroup := r.PathPrefix(cube.CubeURI()).Subrouter()
-	cubeGroup.HandleFunc(cube.SandboxAction, cube.HttpHandler).Methods(http.MethodPost, http.MethodDelete)
-	cubeGroup.HandleFunc(cube.ImageAction, cube.HttpHandler).Methods(http.MethodPost, http.MethodDelete)
-	cubeGroup.HandleFunc(cube.SandboxListAction, cube.HttpHandler).Methods(http.MethodGet, http.MethodPost)
-	cubeGroup.HandleFunc(cube.SandboxInfoAction, cube.HttpHandler).Methods(http.MethodGet, http.MethodPost)
-	cubeGroup.HandleFunc(cube.SandboxExecAction, cube.HttpHandler).Methods(http.MethodPost)
-	cubeGroup.HandleFunc(cube.SandboxUpdateAction, cube.HttpHandler).Methods(http.MethodPost)
-	cubeGroup.HandleFunc(cube.SandboxCommitAction, cube.HttpHandler).Methods(http.MethodPost)
-	cubeGroup.HandleFunc(cube.SandboxRollbackAction, cube.HttpHandler).Methods(http.MethodPost)
-	cubeGroup.HandleFunc(cube.SandboxAction+"/{sandbox_id}/rollback", cube.HttpHandler).Methods(http.MethodPost)
-	cubeGroup.HandleFunc(cube.SnapshotAction, cube.HttpHandler).Methods(http.MethodGet, http.MethodPost)
-	cubeGroup.HandleFunc(cube.SnapshotAction+"/{snapshot_id}", cube.HttpHandler).Methods(http.MethodGet, http.MethodDelete)
-	cubeGroup.HandleFunc(cube.OperationAction+"/{operation_id}", cube.HttpHandler).Methods(http.MethodGet)
-	cubeGroup.HandleFunc(cube.TemplateAction, cube.HttpHandler).Methods(http.MethodGet, http.MethodPost, http.MethodDelete)
-	cubeGroup.HandleFunc(cube.TemplateRedoAction, cube.HttpHandler).Methods(http.MethodPost)
-	cubeGroup.HandleFunc(cube.TemplateBuildStatusAction+"/{build_id}/status", cube.HttpHandler).Methods(http.MethodGet)
-	cubeGroup.HandleFunc(cube.TemplateFromImageAction, cube.HttpHandler).Methods(http.MethodGet, http.MethodPost)
-	cubeGroup.HandleFunc(cube.TemplateArtifactDownloadAction, cube.HttpHandler).Methods(http.MethodGet, http.MethodHead)
-	cubeGroup.HandleFunc(cube.RootfsArtifactAction, cube.HttpHandler).Methods(http.MethodGet)
-	cubeGroup.HandleFunc(cube.ListInventoryAction, cube.HttpHandler).Methods(http.MethodPost)
-	cubeGroup.HandleFunc(cube.SandboxLogsAction, cube.HttpHandler).Methods(http.MethodGet, http.MethodPost)
-
-	internalGroup := r.PathPrefix(inner.InnerURI()).Subrouter()
-	internalGroup.HandleFunc(inner.NodeAction, inner.HttpHandler).Methods(http.MethodGet)
-	internalGroup.HandleFunc(inner.FakeCreateAction, inner.HttpHandler).Methods(http.MethodPost)
-	internalGroup.HandleFunc(inner.StateWs, inner.HttpHandler)
-	internalGroup.HandleFunc(inner.StateQuery, inner.HttpHandler)
-
-	metaGroup := r.PathPrefix(metahttp.MetaURI()).Subrouter()
-	metaGroup.HandleFunc(metahttp.ReadyzAction(), metahttp.ReadyzHandler).Methods(http.MethodGet)
-	metaGroup.HandleFunc(metahttp.RegisterNodeAction(), metahttp.RegisterNodeHandler).Methods(http.MethodPost)
-	metaGroup.HandleFunc(metahttp.NodesAction(), metahttp.ListNodesHandler).Methods(http.MethodGet)
-	metaGroup.HandleFunc(metahttp.NodeAction(), metahttp.GetNodeHandler).Methods(http.MethodGet)
-	metaGroup.HandleFunc(metahttp.NodeStatusAction(), metahttp.UpdateNodeStatusHandler).Methods(http.MethodPost)
+	notify.RegisterNotifyRoutes(root.Group(notify.NotifyURI()))
+	cube.RegisterCubeRoutes(root.Group(cube.CubeURI()))
+	inner.RegisterInnerRoutes(root.Group(inner.InnerURI()))
 }
 
 func (s *internalHttp) Start() error {

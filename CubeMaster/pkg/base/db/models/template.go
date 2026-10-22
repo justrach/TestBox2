@@ -20,8 +20,9 @@ type TemplateDefinition struct {
 	OriginNodeID              string `json:"origin_node_id" gorm:"column:origin_node_id"`
 	DisplayName               string `json:"display_name" gorm:"column:display_name"`
 	StorageBackend            string `json:"storage_backend" gorm:"column:storage_backend"`
-	Retain                    bool   `json:"retain" gorm:"column:retain"`
 	RootfsSizeBytesAtSnapshot uint64 `json:"rootfs_size_bytes_at_snapshot" gorm:"column:rootfs_size_bytes_at_snapshot"`
+	RootfsArtifactID          string `json:"rootfs_artifact_id" gorm:"column:rootfs_artifact_id"`
+	OriginHostFactsJSON       string `json:"origin_host_facts_json" gorm:"column:origin_host_facts_json"`
 	RequestJSON               string `json:"request_json" gorm:"column:request_json"`
 	LastError                 string `json:"last_error" gorm:"column:last_error"`
 }
@@ -39,18 +40,25 @@ func (TemplateDefinition) TableName() string {
 // keyed by templateID/snapshotID.
 type TemplateReplica struct {
 	gorm.Model
-	TemplateID      string `json:"template_id" gorm:"column:template_id"`
-	NodeID          string `json:"node_id" gorm:"column:node_id"`
-	NodeIP          string `json:"node_ip" gorm:"column:node_ip"`
-	InstanceType    string `json:"instance_type" gorm:"column:instance_type"`
-	Spec            string `json:"spec" gorm:"column:spec"`
-	Status          string `json:"status" gorm:"column:status"`
-	Phase           string `json:"phase" gorm:"column:phase"`
-	ArtifactID      string `json:"artifact_id" gorm:"column:artifact_id"`
-	LastJobID       string `json:"last_job_id" gorm:"column:last_job_id"`
-	LastErrorPhase  string `json:"last_error_phase" gorm:"column:last_error_phase"`
-	CleanupRequired bool   `json:"cleanup_required" gorm:"column:cleanup_required"`
-	ErrorMessage    string `json:"error_message" gorm:"column:error_message"`
+	TemplateID        string `json:"template_id" gorm:"column:template_id"`
+	NodeID            string `json:"node_id" gorm:"column:node_id"`
+	NodeIP            string `json:"node_ip" gorm:"column:node_ip"`
+	InstanceType      string `json:"instance_type" gorm:"column:instance_type"`
+	Spec              string `json:"spec" gorm:"column:spec"`
+	Status            string `json:"status" gorm:"column:status"`
+	Phase             string `json:"phase" gorm:"column:phase"`
+	ArtifactID        string `json:"artifact_id" gorm:"column:artifact_id"`
+	LastJobID         string `json:"last_job_id" gorm:"column:last_job_id"`
+	LastErrorPhase    string `json:"last_error_phase" gorm:"column:last_error_phase"`
+	CleanupRequired   bool   `json:"cleanup_required" gorm:"column:cleanup_required"`
+	ErrorMessage      string `json:"error_message" gorm:"column:error_message"`
+	GuestImageVersion string `json:"guest_image_version" gorm:"column:guest_image_version"`
+	AgentVersion      string `json:"agent_version" gorm:"column:agent_version"`
+	KernelVersion     string `json:"kernel_version" gorm:"column:kernel_version"`
+	ShimVersion       string `json:"shim_version" gorm:"column:shim_version"`
+	CompatStatus      string `json:"compat_status" gorm:"column:compat_status"`
+	CompatPolicy      string `json:"compat_policy" gorm:"column:compat_policy"`
+	CompatCheckedUnix int64  `json:"compat_checked_unix" gorm:"column:compat_checked_unix"`
 }
 
 func (TemplateReplica) TableName() string {

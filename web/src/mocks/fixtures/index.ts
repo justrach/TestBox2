@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Tencent. All rights reserved.
 
 import type { components } from '@/api/generated/schema';
+import type { TemplateCompatMatrix } from '@/api/client';
+import { resetWarehouseState } from './warehouse';
 
 type ClusterOverviewDto = components['schemas']['ClusterOverview'];
 type ListedSandboxDto = components['schemas']['ListedSandbox'];
@@ -11,6 +13,7 @@ type SandboxSessionDto = components['schemas']['Sandbox'];
 type TemplateDetailDto = components['schemas']['TemplateDetail'];
 type TemplateSummaryDto = components['schemas']['TemplateSummary'];
 type NodeDto = components['schemas']['NodeView'];
+type VersionMatrixDto = components['schemas']['VersionMatrixView'];
 
 const ago = (secs: number) => new Date(Date.now() - secs * 1000).toISOString();
 const later = (secs: number) => new Date(Date.now() + secs * 1000).toISOString();
@@ -26,6 +29,7 @@ function buildSandboxes(): ListedSandboxDto[] {
       startedAt: ago(137),
       endAt: later(3200),
       cpuCount: 4,
+      cpuMilli: 4000,
       memoryMB: 8192,
       diskSizeMB: 10_240,
       metadata: { project: 'data-pipeline', owner: 'ops@cube.dev', region: 'cn-shanghai' },
@@ -41,6 +45,7 @@ function buildSandboxes(): ListedSandboxDto[] {
       startedAt: ago(32),
       endAt: later(1700),
       cpuCount: 2,
+      cpuMilli: 2000,
       memoryMB: 4096,
       diskSizeMB: 8192,
       metadata: { branch: 'feat/dashboard-ui' },
@@ -55,6 +60,7 @@ function buildSandboxes(): ListedSandboxDto[] {
       startedAt: ago(6200),
       endAt: later(800),
       cpuCount: 2,
+      cpuMilli: 2000,
       memoryMB: 2048,
       diskSizeMB: 4096,
       metadata: { paused_reason: 'manual' },
@@ -69,6 +75,7 @@ function buildSandboxes(): ListedSandboxDto[] {
       startedAt: ago(48),
       endAt: later(3400),
       cpuCount: 2,
+      cpuMilli: 2000,
       memoryMB: 4096,
       diskSizeMB: 8192,
       metadata: { deployment: 'canary-0.3' },
@@ -85,8 +92,11 @@ function buildTemplates(): TemplateSummaryDto[] {
       instanceType: 'standard',
       version: '2024.11.02',
       status: 'ready',
+      jobID: 'job-mock-python-ready-01',
       createdAt: ago(86_400 * 18),
       imageInfo: 'registry.cube.dev/templates/python-3.11-ai:2024.11.02',
+      aliases: ['python-3.11-ai'],
+      public: false,
     },
     {
       templateID: 'nodejs-20-web',
@@ -95,23 +105,31 @@ function buildTemplates(): TemplateSummaryDto[] {
       status: 'ready',
       createdAt: ago(86_400 * 34),
       imageInfo: 'registry.cube.dev/templates/nodejs-20-web:20.18.0',
+      aliases: ['nodejs-20-web'],
+      public: false,
     },
     {
       templateID: 'cuda-12-pytorch',
       instanceType: 'gpu',
       version: '2.4.0',
       status: 'building',
+      jobID: 'job-mock-cuda-build-01',
       createdAt: ago(86_400 * 8),
       imageInfo: 'registry.cube.dev/templates/cuda12-torch:2.4.0',
+      aliases: ['cuda-12-pytorch'],
+      public: false,
     },
     {
       templateID: 'playwright-chromium',
       instanceType: 'standard',
       version: '1.47.0',
       status: 'failed',
+      jobID: 'job-mock-playwright-failed-01',
       lastError: 'image pull backoff: 429 Too Many Requests from registry',
       createdAt: ago(3600 * 4),
       imageInfo: 'registry.cube.dev/templates/playwright:1.47.0',
+      aliases: ['playwright-chromium'],
+      public: false,
     },
   ];
 }
@@ -128,12 +146,23 @@ function buildNodes(): NodeDto[] {
       cpuSaturation: 70.3,
       memorySaturation: 67.3,
       maxMvmSlots: 32,
+      quotaCpu: 64_000,
+      quotaMemMB: 131_072,
+      createConcurrentNum: 8,
       heartbeatTime: ago(12),
       conditions: [
         { type: 'Ready', status: 'True', lastHeartbeatTime: ago(12) },
         { type: 'KernelDeadlock', status: 'False', lastHeartbeatTime: ago(60) },
       ],
       localTemplates: ['python-3.11-ai', 'nodejs-20-web', 'ubuntu-24.04'],
+      versions: [
+        { component: 'cubelet', version: 'v0.5.0', commit: 'a1b2c3d4e5f6', source: 'binary' },
+        { component: 'containerd-shim-cube-rs', version: 'v0.5.0', source: 'manifest' },
+        { component: 'cube-runtime', version: 'v0.5.0', source: 'manifest' },
+        { component: 'cube-agent', version: 'agent-1.2.3', source: 'manifest' },
+        { component: 'guest-image', version: 'cube-image/2026.01', source: 'file' },
+        { component: 'kernel', version: '5.10.0-100', source: 'manifest' },
+      ],
     },
     {
       nodeID: 'cube-edge-02',
@@ -145,9 +174,22 @@ function buildNodes(): NodeDto[] {
       cpuSaturation: 54.2,
       memorySaturation: 44.0,
       maxMvmSlots: 24,
+      quotaCpu: 48_000,
+      quotaMemMB: 98_304,
+      createConcurrentNum: 6,
       heartbeatTime: ago(9),
       conditions: [{ type: 'Ready', status: 'True', lastHeartbeatTime: ago(9) }],
       localTemplates: ['nodejs-20-web', 'go-1.22', 'ubuntu-24.04'],
+      // edge-02 is on a different cubelet version, which demonstrates normal
+      // multi-version distribution plus an undeclared version marker.
+      versions: [
+        { component: 'cubelet', version: 'v0.4.9', commit: 'f6e5d4c3b2a1', source: 'binary' },
+        { component: 'containerd-shim-cube-rs', version: 'v0.5.0', source: 'manifest' },
+        { component: 'cube-runtime', version: 'v0.5.0', source: 'manifest' },
+        { component: 'cube-agent', version: 'agent-1.2.2', source: 'manifest' },
+        { component: 'guest-image', version: 'cube-image/2026.01', source: 'file' },
+        { component: 'kernel', version: '5.10.0-100', source: 'manifest' },
+      ],
     },
     {
       nodeID: 'cube-edge-03',
@@ -159,6 +201,9 @@ function buildNodes(): NodeDto[] {
       cpuSaturation: 90.6,
       memorySaturation: 93.7,
       maxMvmSlots: 16,
+      quotaCpu: 32_000,
+      quotaMemMB: 65_536,
+      createConcurrentNum: 4,
       heartbeatTime: ago(48),
       conditions: [
         {
@@ -171,6 +216,16 @@ function buildNodes(): NodeDto[] {
         { type: 'MemoryPressure', status: 'True', lastHeartbeatTime: ago(60) },
       ],
       localTemplates: ['ubuntu-24.04'],
+      // edge-03 is unhealthy AND running a guest-image outside the release
+      // declaration, covering "not ready" + undeclared in the matrix table.
+      versions: [
+        { component: 'cubelet', version: 'v0.5.0', commit: 'a1b2c3d4e5f6', source: 'binary' },
+        { component: 'containerd-shim-cube-rs', version: 'v0.5.0', source: 'manifest' },
+        { component: 'cube-runtime', version: 'v0.5.0', source: 'manifest' },
+        { component: 'cube-agent', version: 'agent-1.2.3', source: 'manifest' },
+        { component: 'guest-image', version: 'cube-image/2025.12', source: 'file' },
+        { component: 'kernel', version: '5.10.0-100', source: 'manifest' },
+      ],
     },
   ];
 }
@@ -183,6 +238,7 @@ export function resetMockState() {
   sandboxes = buildSandboxes();
   templates = buildTemplates();
   nodes = buildNodes();
+  resetWarehouseState();
 }
 
 export async function mockDelay() {
@@ -252,9 +308,75 @@ export function listTemplates() {
   return clone(templates);
 }
 
+function buildMockCreateRequest(base: TemplateSummaryDto) {
+  const containerBase = {
+    image: { writable_layer_size: '1G' },
+    resources: { cpu: '2000m', mem: '2048Mi' },
+    probe: { probe_handler: { http_get: { path: '/health', port: 8080 } } },
+  };
+
+  const common = {
+    templateID: base.templateID,
+    instanceType: base.instanceType ?? 'standard',
+    image: base.imageInfo,
+    annotations: { 'com.exposed_ports': '8080' },
+    containers: [containerBase],
+  };
+
+  switch (base.templateID) {
+    case 'python-3.11-ai':
+      return {
+        ...common,
+        network_type: 'tap',
+        cubevs_context: {
+          allowInternetAccess: true,
+          allowOut: ['172.67.0.0/16'],
+          denyOut: ['10.0.0.0/8'],
+        },
+        containers: [
+          {
+            ...containerBase,
+            envs: [
+              { key: 'APP_ENV', value: 'production' },
+              { key: 'DEBUG', value: 'false' },
+            ],
+            dns_config: { servers: ['8.8.8.8', '1.1.1.1'] },
+          },
+        ],
+      };
+    case 'nodejs-20-web':
+      return {
+        ...common,
+        network_type: 'tap',
+        cubevs_context: { allowInternetAccess: false },
+        containers: [
+          {
+            ...containerBase,
+            envs: [{ key: 'NODE_ENV', value: 'production' }],
+            dns_config: { servers: ['114.114.114.114'] },
+          },
+        ],
+      };
+    default:
+      return common;
+  }
+}
+
+function mockTemplateNetworkFields(templateID: string) {
+  switch (templateID) {
+    case 'python-3.11-ai':
+      return { networkType: 'tap', allowInternetAccess: true };
+    case 'nodejs-20-web':
+      return { networkType: 'tap', allowInternetAccess: false };
+    default:
+      return { networkType: null, allowInternetAccess: null };
+  }
+}
+
 export function getTemplate(templateID: string): TemplateDetailDto | undefined {
   const base = templates.find((item) => item.templateID === templateID);
   if (!base) return undefined;
+  const network = mockTemplateNetworkFields(base.templateID);
   return {
     templateID: base.templateID,
     instanceType: base.instanceType,
@@ -262,14 +384,90 @@ export function getTemplate(templateID: string): TemplateDetailDto | undefined {
     status: base.status,
     lastError: base.lastError,
     replicas: [
-      { node: 'cube-edge-01', ready: true, localVersion: base.version },
-      { node: 'cube-edge-02', ready: base.status !== 'failed', localVersion: base.version },
+      {
+        node_id: 'cube-edge-01',
+        node_ip: '10.0.2.11',
+        phase: 'READY',
+        status: 'READY',
+        spec: 'cpu=2000m,mem=4096Mi',
+        artifact_id: 'rfs-mock-edge-01',
+        last_job_id: 'job-mock-edge-01',
+        compat_status: 'OK',
+        guest_image_version:
+          base.templateID === 'python-3.11-ai'
+            ? 'guest-image@2024.11.02'
+            : 'guest-image@2024.12.01',
+        agent_version:
+          base.templateID === 'python-3.11-ai' ? 'cube-agent@0.1.7' : 'cube-agent@0.1.8',
+      },
+      {
+        node_id: 'cube-edge-02',
+        node_ip: '10.0.2.12',
+        phase: base.status === 'failed' ? 'FAILED' : 'READY',
+        status: base.status === 'failed' ? 'FAILED' : 'READY',
+        spec: 'cpu=2000m,mem=4096Mi',
+        artifact_id: 'rfs-mock-edge-02',
+        last_job_id: 'job-mock-edge-02',
+        compat_status: base.templateID === 'nodejs-20-web' ? 'UNKNOWN' : 'OK',
+        guest_image_version: 'guest-image@2024.12.01',
+        agent_version: 'cube-agent@0.1.8',
+      },
     ],
-    createRequest: {
-      templateID: base.templateID,
-      instanceType: base.instanceType ?? 'standard',
-      image: base.imageInfo,
+    createRequest: buildMockCreateRequest(base),
+    aliases: base.aliases ?? [],
+    ...network,
+  } as TemplateDetailDto;
+}
+
+export function getTemplateCompat(): TemplateCompatMatrix {
+  return {
+    summary: {
+      staleTemplates: 0,
+      staleReplicas: 0,
+      affectedNodes: 0,
+      missingReplicas: 1,
+      unknownReplicas: 1,
     },
+    templates: [
+      {
+        templateID: 'python-3.11-ai',
+        instanceType: 'standard',
+        overall: 'OK',
+        nodes: [
+          {
+            nodeID: 'cube-edge-01',
+            nodeIP: '10.0.2.11',
+            compatStatus: 'OK',
+            boundGuestImageVersion: 'guest-image@2024.11.02',
+            currentGuestImageVersion: 'guest-image@2024.12.01',
+            boundAgentVersion: 'cube-agent@0.1.7',
+            currentAgentVersion: 'cube-agent@0.1.8',
+            boundKernelVersion: 'kernel@6.6.32-cube',
+            currentKernelVersion: 'kernel@6.6.32-cube',
+          },
+          {
+            nodeID: 'cube-edge-02',
+            nodeIP: '10.0.2.12',
+            compatStatus: 'OK',
+            boundGuestImageVersion: 'guest-image@2024.11.02',
+            currentGuestImageVersion: 'guest-image@2024.11.02',
+            boundAgentVersion: 'cube-agent@0.1.7',
+            currentAgentVersion: 'cube-agent@0.1.7',
+            boundKernelVersion: 'kernel@6.6.32-cube',
+            currentKernelVersion: 'kernel@6.6.32-cube',
+          },
+        ],
+      },
+      {
+        templateID: 'nodejs-20-web',
+        instanceType: 'standard',
+        overall: 'UNKNOWN',
+        nodes: [
+          { nodeID: 'cube-edge-01', nodeIP: '10.0.2.11', compatStatus: 'UNKNOWN' },
+          { nodeID: 'cube-edge-02', nodeIP: '10.0.2.12', compatStatus: 'MISSING' },
+        ],
+      },
+    ],
   };
 }
 
@@ -280,6 +478,67 @@ export function listNodes() {
 export function getNode(nodeID: string) {
   const node = nodes.find((item) => item.nodeID === nodeID);
   return node ? clone(node) : undefined;
+}
+
+export function getVersionMatrix(): VersionMatrixDto {
+  const declared: Record<string, string> = {
+    cubelet: 'v0.5.0',
+    'containerd-shim-cube-rs': 'v0.5.0',
+    'cube-runtime': 'v0.5.0',
+    'cube-agent': 'agent-1.2.3',
+    'guest-image': 'cube-image/2026.01',
+    kernel: '5.10.0-100',
+  };
+
+  const componentNodes = new Map<string, Map<string, string[]>>();
+  for (const node of nodes) {
+    for (const v of node.versions ?? []) {
+      const version = v.version ?? '';
+      if (!componentNodes.has(v.component)) componentNodes.set(v.component, new Map());
+      const byVersion = componentNodes.get(v.component)!;
+      const list = byVersion.get(version) ?? [];
+      list.push(node.nodeID);
+      byVersion.set(version, list);
+    }
+  }
+
+  const components = Array.from(componentNodes.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([component, byVersion]) => {
+      const versions = Array.from(byVersion.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([version, nodeIds]) => ({ version, nodes: nodeIds }));
+      return {
+        component,
+        declaredVersion: declared[component] ?? '',
+        declaredVersions: declared[component] ? [declared[component]] : [],
+        consistent: versions.length <= 1,
+        versions,
+      };
+    });
+
+  const matrixNodes = nodes.map((node) => ({
+    nodeID: node.nodeID,
+    healthy: node.healthy,
+    components: (node.versions ?? [])
+      .slice()
+      .sort((a, b) => a.component.localeCompare(b.component))
+      .map((v) => ({
+        component: v.component,
+        version: v.version ?? '',
+        declared: !!declared[v.component] && v.version === declared[v.component],
+      })),
+  }));
+
+  return {
+    controlPlane: {
+      version: 'v0.5.0',
+      commit: 'a1b2c3d4e5f6a1b2',
+      buildTime: '2026-01-15T08:00:00Z',
+    },
+    components,
+    nodes: matrixNodes,
+  };
 }
 
 export function getClusterOverview(): ClusterOverviewDto {
@@ -320,7 +579,8 @@ export function getSandboxLogs(sandboxID: string): SandboxLogsDto | undefined {
         timestamp: ago(18),
         level: sandbox.state === 'paused' ? 'warn' : 'info',
         message: sandbox.state === 'paused' ? 'sandbox paused by operator' : 'client connected',
-        fields: sandbox.state === 'paused' ? { actor: 'dashboard' } : { client: 'sdk/python@1.4.2' },
+        fields:
+          sandbox.state === 'paused' ? { actor: 'dashboard' } : { client: 'sdk/python@1.4.2' },
       },
     ],
   };
@@ -340,8 +600,9 @@ export function createSandbox(body: {
     alias: body.alias,
     clientID: 'dashboard',
     startedAt: new Date().toISOString(),
-    endAt: later((body.timeout ?? 300)),
+    endAt: later(body.timeout ?? 300),
     cpuCount: 2,
+    cpuMilli: 2000,
     memoryMB: 4096,
     diskSizeMB: 8192,
     metadata: body.metadata ?? {},

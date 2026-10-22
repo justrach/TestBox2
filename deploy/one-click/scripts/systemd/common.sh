@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SYSTEMD_HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOLBOX_ROOT="${ONE_CLICK_TOOLBOX_ROOT:-/usr/local/services/cubetoolbox}"
+TOOLBOX_ROOT="/usr/local/services/cubetoolbox"
 ENV_FILE="${ONE_CLICK_RUNTIME_ENV_FILE:-${TOOLBOX_ROOT}/.one-click.env}"
 UNIT_SOURCE_DIR="${ONE_CLICK_SYSTEMD_UNIT_SOURCE_DIR:-${TOOLBOX_ROOT}/systemd}"
 UNIT_INSTALL_DIR="${ONE_CLICK_SYSTEMD_UNIT_INSTALL_DIR:-/etc/systemd/system}"
@@ -19,6 +19,11 @@ die() {
   echo "[one-click-systemd] ERROR: $*" >&2
   exit 1
 }
+
+# shellcheck source=../common/validation.sh
+source "${SYSTEMD_HELPER_DIR}/../common/validation.sh"
+# shellcheck source=../common/cubelet_config.sh
+source "${SYSTEMD_HELPER_DIR}/../common/cubelet_config.sh"
 
 require_cmd() {
   local cmd="$1"
@@ -127,7 +132,10 @@ resolve_control_plane_cubemaster_addr() {
   local addr="${ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR:-}"
   local ip="${ONE_CLICK_CONTROL_PLANE_IP:-}"
   local default_addr="${CUBEMASTER_ADDR:-127.0.0.1:8089}"
-  local port="${default_addr##*:}"
+  # 8089 is the cubemaster protocol port (a fixed constant), NOT derived from
+  # CUBEMASTER_ADDR -- that variable is the control node's local listen address;
+  # using its port here was an accidental coupling that broke when they differed.
+  local cubemaster_port=8089
 
   if [[ "${role}" != "compute" ]]; then
     printf '%s\n' "${default_addr}"
@@ -135,16 +143,48 @@ resolve_control_plane_cubemaster_addr() {
   fi
 
   if [[ -n "${addr}" ]]; then
+    validate_host_port "${addr}" "ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR"
     printf '%s\n' "${addr}"
     return 0
   fi
 
   if [[ -n "${ip}" ]]; then
-    printf '%s:%s\n' "${ip}" "${port}"
+    validate_ipv4_literal "${ip}" "ONE_CLICK_CONTROL_PLANE_IP"
+    validate_host_port "${ip}:${cubemaster_port}" "ONE_CLICK_CONTROL_PLANE_IP-derived cubemaster address"
+    printf '%s:%s\n' "${ip}" "${cubemaster_port}"
     return 0
   fi
 
   die "ONE_CLICK_CONTROL_PLANE_IP or ONE_CLICK_CONTROL_PLANE_CUBEMASTER_ADDR is required for compute role"
+}
+
+resolve_control_plane_cubeops_addr() {
+  local role
+  role="$(one_click_deploy_role)"
+  local addr="${ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR:-}"
+  local ip="${ONE_CLICK_CONTROL_PLANE_IP:-}"
+  local default_addr="${CUBEOPS_ADDR:-127.0.0.1:3010}"
+  local cubeops_port=3010
+
+  if [[ "${role}" != "compute" ]]; then
+    printf '%s\n' "${default_addr}"
+    return 0
+  fi
+
+  if [[ -n "${addr}" ]]; then
+    validate_host_port "${addr}" "ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR"
+    printf '%s\n' "${addr}"
+    return 0
+  fi
+
+  if [[ -n "${ip}" ]]; then
+    validate_ipv4_literal "${ip}" "ONE_CLICK_CONTROL_PLANE_IP"
+    validate_host_port "${ip}:${cubeops_port}" "ONE_CLICK_CONTROL_PLANE_IP-derived cubeops address"
+    printf '%s:%s\n' "${ip}" "${cubeops_port}"
+    return 0
+  fi
+
+  die "ONE_CLICK_CONTROL_PLANE_IP or ONE_CLICK_CONTROL_PLANE_CUBEOPS_ADDR is required for compute role"
 }
 
 list_unit_files() {
@@ -180,9 +220,33 @@ escape_sed() {
   printf '%s' "$1" | sed 's/[\/&]/\\&/g'
 }
 
+command_output_has_exact_line() {
+  local needle="$1"
+  shift
+
+  require_cmd grep
+
+  local output
+  output="$("$@" 2>/dev/null || true)"
+  [[ -n "${output}" ]] || return 1
+  grep -Fxq -- "${needle}" <<<"${output}"
+}
+
+command_output_contains_fixed_string() {
+  local needle="$1"
+  shift
+
+  require_cmd grep
+
+  local output
+  output="$("$@" 2>/dev/null || true)"
+  [[ -n "${output}" ]] || return 1
+  grep -Fq -- "${needle}" <<<"${output}"
+}
+
 container_exists() {
   local name="$1"
-  docker ps -a --format '{{.Names}}' | rg -x -- "${name}" >/dev/null 2>&1
+  command_output_has_exact_line "${name}" docker ps -a --format '{{.Names}}'
 }
 
 docker_rm_if_exists() {
@@ -224,7 +288,7 @@ pid_matches_pattern() {
     return 0
   fi
 
-  pgrep -f -- "${pattern}" | rg -x -- "${pid}" >/dev/null 2>&1
+  command_output_has_exact_line "${pid}" pgrep -f -- "${pattern}"
 }
 
 refresh_pidfile_from_pattern() {
@@ -265,6 +329,60 @@ stop_pid_with_timeout() {
   fi
 }
 
+# True if the process ${pid} was launched with exactly the argument ${want}
+# (NUL-delimited match against /proc/<pid>/cmdline). Unlike a `pgrep -f` substring
+# scan this is an exact, per-argument comparison, so it cannot be fooled by an
+# unrelated process that merely embeds the string somewhere in its argv, and it
+# does not treat the argument as a regex.
+pid_cmdline_has_arg() {
+  local pid="$1"
+  local want="$2"
+  local cmdline="/proc/${pid}/cmdline"
+  local arg
+
+  [[ -n "${pid}" && -r "${cmdline}" ]] || return 1
+  while IFS= read -r -d '' arg; do
+    [[ "${arg}" == "${want}" ]] && return 0
+  done < "${cmdline}"
+  return 1
+}
+
+# Stop a dnsmasq instance we launched directly, identified by its config-file
+# path. Only signal a PID we can confirm belongs to that instance: prefer the
+# pid-file when it still points at our process, otherwise scan the process table
+# for candidates. In both cases the candidate is confirmed by an exact
+# "--conf-file=<path>" argv match (pid_cmdline_has_arg), not a substring/regex
+# scan, so we never SIGTERM/SIGKILL an unrelated process the kernel recycled the
+# PID onto, or one that merely has "dnsmasq" (or the path) somewhere in its argv.
+stop_dnsmasq_by_conf() {
+  local pid_file="$1"
+  local conf_path="$2"
+  local timeout="${3:-10}"
+  local want_arg="--conf-file=${conf_path}"
+  local pid=""
+
+  if [[ -f "${pid_file}" ]]; then
+    pid="$(<"${pid_file}")"
+    if [[ -z "${pid}" ]] || ! pid_cmdline_has_arg "${pid}" "${want_arg}"; then
+      pid=""
+    fi
+  fi
+  if [[ -z "${pid}" ]]; then
+    # pgrep -f only narrows the candidate set (its argument is a regex and can
+    # over-match); pid_cmdline_has_arg then confirms each candidate exactly.
+    local cand
+    for cand in $(pgrep -f -- "conf-file=${conf_path}" 2>/dev/null || true); do
+      if pid_cmdline_has_arg "${cand}" "${want_arg}"; then
+        pid="${cand}"
+        break
+      fi
+    done
+  fi
+  if [[ -n "${pid}" ]]; then
+    stop_pid_with_timeout "${pid}" "${timeout}" || true
+  fi
+}
+
 wait_for_http() {
   local url="$1"
   local retries="${2:-30}"
@@ -272,6 +390,7 @@ wait_for_http() {
   local curl_args="${4:-}"
   local i
   local -a extra_args=()
+  local last_err=""
 
   if [[ -n "${curl_args}" ]]; then
     # shellcheck disable=SC2206
@@ -279,11 +398,12 @@ wait_for_http() {
   fi
 
   for ((i = 1; i <= retries; i++)); do
-    if curl -fsS "${extra_args[@]}" "${url}" >/dev/null 2>&1; then
+    if last_err="$(curl -fsS "${extra_args[@]}" "${url}" 2>&1 >/dev/null)"; then
       return 0
     fi
     sleep "${delay}"
   done
+  log "ERROR wait_for_http timeout: url=${url} waited=$((retries * delay))s last_curl_error=${last_err:-<empty>}"
   return 1
 }
 
@@ -294,13 +414,13 @@ wait_for_tcp_port() {
   local i
 
   require_cmd ss
-  require_cmd rg
   for ((i = 1; i <= retries; i++)); do
-    if ss -lnt "( sport = :${port} )" | rg -q -- ":${port}"; then
+    if command_output_contains_fixed_string ":${port}" ss -lnt "( sport = :${port} )"; then
       return 0
     fi
     sleep "${delay}"
   done
+  log "ERROR wait_for_tcp_port timeout: port=${port} waited=$((retries * delay))s no_listener_observed"
   return 1
 }
 
@@ -312,13 +432,13 @@ wait_for_udp_port() {
   local i
 
   require_cmd ss
-  require_cmd rg
   for ((i = 1; i <= retries; i++)); do
-    if ss -lnu "( sport = :${port} )" | rg -q -- "${address}:${port}"; then
+    if command_output_contains_fixed_string "${address}:${port}" ss -lnu "( sport = :${port} )"; then
       return 0
     fi
     sleep "${delay}"
   done
+  log "ERROR wait_for_udp_port timeout: address=${address} port=${port} waited=$((retries * delay))s no_listener_observed"
   return 1
 }
 
@@ -326,7 +446,7 @@ wait_for_container_health() {
   local container="$1"
   local retries="${2:-40}"
   local delay="${3:-2}"
-  local status
+  local status=""
   local i
 
   require_cmd docker
@@ -337,6 +457,7 @@ wait_for_container_health() {
     fi
     sleep "${delay}"
   done
+  log "ERROR wait_for_container_health timeout: container=${container} waited=$((retries * delay))s last_status=${status:-<unknown>}"
   return 1
 }
 

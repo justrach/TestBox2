@@ -7,7 +7,7 @@ package cubebox
 import (
 	"sync"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 type Status struct {
@@ -49,14 +49,17 @@ func (s Status) State() cubebox.ContainerState {
 	if s.Unknown {
 		return cubebox.ContainerState_CONTAINER_UNKNOWN
 	}
-	if s.FinishedAt != 0 {
-		return cubebox.ContainerState_CONTAINER_EXITED
-	}
+	// Pause / pause-to-snapshot must never surface as EXITED: CoW Pause exits
+	// the shim (TaskExit may stamp FinishedAt) while the sandbox is still in
+	// the pause lifecycle. Prefer PausingAt/PausedAt over FinishedAt.
 	if s.PausingAt != 0 {
 		return cubebox.ContainerState_CONTAINER_PAUSING
 	}
 	if s.PausedAt != 0 {
 		return cubebox.ContainerState_CONTAINER_PAUSED
+	}
+	if s.FinishedAt != 0 {
+		return cubebox.ContainerState_CONTAINER_EXITED
 	}
 	if s.StartedAt != 0 {
 		return cubebox.ContainerState_CONTAINER_RUNNING

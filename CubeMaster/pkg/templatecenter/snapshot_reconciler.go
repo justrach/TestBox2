@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	cubeboxv1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
-	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db/models"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
@@ -23,7 +21,14 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox"
 	sandboxtypes "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
+	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 	"gorm.io/gorm"
+)
+
+var (
+	getSnapshotReconcilerNodes = localcache.GetHealthyNodesByInstanceType
+	getLocalSnapshotOnCubelet  = cubelet.GetLocalSnapshot
 )
 
 const (
@@ -79,6 +84,17 @@ func failedReplicaStatus(replica models.TemplateReplica, message string) Replica
 	return status
 }
 
+// stampReplicaPresenceFailed marks a missing local catalog entry FAILED.
+// The snapshot row is CAS-updated only while still READY/FAILED so a
+// concurrent tombstone is not overwritten.
+func stampReplicaPresenceFailed(ctx context.Context, snapshotID string, model models.TemplateReplica, msg string) {
+	_ = UpsertReplica(ctx, snapshotID, model.InstanceType, failedReplicaStatus(model, msg))
+	_, _ = updateSnapshotFieldsIfStatusIn(ctx, snapshotID, map[string]any{
+		"status":     StatusFailed,
+		"last_error": msg,
+	}, StatusReady, StatusFailed)
+}
+
 var (
 	snapshotReconcilerOnce sync.Once
 	snapshotStorageCache   = struct {
@@ -92,9 +108,7 @@ var (
 func startSnapshotReconciler(ctx context.Context) {
 	snapshotReconcilerOnce.Do(func() {
 		go func() {
-			runSnapshotReconcilerPass(detachTemplateImageJobContext(ctx, map[string]any{
-				"component": "snapshot_reconciler",
-			}))
+			runSnapshotReconcilerPass(detachTemplateImageJobContext(ctx, "snapshot_reconciler", nil))
 			ticker := time.NewTicker(snapshotReconcilerInterval)
 			defer ticker.Stop()
 			for {
@@ -102,9 +116,7 @@ func startSnapshotReconciler(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					runSnapshotReconcilerPass(detachTemplateImageJobContext(ctx, map[string]any{
-						"component": "snapshot_reconciler",
-					}))
+					runSnapshotReconcilerPass(detachTemplateImageJobContext(ctx, "snapshot_reconciler", nil))
 				}
 			}
 		}()
@@ -124,6 +136,9 @@ func runSnapshotReconcilerPass(ctx context.Context) {
 	}
 	if err := reconcileSnapshotRuntimeRefs(ctx); err != nil {
 		logger.Warnf("reconcile snapshot runtime refs failed: %v", err)
+	}
+	if err := reconcileSnapshotTombstones(ctx); err != nil {
+		logger.Warnf("reconcile snapshot tombstones failed: %v", err)
 	}
 	if err := refreshSnapshotStorageMetrics(ctx); err != nil {
 		logger.Warnf("refresh snapshot storage metrics failed: %v", err)
@@ -173,60 +188,136 @@ func getOrRefreshSnapshotStorageState(ctx context.Context, nodeID, nodeIP string
 }
 
 func reconcileSnapshotDefinitionTimeouts(ctx context.Context) error {
-	var defs []models.TemplateDefinition
-	if err := store.db.WithContext(ctx).Table(constants.TemplateDefinitionTableName).
-		Where("kind = ? AND status IN ? AND updated_at < ?", TemplateKindSnapshot, []string{StatusCreating, StatusDeleting}, time.Now().Add(-snapshotOperationTimeout)).
-		Find(&defs).Error; err != nil {
+	var rows []models.SnapshotRecord
+	if err := store.db.WithContext(ctx).Table(constants.SnapshotTableName).
+		Where("status IN ? AND updated_at < ?", []string{StatusCreating, StatusDeleting}, time.Now().Add(-snapshotOperationTimeout)).
+		Find(&rows).Error; err != nil {
 		return err
 	}
-	for _, def := range defs {
-		active, err := getActiveSnapshotJobByResourceID(ctx, def.TemplateID)
-		if err == nil && active != nil {
-			continue
-		}
-		if err != nil && !errorsIsRecordNotFound(err) {
-			return err
-		}
-		lastError := fmt.Sprintf("snapshot %s remained in %s beyond %s", def.TemplateID, def.Status, snapshotOperationTimeout)
-		if err := updateDefinitionFields(ctx, def.TemplateID, map[string]any{
-			"status":     StatusFailed,
-			"last_error": lastError,
-		}); err != nil {
+	for _, rec := range rows {
+		if err := reclaimTimedOutSnapshotRecord(ctx, rec); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// shouldReclaimStaleSnapshotDeleteJob is true when a DELETING row is held
+// by an expired SNAPSHOT_DELETE job (typical after a master crash between
+// insertSnapshotDeleteJob and execute). Fresh jobs and CREATING stay skipped.
+func snapshotDeleteJobIsStale(job *models.TemplateImageJob) bool {
+	if job == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(job.Operation), JobOperationSnapshotDelete) {
+		return false
+	}
+	if job.UpdatedAt.IsZero() {
+		return false
+	}
+	return time.Since(job.UpdatedAt) >= snapshotOperationTimeout
+}
+
+func shouldReclaimStaleSnapshotDeleteJob(rec models.SnapshotRecord, job *models.TemplateImageJob) bool {
+	if !strings.EqualFold(strings.TrimSpace(rec.Status), StatusDeleting) {
+		return false
+	}
+	return snapshotDeleteJobIsStale(job)
+}
+
+func shouldFailStaleDeleteJobOnTombstone(rec models.SnapshotRecord, job *models.TemplateImageJob) bool {
+	if !snapshotIsTombstoned(rec.Status) {
+		return false
+	}
+	return snapshotDeleteJobIsStale(job)
+}
+
+// reclaimTimedOutSnapshotRecord returns a stuck CREATING/DELETING row to a
+// terminal-or-retryable status. A live active job still wins, except a stale
+// SNAPSHOT_DELETE job which is failed so the tombstone reconciler can retry.
+func reclaimTimedOutSnapshotRecord(ctx context.Context, rec models.SnapshotRecord) error {
+	active, err := getActiveSnapshotJobByResourceID(ctx, rec.SnapshotID)
+	if err != nil && !errorsIsRecordNotFound(err) {
+		return err
+	}
+	if active != nil {
+		if !shouldReclaimStaleSnapshotDeleteJob(rec, active) {
+			return nil
+		}
+		if err := updateTemplateImageJob(ctx, active.JobID, map[string]any{
+			"status":        JobStatusFailed,
+			"error_message": fmt.Sprintf("stale snapshot delete job %s exceeded %s", active.JobID, snapshotOperationTimeout),
+		}); err != nil {
+			return err
+		}
+	}
+	lastError := fmt.Sprintf("snapshot %s remained in %s beyond %s", rec.SnapshotID, rec.Status, snapshotOperationTimeout)
+	if active != nil {
+		lastError = fmt.Sprintf("snapshot %s remained in %s beyond %s with stale delete job %s", rec.SnapshotID, rec.Status, snapshotOperationTimeout, active.JobID)
+	}
+	// Stuck DELETING returns to DELETED so the tombstone reconciler can retry.
+	status := StatusFailed
+	if strings.EqualFold(rec.Status, StatusDeleting) {
+		status = StatusDeleted
+	}
+	return updateSnapshotFields(ctx, rec.SnapshotID, map[string]any{
+		"status":     status,
+		"last_error": lastError,
+	})
+}
+
 func reconcileSnapshotReplicaPresence(ctx context.Context) error {
 	var reconcileErr error
 	orphanCount := 0
 	defer setSnapshotOrphanGauge(orphanCount)
-	var defs []models.TemplateDefinition
-	if err := store.db.WithContext(ctx).Table(constants.TemplateDefinitionTableName).
-		Where("kind = ? AND status IN ?", TemplateKindSnapshot, []string{StatusReady, StatusFailed, StatusDeleting}).
-		Find(&defs).Error; err != nil {
+	var rows []models.SnapshotRecord
+	if err := store.db.WithContext(ctx).Table(constants.SnapshotTableName).
+		Where("status IN ?", []string{StatusReady, StatusFailed}).
+		Find(&rows).Error; err != nil {
 		return err
 	}
-	for _, def := range defs {
-		replicas, err := ListReplicas(ctx, def.TemplateID)
+	for _, rec := range rows {
+		// S3 packages are cluster-shared. A node catalog miss after Finalize
+		// is normal (metadata is unmounted), and CleanupTemplate(s3) would
+		// delete objects every node still needs. Existence is remote_status
+		// plus the remotestatus poller — not this XFS replica-presence walk.
+		if constants.IsS3Backend(rec.Backend) {
+			continue
+		}
+		snapshotBackend := pinnedCleanupBackend(rec.Backend)
+		replicas, err := ListReplicas(ctx, rec.SnapshotID)
 		if err != nil {
 			return err
+		}
+		if len(replicas) == 0 {
+			replicas = []models.TemplateReplica{{
+				TemplateID:   rec.SnapshotID,
+				NodeID:       rec.OriginNodeID,
+				NodeIP:       rec.OriginNodeIP,
+				InstanceType: rec.InstanceType,
+				Status:       ReplicaStatusReady,
+				Phase:        ReplicaPhaseReady,
+			}}
 		}
 		for _, model := range replicas {
 			replica := replicaModelToStatus(model)
 			hostIP := resolveNodeIP(replica.NodeID, replica.NodeIP)
 			if hostIP == "" {
-				err := fmt.Errorf("snapshot %s replica on node %s has no reachable node address", def.TemplateID, firstNonEmpty(replica.NodeID, replica.NodeIP))
+				err := fmt.Errorf("snapshot %s replica on node %s has no reachable node address", rec.SnapshotID, firstNonEmpty(replica.NodeID, replica.NodeIP))
 				reconcileErr = errors.Join(reconcileErr, err)
 				continue
 			}
 			// Authoritative existence check now happens via cubelet's local
 			// snapshot catalog. Master no longer carries physical refs on
 			// snapshot replicas, so we ask the node directly.
-			rsp, err := cubelet.GetLocalSnapshot(ctx, cubelet.GetCubeletAddr(hostIP), &cubeboxv1.GetLocalSnapshotRequest{
+			//
+			// Backend must be sent: cubelet reads one backend namespace per
+			// call and an empty value means xfs, so omitting it reports every
+			// s3 package as missing and stamps a healthy snapshot FAILED.
+			rsp, err := getLocalSnapshotOnCubelet(ctx, cubelet.GetCubeletAddr(hostIP), &cubeboxv1.GetLocalSnapshotRequest{
 				RequestID:  uuid.NewString(),
-				SnapshotID: def.TemplateID,
+				SnapshotID: rec.SnapshotID,
+				Backend:    snapshotBackend,
 			})
 			if err != nil {
 				msg := "get local snapshot failed"
@@ -240,7 +331,7 @@ func reconcileSnapshotReplicaPresence(ctx context.Context) error {
 					LastError:     msg,
 					LastUpdatedAt: time.Now(),
 				})
-				reconcileErr = errors.Join(reconcileErr, fmt.Errorf("snapshot %s reconcile on node %s failed: %s", def.TemplateID, firstNonEmpty(replica.NodeID, hostIP), msg))
+				reconcileErr = errors.Join(reconcileErr, fmt.Errorf("snapshot %s reconcile on node %s failed: %s", rec.SnapshotID, firstNonEmpty(replica.NodeID, hostIP), msg))
 				continue
 			}
 			retCode := cubeleterrorcode.ErrorCode_Success
@@ -253,27 +344,19 @@ func reconcileSnapshotReplicaPresence(ctx context.Context) error {
 			case cubeleterrorcode.ErrorCode_Success:
 				if rsp.GetSnapshot() == nil || strings.TrimSpace(rsp.GetSnapshot().GetSnapshotID()) == "" {
 					orphanCount++
-					msg := fmt.Sprintf("snapshot %s missing from local catalog on node %s", def.TemplateID, firstNonEmpty(replica.NodeID, hostIP))
-					_ = UpsertReplica(ctx, def.TemplateID, model.InstanceType, failedReplicaStatus(model, msg))
-					_ = updateDefinitionFields(ctx, def.TemplateID, map[string]any{
-						"status":     StatusFailed,
-						"last_error": msg,
-					})
+					msg := fmt.Sprintf("snapshot %s missing from local catalog on node %s", rec.SnapshotID, firstNonEmpty(replica.NodeID, hostIP))
+					stampReplicaPresenceFailed(ctx, rec.SnapshotID, model, msg)
 				}
 			case cubeleterrorcode.ErrorCode_PreConditionFailed:
 				orphanCount++
-				msg := fmt.Sprintf("snapshot %s missing from local catalog on node %s: %s", def.TemplateID, firstNonEmpty(replica.NodeID, hostIP), retMsg)
-				_ = cleanupTemplateReplicasWithLocators(ctx, def.TemplateID, []templateCleanupLocator{{
+				msg := fmt.Sprintf("snapshot %s missing from local catalog on node %s: %s", rec.SnapshotID, firstNonEmpty(replica.NodeID, hostIP), retMsg)
+				_ = cleanupTemplateReplicasWithLocators(ctx, rec.SnapshotID, []templateCleanupLocator{{
 					NodeID: model.NodeID,
 					NodeIP: model.NodeIP,
-				}})
-				_ = UpsertReplica(ctx, def.TemplateID, model.InstanceType, failedReplicaStatus(model, msg))
-				_ = updateDefinitionFields(ctx, def.TemplateID, map[string]any{
-					"status":     StatusFailed,
-					"last_error": msg,
-				})
+				}}, snapshotBackend)
+				stampReplicaPresenceFailed(ctx, rec.SnapshotID, model, msg)
 			default:
-				reconcileErr = errors.Join(reconcileErr, fmt.Errorf("snapshot %s reconcile on node %s returned ret=%d %s", def.TemplateID, firstNonEmpty(replica.NodeID, hostIP), retCode, retMsg))
+				reconcileErr = errors.Join(reconcileErr, fmt.Errorf("snapshot %s reconcile on node %s returned ret=%d %s", rec.SnapshotID, firstNonEmpty(replica.NodeID, hostIP), retCode, retMsg))
 			}
 		}
 	}
@@ -281,7 +364,7 @@ func reconcileSnapshotReplicaPresence(ctx context.Context) error {
 }
 
 func reconcileSnapshotRuntimeRefs(ctx context.Context) error {
-	nodes := localcache.GetHealthyNodesByInstanceType(-1, cubeboxv1.InstanceType_cubebox.String())
+	nodes := getSnapshotReconcilerNodes(-1, cubeboxv1.InstanceType_cubebox.String())
 	var reconcileErr error
 	for i := range nodes {
 		nodeID := strings.TrimSpace(nodes[i].ID())
@@ -314,23 +397,9 @@ func reconcileSnapshotRuntimeRefs(ctx context.Context) error {
 				observed = append(observed, ref)
 				continue
 			}
-			templateID := ""
-			if item != nil {
-				templateID = strings.TrimSpace(item.TemplateID)
+			if ref, ok := snapshotRuntimeRefFromTemplateID(ctx, item); ok {
+				observed = append(observed, ref)
 			}
-			if templateID == "" {
-				continue
-			}
-			kind, err := GetTemplateKind(ctx, templateID)
-			if err != nil || !strings.EqualFold(kind, TemplateKindSnapshot) {
-				continue
-			}
-			observed = append(observed, SnapshotRuntimeRefInfo{
-				SnapshotID: templateID,
-				SandboxID:  item.SandboxID,
-				NodeID:     item.HostID,
-				NodeIP:     item.HostIP,
-			})
 		}
 		if err := RefreshSnapshotRuntimeRefsFromNode(ctx, nodeID, nodeIP, observed); err != nil {
 			reconcileErr = err
@@ -361,7 +430,7 @@ func refreshSnapshotStorageMetrics(ctx context.Context) error {
 		targets = append(targets, refreshTarget{nodeID: nodeID, nodeIP: nodeIP})
 	}
 
-	nodes := localcache.GetHealthyNodesByInstanceType(-1, cubeboxv1.InstanceType_cubebox.String())
+	nodes := getSnapshotReconcilerNodes(-1, cubeboxv1.InstanceType_cubebox.String())
 	for i := range nodes {
 		addTarget(nodes[i].ID(), nodes[i].HostIP())
 	}

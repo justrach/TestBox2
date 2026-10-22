@@ -7,6 +7,8 @@ package grpcconn
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,6 +60,9 @@ func (wc *workerGrpcConnPool) checkWorkerConn() {
 }
 
 func GetWorkerConn(ctx context.Context, addr string) (grpcpool.Conn, error) {
+	if connPool == nil {
+		return nil, fmt.Errorf("worker grpc conn pool is not initialized")
+	}
 	key := constants.GetUA(ctx) + "+" + addr
 	cp, ok := connPool.cache.Load(key)
 	if ok && cp != nil {
@@ -76,10 +81,24 @@ func GetWorkerConn(ctx context.Context, addr string) (grpcpool.Conn, error) {
 	return cp.(grpcpool.Pool).Get()
 }
 
+// CloseWorkerConn closes and evicts all cached connection pools associated with
+// the specified worker address (matching both exact address and prefixed "ua+addr" keys).
 func CloseWorkerConn(addr string) {
-	cp, ok := connPool.cache.Load(addr)
-	if ok && cp != nil {
-		connPool.cache.Delete(addr)
-		_ = cp.(grpcpool.Pool).Close()
+	if connPool == nil {
+		return
 	}
+	suffix := "+" + addr
+	connPool.cache.Range(func(key, cp interface{}) bool {
+		k, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if k == addr || strings.HasSuffix(k, suffix) {
+			connPool.cache.Delete(key)
+			if cp != nil {
+				_ = cp.(grpcpool.Pool).Close()
+			}
+		}
+		return true
+	})
 }

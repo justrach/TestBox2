@@ -21,6 +21,8 @@ import (
 type prefilter struct {
 }
 
+var getSchedulableNodesByInstanceType = localcache.GetSchedulableNodesByInstanceType
+
 func NewPreFilter() *prefilter {
 	filter := &prefilter{}
 	return filter
@@ -36,10 +38,10 @@ func (l *prefilter) Select(selCtx *selctx.SelectorCtx) (node.NodeList, error) {
 		return nil, ret.Errorf(errorcode.ErrorCode_MasterInternalError, "scheduler config is nil")
 	}
 
-	nodes := localcache.GetHealthyNodesByInstanceType(sconf.PreSelectNum, selCtx.InstanceType)
+	nodes := getSchedulableNodesByInstanceType(sconf.PreSelectNum, selCtx.InstanceType)
 
 	if log.IsDebug() {
-		log.G(selCtx.Ctx).Debugf("GetHealthyNodesByInstanceType:%+v,size:%d", nodes.String(), nodes.Len())
+		log.G(selCtx.Ctx).Debugf("GetSchedulableNodesByInstanceType:%+v,size:%d", nodes.String(), nodes.Len())
 	}
 	newNodes := make(node.NodeList, 0, nodes.Len())
 	for i := range nodes {
